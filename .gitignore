@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project storage downloads & cache
+storage/server_cache/*
+!storage/server_cache/.gitkeep
+storage/client_downloads/*
+!storage/client_downloads/.gitkeep

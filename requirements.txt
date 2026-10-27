@@ -1,0 +1,5 @@
+# Core cryptographic library for payload encryption (Rubric Step 8)
+cryptography>=42.0.0
+
+# Automated testing framework (Rubric Step 10)
+pytest>=8.0.0
