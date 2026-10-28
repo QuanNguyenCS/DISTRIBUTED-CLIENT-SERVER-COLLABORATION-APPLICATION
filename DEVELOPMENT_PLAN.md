@@ -259,11 +259,11 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - Khái niệm **Race Condition** và **Thread-Safe**: Khi 10 client cùng truy cập danh sách người dùng, cần có `threading.Lock` để đồng bộ.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 3.1: Xây dựng lớp `ClientHandler` (`server/client_handler.py`)**
+- [x] **Micro-step 3.1: Xây dựng lớp `ClientHandler` (`server/client_handler.py`)**
   - Kế thừa từ `threading.Thread`.
   - Nhận socket của client vừa kết nối và địa chỉ client `(ip, port)`.
   - Phương thức `run()`: Chạy vòng lặp lắng nghe `protocol.recv_packet(client_socket)` liên tục cho đến khi client ngắt kết nối.
-- [ ] **Micro-step 3.2: Cập nhật vòng lặp lắng nghe trên Server (`server/server_core.py`)**
+- [x] **Micro-step 3.2: Cập nhật vòng lặp lắng nghe trên Server (`server/server_core.py`)**
   ```python
   while self.is_running:
       client_sock, client_addr = self.server_sock.accept()
@@ -271,10 +271,10 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
       handler.daemon = True
       handler.start()
   ```
-- [ ] **Micro-step 3.3: Nâng cấp Client thành 2 luồng hoạt động đồng thời**
+- [x] **Micro-step 3.3: Nâng cấp Client thành 2 luồng hoạt động đồng thời**
   - **Luồng 1 (Sender / Main Thread):** Đọc lệnh từ bàn phím hoặc sự kiện người dùng và gửi đi.
   - **Luồng 2 (Receiver Thread):** Chạy nền liên tục lắng nghe các gói tin từ Server trả về và in ra console.
-- [ ] **Micro-step 3.4: Viết script kiểm thử đa kết nối**
+- [x] **Micro-step 3.4: Viết script kiểm thử đa kết nối**
   - Chạy 5 cửa sổ terminal client cùng lúc, đảm bảo tất cả đều kết nối và gửi/nhận đồng thời mà không ai bị đơ hay chờ đợi.
 
 #### 🧪 Tiêu chí nghiệm thu (Acceptance Criteria):

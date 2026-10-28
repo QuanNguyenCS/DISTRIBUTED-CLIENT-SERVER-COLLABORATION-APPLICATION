@@ -1,7 +1,7 @@
 """
 Module: server.server_core
-Mô tả: Lớp Server chính quản lý TCP Socket Listener, chấp nhận kết nối từ các Client
-và thực hiện cơ chế bắt tay tầng ứng dụng (Application Handshake Protocol).
+Mô tả: Lớp Server chính quản lý TCP Socket Listener, chấp nhận kết nối từ các Client,
+thực hiện cơ chế bắt tay tầng ứng dụng và phân phối mỗi Client cho một ClientHandler Thread riêng.
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from common.logger import get_logger
 from common.message_types import MessageType
@@ -21,13 +21,14 @@ from common.protocol import (
     create_packet,
     recv_packet,
 )
+from server.client_handler import ClientHandler
 
 logger = get_logger("server.core")
 
 
 class ServerCore:
     """
-    Lớp quản lý Server TCP ở tầng mạng.
+    Lớp quản lý Server TCP ở tầng mạng áp dụng mô hình Thread-per-Client.
     
     Vòng đời của Server Socket:
       1. Khởi tạo socket TCP: socket(AF_INET, SOCK_STREAM)
@@ -35,11 +36,12 @@ class ServerCore:
       3. Gán địa chỉ (bind) vào host và port quy định
       4. Lắng nghe (listen) với backlog xác định
       5. Chấp nhận kết nối (accept) và thực hiện bắt tay ứng dụng (Handshake)
+      6. Chuyển giao socket client cho ClientHandler Thread riêng biệt để chạy song song
     """
 
     DEFAULT_HOST: str = "0.0.0.0"
     DEFAULT_PORT: int = 9000
-    DEFAULT_BACKLOG: int = 10
+    DEFAULT_BACKLOG: int = 20
 
     def __init__(
         self,
@@ -54,39 +56,44 @@ class ServerCore:
         self.is_running: bool = False
         self._lock = threading.Lock()
 
+        # Quản lý danh sách các ClientHandler đang hoạt động theo (IP, Port)
+        self.handlers: Dict[Tuple[str, int], ClientHandler] = {}
+        self._handlers_lock = threading.Lock()
+
     def start(self) -> None:
         """
         Khởi động TCP Server socket, bind và listen.
         """
-        if self.is_running:
-            logger.warning("Server đang chạy sẵn trên %s:%d.", self.host, self.port)
-            return
+        with self._lock:
+            if self.is_running:
+                logger.warning("Server đang chạy sẵn trên %s:%d.", self.host, self.port)
+                return
 
-        try:
-            # 1. Tạo socket TCP IPv4
-            self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                # 1. Tạo socket TCP IPv4
+                self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-            # 2. Bật SO_REUSEADDR để tái sử dụng port ngay khi khởi động lại server
-            self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # 2. Bật SO_REUSEADDR để tái sử dụng port ngay khi khởi động lại server
+                self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            # 3. Bind socket vào host và port
-            self.server_sock.bind((self.host, self.port))
+                # 3. Bind socket vào host và port
+                self.server_sock.bind((self.host, self.port))
 
-            # 4. Bắt đầu lắng nghe các kết nối từ client
-            self.server_sock.listen(self.DEFAULT_BACKLOG)
-            self.is_running = True
+                # 4. Bắt đầu lắng nghe các kết nối từ client
+                self.server_sock.listen(self.DEFAULT_BACKLOG)
+                self.is_running = True
 
-            logger.info(
-                "🚀 Server '%s' đã khởi động thành công và đang lắng nghe tại %s:%d (Backlog: %d)",
-                self.server_id,
-                self.host,
-                self.port,
-                self.DEFAULT_BACKLOG,
-            )
-        except OSError as exc:
-            logger.critical("Không thể khởi động Server tại %s:%d: %s", self.host, self.port, exc)
-            self.stop()
-            raise
+                logger.info(
+                    "🚀 Server '%s' đã khởi động thành công và đang lắng nghe tại %s:%d (Backlog: %d)",
+                    self.server_id,
+                    self.host,
+                    self.port,
+                    self.DEFAULT_BACKLOG,
+                )
+            except OSError as exc:
+                logger.critical("Không thể khởi động Server tại %s:%d: %s", self.host, self.port, exc)
+                self.stop()
+                raise
 
     def handle_handshake(
         self, client_sock: socket.socket, client_addr: Tuple[str, int]
@@ -194,14 +201,69 @@ class ServerCore:
             logger.error("[%s:%d] Lỗi trong quá trình bắt tay: %s", client_addr[0], client_addr[1], exc)
             return False, None
 
-    def accept_one(self) -> Tuple[Optional[socket.socket], Optional[Tuple[str, int]]]:
+    def register_handler(self, handler: ClientHandler) -> None:
+        """Đăng ký một ClientHandler mới vào bộ quản lý (Thread-Safe)."""
+        with self._handlers_lock:
+            self.handlers[handler.client_addr] = handler
+            active_count = len(self.handlers)
+        logger.info(
+            "➕ Đã thêm handler [%s:%d]. Số Client trực tuyến: %d",
+            handler.client_addr[0],
+            handler.client_addr[1],
+            active_count,
+        )
+
+    def unregister_handler(self, client_addr: Tuple[str, int]) -> None:
+        """Hủy đăng ký một ClientHandler khi kết nối đóng (Thread-Safe)."""
+        with self._handlers_lock:
+            self.handlers.pop(client_addr, None)
+            active_count = len(self.handlers)
+        logger.info(
+            "➖ Đã gỡ bỏ handler [%s:%d]. Số Client còn lại: %d",
+            client_addr[0],
+            client_addr[1],
+            active_count,
+        )
+
+    def get_active_client_count(self) -> int:
+        """Lấy số lượng client đang kết nối đồng thời."""
+        with self._handlers_lock:
+            return len(self.handlers)
+
+    def get_all_handlers(self) -> List[ClientHandler]:
+        """Lấy danh sách bản sao các ClientHandler đang hoạt động (Thread-Safe)."""
+        with self._handlers_lock:
+            return list(self.handlers.values())
+
+    def broadcast_packet(
+        self,
+        msg_type: MessageType | int,
+        payload: Any = b"",
+        exclude_addr: Optional[Tuple[str, int]] = None,
+    ) -> int:
         """
-        Chấp nhận một kết nối đến và thực hiện bắt tay ứng dụng.
-        Dùng cho các bài test hoặc kịch bản đơn kết nối.
+        Gửi gói tin phát thanh (Broadcast) đến tất cả các Client đang kết nối.
+
+        Args:
+            msg_type: Loại thông điệp.
+            payload: Dữ liệu cần gửi.
+            exclude_addr: Địa chỉ của Client cần loại trừ (ví dụ không gửi lại cho người vừa gửi).
 
         Returns:
-            Tuple[Optional[socket.socket], Optional[Tuple[str, int]]]:
-                (client_socket, client_addr) nếu bắt tay thành công, ngược lại (None, None).
+            int: Số lượng client gửi thành công.
+        """
+        handlers = self.get_all_handlers()
+        success_count = 0
+        for handler in handlers:
+            if exclude_addr and handler.client_addr == exclude_addr:
+                continue
+            if handler.send_packet(msg_type, payload):
+                success_count += 1
+        return success_count
+
+    def accept_one(self) -> Tuple[Optional[socket.socket], Optional[Tuple[str, int]]]:
+        """
+        Chấp nhận một kết nối đơn lẻ và thực hiện bắt tay (Phục vụ kiểm thử).
         """
         if not self.server_sock or not self.is_running:
             raise RuntimeError("Server chưa được khởi động. Hãy gọi start() trước.")
@@ -228,36 +290,46 @@ class ServerCore:
 
     def serve_forever(self) -> None:
         """
-        Vòng lặp chính chấp nhận kết nối liên tục.
-        (Nền tảng cho Giai đoạn 2 và sẵn sàng tích hợp Multi-threading ở Giai đoạn 3).
+        Vòng lặp lắng nghe chính áp dụng mô hình Thread-per-Client.
+        Chấp nhận kết nối và tạo Thread riêng xử lý cho từng Client liên tục.
         """
         if not self.is_running:
             self.start()
 
-        logger.info("Server đang chạy vòng lặp phục vụ kết nối (Nhấn Ctrl+C để dừng)...")
+        logger.info(
+            "🌟 Server đang chạy ở chế độ ĐA NHIỆM (Multi-threading). Sẵn sàng phục vụ nhiều client cùng lúc..."
+        )
+
         try:
             while self.is_running:
-                client_sock, client_addr = self.accept_one()
-                if client_sock and client_addr:
-                    # Ở Giai đoạn 2: In thông báo hoàn thành handshake
-                    logger.info(
-                        "🎉 Client [%s:%d] đã hoàn tất bắt tay TCP và Handshake ứng dụng.",
-                        client_addr[0],
-                        client_addr[1],
-                    )
-                    # Chờ client ngắt kết nối hoặc đóng socket
+                try:
+                    # Chấp nhận kết nối TCP từ client mới
+                    client_sock, client_addr = self.server_sock.accept()
+                except OSError:
+                    # Socket server đã bị đóng trong stop()
+                    break
+
+                logger.info("⚡ Chấp nhận kết nối TCP từ %s:%d", client_addr[0], client_addr[1])
+
+                # 1. Bắt tay tầng ứng dụng
+                success, client_info = self.handle_handshake(client_sock, client_addr)
+                if not success:
                     try:
-                        # Kiểm tra xem client có gửi DISCONNECT_NOTICE không
-                        packet = recv_packet(client_sock)
-                        if packet.msg_type == MessageType.DISCONNECT_NOTICE:
-                            logger.info("[%s:%d] Client chủ động ngắt kết nối.", client_addr[0], client_addr[1])
-                    except (ConnectionClosedError, OSError):
-                        logger.info("[%s:%d] Kết nối đã đóng.", client_addr[0], client_addr[1])
-                    finally:
-                        try:
-                            client_sock.close()
-                        except OSError:
-                            pass
+                        client_sock.close()
+                    except OSError:
+                        pass
+                    continue
+
+                # 2. Tạo một Thread riêng để phục vụ Client này mà không làm block Server
+                handler = ClientHandler(
+                    client_sock=client_sock,
+                    client_addr=client_addr,
+                    server=self,
+                    client_info=client_info,
+                )
+                self.register_handler(handler)
+                handler.start()
+
         except KeyboardInterrupt:
             logger.info("Nhận tín hiệu dừng từ bàn phím (Ctrl+C).")
         finally:
@@ -265,12 +337,23 @@ class ServerCore:
 
     def stop(self) -> None:
         """
-        Đóng socket server và dọn dẹp tài nguyên.
+        Đóng socket server và dọn dẹp toàn bộ các luồng Client đang kết nối.
         """
         with self._lock:
             if not self.is_running and self.server_sock is None:
                 return
             self.is_running = False
+
+            # 1. Đóng toàn bộ các ClientHandler đang hoạt động
+            with self._handlers_lock:
+                active_handlers = list(self.handlers.values())
+                self.handlers.clear()
+
+            logger.info("Đang đóng toàn bộ %d kết nối Client...", len(active_handlers))
+            for handler in active_handlers:
+                handler.close()
+
+            # 2. Đóng Server socket chính
             if self.server_sock:
                 try:
                     self.server_sock.close()

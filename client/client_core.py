@@ -1,19 +1,23 @@
 """
 Module: client.client_core
-Mô tả: Lớp Client chính quản lý TCP Socket, thực hiện kết nối tới Server,
-thực hiện cơ chế bắt tay tầng ứng dụng (Application Handshake) và duy trì kết nối.
+Mô tả: Lớp Client chính quản lý TCP Socket áp dụng kiến trúc 2 luồng đồng thời:
+  - Luồng 1 (Main/Sender Thread): Thực hiện kết nối, gửi lệnh, tin nhắn và file.
+  - Luồng 2 (Receiver Thread): Chạy ngầm liên tục lắng nghe và xử lý gói tin từ Server trả về.
 """
 
 from __future__ import annotations
 
+import queue
 import socket
-from typing import Any, Dict, Optional
+import threading
+from typing import Any, Callable, Dict, List, Optional
 
 from common.logger import get_logger
 from common.message_types import MessageType
 from common.protocol import (
     PROTOCOL_VERSION,
     ConnectionClosedError,
+    Packet,
     ProtocolError,
     create_packet,
     recv_packet,
@@ -24,14 +28,12 @@ logger = get_logger("client.core")
 
 class ClientCore:
     """
-    Lớp quản lý Client TCP ở tầng mạng.
+    Lớp quản lý Client TCP đa luồng (Dual-thread architecture).
     
-    Vòng đời của Client Socket:
-      1. Khởi tạo socket TCP: socket(AF_INET, SOCK_STREAM)
-      2. Kết nối tới Server (IP, Port) bằng connect()
-      3. Gửi gói tin HELLO_HANDSHAKE kèm thông tin phiên bản giao thức
-      4. Chờ nhận phản hồi HANDSHAKE_ACK hoặc HANDSHAKE_REJECT từ Server
-      5. Giao tiếp dữ liệu hoặc chủ động ngắt kết nối (DISCONNECT_NOTICE)
+    Cấu trúc luồng:
+      1. Main Thread / UI Thread: Gọi connect(), send_packet(), disconnect().
+      2. Receiver Thread (Background Daemon): Lặp recv_packet() để đón nhận
+         tin nhắn, thông báo, file chunks mà không làm đơ giao diện người dùng.
     """
 
     DEFAULT_HOST: str = "127.0.0.1"
@@ -50,20 +52,46 @@ class ClientCore:
         self.is_connected: bool = False
         self.server_info: Optional[Dict[str, Any]] = None
 
-    def connect(self, timeout: float = 5.0, protocol_version: int = PROTOCOL_VERSION) -> bool:
+        # Khóa bảo vệ khi gửi dữ liệu từ nhiều luồng (Thread-Safe Send)
+        self._send_lock = threading.Lock()
+
+        # Luồng lắng nghe ngầm
+        self._receiver_thread: Optional[threading.Thread] = None
+
+        # Hàng đợi chứa các gói tin nhận về (phục vụ GUI và Test)
+        self.received_queue: queue.Queue[Packet] = queue.Queue()
+
+        # Callbacks cho từng loại mã thông điệp: Dict[MessageType, List[Callable]]
+        self._packet_callbacks: Dict[int, List[Callable[[Packet], None]]] = {}
+
+        # Callback chung cho tất cả các gói tin đến
+        self.on_packet_received: Optional[Callable[[Packet], None]] = None
+
+    def register_callback(
+        self, msg_type: MessageType | int, callback: Callable[[Packet], None]
+    ) -> None:
+        """Đăng ký hàm callback xử lý khi nhận được loại gói tin cụ thể."""
+        msg_key = int(msg_type)
+        if msg_key not in self._packet_callbacks:
+            self._packet_callbacks[msg_key] = []
+        self._packet_callbacks[msg_key].append(callback)
+
+    def connect(
+        self,
+        timeout: float = 5.0,
+        protocol_version: int = PROTOCOL_VERSION,
+        start_receiver: bool = True,
+    ) -> bool:
         """
-        Kết nối tới Server TCP và thực hiện bắt tay ứng dụng.
+        Kết nối tới Server TCP, thực hiện bắt tay và khởi chạy luồng lắng nghe nền.
 
         Args:
             timeout: Thời gian tối đa chờ kết nối (giây).
             protocol_version: Phiên bản giao thức gửi đi (mặc định là PROTOCOL_VERSION).
+            start_receiver: Có tự động bật Receiver Thread chạy nền hay không (mặc định True).
 
         Returns:
             bool: True nếu kết nối và bắt tay thành công, False nếu thất bại.
-
-        Raises:
-            ConnectionRefusedError: Nếu Server từ chối kết nối (chưa chạy hoặc chặn port).
-            TimeoutError / socket.timeout: Nếu hết thời gian chờ kết nối.
         """
         if self.is_connected:
             logger.warning("Client đã kết nối sẵn tới %s:%d.", self.server_host, self.server_port)
@@ -81,7 +109,7 @@ class ClientCore:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(timeout)
 
-            # 2. Thực hiện 3-way handshake TCP ở tầng truyền vận
+            # 2. Thực hiện 3-way handshake TCP
             self.sock.connect((self.server_host, self.server_port))
             logger.info("🔗 Đã thiết lập kết nối TCP thành công với %s:%d.", self.server_host, self.server_port)
 
@@ -89,8 +117,13 @@ class ClientCore:
             handshake_success = self._perform_handshake(protocol_version=protocol_version)
             if handshake_success:
                 self.is_connected = True
-                # Bỏ timeout kết nối, đưa socket về chế độ bình thường
+                # Bỏ timeout để socket hoạt động ở chế độ bình thường
                 self.sock.settimeout(None)
+
+                # 4. Kích hoạt Luồng 2 (Receiver Thread) chạy nền nếu được yêu cầu
+                if start_receiver:
+                    self._start_receiver()
+
                 return True
             else:
                 self.disconnect()
@@ -118,15 +151,7 @@ class ClientCore:
             return False
 
     def _perform_handshake(self, protocol_version: int = PROTOCOL_VERSION) -> bool:
-        """
-        Gửi yêu cầu HELLO_HANDSHAKE và xử lý phản hồi từ Server.
-
-        Args:
-            protocol_version: Phiên bản giao thức đóng gói trong gói tin.
-
-        Returns:
-            bool: True nếu nhận được HANDSHAKE_ACK, False nếu bị từ chối hoặc lỗi.
-        """
+        """Thực hiện trao đổi gói tin HELLO_HANDSHAKE và HANDSHAKE_ACK."""
         if not self.sock:
             return False
 
@@ -137,7 +162,6 @@ class ClientCore:
                 protocol_version,
             )
 
-            # 1. Đóng gói và gửi HELLO_HANDSHAKE
             hello_payload = {
                 "client_name": self.client_name,
                 "client_version": protocol_version,
@@ -149,10 +173,8 @@ class ClientCore:
             )
             self.sock.sendall(packet)
 
-            # 2. Đọc gói tin phản hồi từ Server
             response = recv_packet(self.sock)
 
-            # 3. Phân loại phản hồi
             if response.msg_type == MessageType.HANDSHAKE_ACK:
                 self.server_info = response.to_json()
                 logger.info(
@@ -181,12 +203,102 @@ class ClientCore:
             logger.error("❌ Lỗi xảy ra trong quá trình trao đổi Handshake: %s", exc)
             return False
 
+    def _start_receiver(self) -> None:
+        """Khởi chạy Luồng lắng nghe ngầm (Receiver Thread)."""
+        self._receiver_thread = threading.Thread(
+            target=self._receiver_loop,
+            name=f"ClientRecv-{self.client_name}",
+            daemon=True,
+        )
+        self._receiver_thread.start()
+        logger.info("🎧 Receiver Thread đã khởi động và đang lắng nghe phản hồi từ Server...")
+
+    def _receiver_loop(self) -> None:
+        """
+        Vòng lặp chạy trong Receiver Thread:
+        Đọc liên tục các gói tin từ Server trả về và phân phát cho callbacks / queue.
+        """
+        while self.is_connected and self.sock:
+            try:
+                packet = recv_packet(self.sock)
+                # Đưa vào queue để GUI / Caller có thể lấy ra
+                self.received_queue.put(packet)
+
+                # Gọi callback chung nếu có
+                if self.on_packet_received:
+                    try:
+                        self.on_packet_received(packet)
+                    except Exception as e:
+                        logger.error("Lỗi trong on_packet_received callback: %s", e)
+
+                # Gọi các callback chuyên biệt theo msg_type
+                msg_key = int(packet.msg_type)
+                if msg_key in self._packet_callbacks:
+                    for cb in self._packet_callbacks[msg_key]:
+                        try:
+                            cb(packet)
+                        except Exception as e:
+                            logger.error("Lỗi trong packet callback [%s]: %s", msg_key, e)
+
+            except ConnectionClosedError:
+                if self.is_connected:
+                    logger.warning("🔌 Server đã ngắt kết nối.")
+                break
+            except (ConnectionResetError, ConnectionAbortedError):
+                if self.is_connected:
+                    logger.warning("⚠️ Kết nối tới Server bị reset đột ngột.")
+                break
+            except OSError:
+                # Socket có thể đã được close bởi disconnect()
+                break
+            except Exception as exc:
+                if self.is_connected:
+                    logger.error("❌ Lỗi không mong muốn trong Receiver Loop: %s", exc)
+                break
+
+        self.is_connected = False
+
+    def send_packet(
+        self,
+        msg_type: MessageType | int,
+        payload: Any = b"",
+        flags: int = 0,
+    ) -> bool:
+        """
+        Gửi một gói tin đến Server an toàn đa luồng (Thread-Safe).
+        """
+        if not self.is_connected or not self.sock:
+            logger.error("Không thể gửi: Socket chưa kết nối.")
+            return False
+
+        try:
+            packet_bytes = create_packet(msg_type, payload, flags=flags)
+            with self._send_lock:
+                if self.sock:
+                    self.sock.sendall(packet_bytes)
+            return True
+        except (OSError, ConnectionError) as exc:
+            logger.error("Lỗi khi gửi gói tin lên Server: %s", exc)
+            self.is_connected = False
+            return False
+
+    def send_chat(self, text: str) -> bool:
+        """Tiện ích gửi tin nhắn trò chuyện lên phòng chat chung."""
+        return self.send_packet(
+            MessageType.CHAT_BROADCAST,
+            {"sender": self.client_name, "text": text},
+        )
+
+    def send_heartbeat(self) -> bool:
+        """Tiện ích gửi gói tin kiểm tra nhịp tim (PING) lên Server."""
+        return self.send_packet(
+            MessageType.HEARTBEAT_PING,
+            {"client": self.client_name},
+        )
+
     def disconnect(self, send_notice: bool = True) -> None:
         """
         Chủ động ngắt kết nối với Server (Graceful Disconnect).
-
-        Args:
-            send_notice: Gửi thông điệp DISCONNECT_NOTICE trước khi đóng socket nếu True.
         """
         if not self.is_connected and not self.sock:
             return
@@ -194,17 +306,23 @@ class ClientCore:
         logger.info("Đang ngắt kết nối tới Server...")
         if self.sock and self.is_connected and send_notice:
             try:
-                # Gửi thông báo ngắt kết nối lịch sự tới server
                 disconnect_packet = create_packet(
                     MessageType.DISCONNECT_NOTICE,
                     {"reason": "Client graceful shutdown"},
                 )
-                self.sock.sendall(disconnect_packet)
+                with self._send_lock:
+                    self.sock.sendall(disconnect_packet)
             except OSError:
                 pass
 
-        self._cleanup_socket()
         self.is_connected = False
+        self._cleanup_socket()
+
+        # Chờ Receiver thread kết thúc
+        if self._receiver_thread and threading.current_thread() != self._receiver_thread:
+            self._receiver_thread.join(timeout=1.0)
+            self._receiver_thread = None
+
         logger.info("🔌 Đã ngắt kết nối hoàn tất.")
 
     def _cleanup_socket(self) -> None:
