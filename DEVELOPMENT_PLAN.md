@@ -186,7 +186,7 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - **Kỹ thuật Packet Framing:** Để giải quyết vấn đề trên, giao thức của chúng ta sẽ sử dụng phương pháp **Header Độ Dài Cố Định (Fixed-length Header)** chứa kích thước của Payload. Bên nhận sẽ luôn đọc đủ Header trước, trích xuất độ dài `N`, sau đó lặp đọc đúng `N` bytes tiếp theo.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 1.1: Định nghĩa Cấu trúc Packet chuẩn (Fixed Header + Dynamic Payload)**
+- [x] **Micro-step 1.1: Định nghĩa Cấu trúc Packet chuẩn (Fixed Header + Dynamic Payload)**
   - Thiết kế Header nhị phân kích thước cố định **16 bytes**:
     - `Magic Bytes` (2 bytes, vd: `b"CA"` - Collaboration App): Nhận diện gói tin hợp lệ của app.
     - `Version` (1 byte, vd: `1`): Phiên bản giao thức.
@@ -194,21 +194,21 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
     - `Flags` (1 byte): Đánh dấu (vd: `0x01` là nén, `0x02` là đã mã hóa).
     - `Reserved` (2 bytes): Dự phòng mở rộng tương lai.
     - `Payload Length` (8 bytes - 64-bit integer): Kích thước chính xác của payload tính bằng bytes.
-- [ ] **Micro-step 1.2: Xây dựng bảng Message Types (`common/message_types.py`)**
+- [x] **Micro-step 1.2: Xây dựng bảng Message Types (`common/message_types.py`)**
   - `AUTH_REQ (101)`, `AUTH_RESP_SUCCESS (102)`, `AUTH_RESP_FAIL (103)`
   - `USER_LIST_REQ (201)`, `USER_LIST_RESP (202)`, `USER_STATUS_BROADCAST (203)`
   - `CHAT_BROADCAST (301)`, `CHAT_DIRECT (302)`, `CHAT_ACK (303)`
   - `FILE_OFFER_REQ (401)`, `FILE_OFFER_RESP (402)`, `FILE_CHUNK (403)`, `FILE_ACK (404)`
   - `HEARTBEAT_PING (501)`, `HEARTBEAT_PONG (502)`
   - `DISCONNECT_NOTICE (601)`
-- [ ] **Micro-step 1.3: Hiện thực module Đóng gói & Mở gói (`common/protocol.py`)**
-  - Viết hàm `create_packet(msg_type, payload_bytes, is_encrypted=False) -> bytes` dùng `struct.pack("!2sBBHBQ", ...)`.
+- [x] **Micro-step 1.3: Hiện thực module Đóng gói & Mở gói (`common/protocol.py`)**
+  - Viết hàm `create_packet(msg_type, payload_bytes, is_encrypted=False) -> bytes` dùng `struct.pack("!2sBHBHQ", ...)`.
   - Viết hàm đọc đúng chính xác số bytes từ socket: `recv_exact(sock, length) -> bytes`.
-  - Viết hàm `recv_packet(sock) -> (msg_type, payload_bytes, is_encrypted)`:
+  - Viết hàm `recv_packet(sock) -> Packet`:
     - Bước 1: Đọc 16 bytes header bằng `recv_exact`.
     - Bước 2: Parse thông tin header, kiểm tra Magic Bytes.
     - Bước 3: Đọc tiếp `payload_length` bytes bằng `recv_exact`.
-- [ ] **Micro-step 1.4: Viết tài liệu Protocol Specification (`docs/protocol_specs.md`)**
+- [x] **Micro-step 1.4: Viết tài liệu Protocol Specification (`docs/protocol_specs.md`)**
   - Mô tả chi tiết từng byte trong Header.
   - Vẽ sơ đồ trạng thái (Client State Machine: `DISCONNECTED` -> `CONNECTING` -> `AUTHENTICATING` -> `ONLINE` -> `TRANSFERRING_FILE` -> `DISCONNECTED`).
 
