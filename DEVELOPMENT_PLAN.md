@@ -227,19 +227,19 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - Cách thức hoạt động của địa chỉ IP (IPv4) và Cổng mạng (Port) trong hệ điều hành.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 2.1: Xây dựng Server Socket cơ bản (`server/server_core.py`)**
+- [x] **Micro-step 2.1: Xây dựng Server Socket cơ bản (`server/server_core.py`)**
   - Khởi tạo socket TCP, gán cờ `SO_REUSEADDR` để tránh lỗi "Address already in use".
   - Bind vào `0.0.0.0` (lắng nghe mọi card mạng) và Port mặc định (ví dụ: `9000`).
   - Gọi `listen(backlog=10)`.
-- [ ] **Micro-step 2.2: Xây dựng Client Socket cơ bản (`client/client_core.py`)**
+- [x] **Micro-step 2.2: Xây dựng Client Socket cơ bản (`client/client_core.py`)**
   - Tạo socket TCP, gọi `connect((server_ip, server_port))`.
   - Kiểm tra kết nối thành công hay thất bại (xử lý ngoại lệ `ConnectionRefusedError`).
-- [ ] **Micro-step 2.3: Thực hiện Bắt tay Ứng dụng (Application Handshake)**
+- [x] **Micro-step 2.3: Thực hiện Bắt tay Ứng dụng (Application Handshake)**
   - Sau khi kết nối TCP thành công, Client tự động gửi gói tin `HELLO_HANDSHAKE` chứa phiên bản giao thức client.
   - Server kiểm tra phiên bản:
     - Nếu hợp lệ: Trả về gói tin `HANDSHAKE_ACK` kèm theo thông điệp chào mừng và Server ID.
     - Nếu không hợp lệ: Trả về `HANDSHAKE_REJECT` và đóng socket.
-- [ ] **Micro-step 2.4: Tạo 2 script chạy thử nghiệm đơn giản**
+- [x] **Micro-step 2.4: Tạo 2 script chạy thử nghiệm đơn giản**
   - `run_server.py`: In ra màn hình console khi có client kết nối (IP và Port của Client).
   - `run_client.py`: In ra thông điệp "Connected to Server successfully! Handshake ACK received".
 
