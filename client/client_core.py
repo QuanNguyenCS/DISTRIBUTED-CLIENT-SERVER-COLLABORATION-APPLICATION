@@ -33,6 +33,7 @@ from client.file_transfer import (
     read_file_chunks,
     unpack_chunk_payload,
 )
+from client.heartbeat import HeartbeatSender
 
 logger = get_logger("client.core")
 
@@ -109,6 +110,10 @@ class ClientCore:
         self.register_callback(MessageType.FILE_CHUNK, self._handle_file_chunk)
         self.register_callback(MessageType.FILE_ACK, self._handle_file_ack)
 
+        # Quản lý luồng gửi nhịp tim (Heartbeat / Keepalive)
+        self.heartbeat_sender: Optional[HeartbeatSender] = None
+        self.heartbeat_interval: float = 4.0
+
     def register_callback(
         self, msg_type: MessageType | int, callback: Callable[[Packet], None]
     ) -> None:
@@ -123,6 +128,7 @@ class ClientCore:
         timeout: float = 5.0,
         protocol_version: int = PROTOCOL_VERSION,
         start_receiver: bool = True,
+        start_heartbeat: bool = True,
     ) -> bool:
         """
         Kết nối tới Server TCP, thực hiện bắt tay và khởi chạy luồng lắng nghe nền.
@@ -165,6 +171,11 @@ class ClientCore:
                 # 4. Kích hoạt Luồng 2 (Receiver Thread) chạy nền nếu được yêu cầu
                 if start_receiver:
                     self._start_receiver()
+
+                # 5. Kích hoạt Luồng Heartbeat định kỳ gửi PING duy trì kết nối
+                if start_heartbeat:
+                    self.heartbeat_sender = HeartbeatSender(self, interval_seconds=self.heartbeat_interval)
+                    self.heartbeat_sender.start()
 
                 return True
             else:
@@ -732,6 +743,12 @@ class ClientCore:
         self.is_authenticated = False
         self.username = None
         self.online_users = []
+
+        # Dừng luồng Heartbeat nếu đang chạy
+        if self.heartbeat_sender:
+            self.heartbeat_sender.stop()
+            self.heartbeat_sender = None
+
         self._cleanup_socket()
 
         # Chờ Receiver thread kết thúc

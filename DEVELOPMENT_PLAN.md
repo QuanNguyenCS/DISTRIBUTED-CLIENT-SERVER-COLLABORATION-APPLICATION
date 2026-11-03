@@ -388,17 +388,17 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - **Cơ chế Heartbeat (Nhịp tim):** Định kỳ (vd: mỗi 5 giây), Client gửi gói tin `HEARTBEAT_PING`. Server cập nhật `last_seen_time`. Nếu quá 15 giây không thấy Ping, Server coi như Client đã chết và chủ động đóng socket, giải phóng bộ nhớ.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 7.1: Bọc toàn diện khối Try-Except xử lý ngoại lệ Socket**
+- [x] **Micro-step 7.1: Bọc toàn diện khối Try-Except xử lý ngoại lệ Socket**
   - Tại `protocol.py`, `client_handler.py`, `client_core.py`: Bắt `socket.error`, `ConnectionResetError`, `BrokenPipeError`, `TimeoutError`.
   - Đảm bảo khi xảy ra lỗi, code luôn nhảy vào khối `finally:` để gọi `sock.close()`.
-- [ ] **Micro-step 7.2: Xây dựng cơ chế Heartbeat (Keepalive)**
+- [x] **Micro-step 7.2: Xây dựng cơ chế Heartbeat (Keepalive)**
   - Phía Client: Khởi chạy thread nền `HeartbeatThread` gửi `HEARTBEAT_PING` mỗi 5 giây.
   - Phía Server: Lưu trường `last_seen = time.time()` cho mỗi user.
   - Phía Server: Có một luồng quét dọn `ZombieCleanerThread` chạy mỗi 10 giây. Nếu user nào có `time.time() - last_seen > 15`:
     - Đóng socket.
     - Xóa khỏi `SessionManager`.
     - Broadcast thông báo cho các client khác biết user đã mất kết nối.
-- [ ] **Micro-step 7.3: Xử lý Thoát Ứng dụng An toàn (Graceful Shutdown)**
+- [x] **Micro-step 7.3: Xử lý Thoát Ứng dụng An toàn (Graceful Shutdown)**
   - Bắt tín hiệu `Ctrl + C` hoặc sự kiện đóng cửa sổ (Close Window).
   - Gửi gói tin `DISCONNECT_NOTICE` lên Server trước khi thoát để Server lập tức giải phóng tài nguyên mà không cần đợi timeout.
 

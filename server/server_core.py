@@ -9,6 +9,7 @@ from __future__ import annotations
 import socket
 import sys
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from common.logger import get_logger
@@ -68,6 +69,12 @@ class ServerCore:
         # Bộ định tuyến tin nhắn (Message Router)
         self.router = MessageRouter(self)
 
+        # Giám sát kết nối Zombie & Quản lý nhịp tim
+        self.zombie_timeout: float = 15.0  # Quá 15 giây không có tín hiệu coi như mất mạng ngầm
+        self.zombie_check_interval: float = 3.0
+        self._zombie_cleaner_thread: Optional[threading.Thread] = None
+        self._stop_zombie_event = threading.Event()
+
     def start(self) -> None:
         """
         Khởi động TCP Server socket, bind và listen.
@@ -90,6 +97,15 @@ class ServerCore:
                 # 4. Bắt đầu lắng nghe các kết nối từ client
                 self.server_sock.listen(self.DEFAULT_BACKLOG)
                 self.is_running = True
+
+                # 5. Khởi chạy luồng dọn dẹp Zombie kết nối ngầm
+                self._stop_zombie_event.clear()
+                self._zombie_cleaner_thread = threading.Thread(
+                    target=self._run_zombie_cleaner,
+                    name="ZombieCleanerThread",
+                    daemon=True,
+                )
+                self._zombie_cleaner_thread.start()
 
                 logger.info(
                     "🚀 Server '%s' đã khởi động thành công và đang lắng nghe tại %s:%d (Backlog: %d)",
@@ -347,6 +363,30 @@ class ServerCore:
         finally:
             self.stop()
 
+    def _run_zombie_cleaner(self) -> None:
+        """
+        Luồng nền định kỳ rà soát và đóng các kết nối Zombie (Half-Open Sockets).
+        Nếu Client bị rớt mạng đột ngột không gửi FIN, sau zombie_timeout giây không có
+        Heartbeat Ping thì Server sẽ chủ động đóng socket và dọn dẹp bộ nhớ.
+        """
+        logger.info("🧟 Luồng ZombieCleaner đã khởi động (Quét mỗi %.1fs, Timeout: %.1fs)...", self.zombie_check_interval, self.zombie_timeout)
+        while not self._stop_zombie_event.is_set() and self.is_running:
+            now = time.time()
+            handlers = self.get_all_handlers()
+            for h in handlers:
+                if now - h.last_seen > self.zombie_timeout:
+                    logger.warning(
+                        "🧟 [ZombieCleaner] Client [%s:%d] ('%s') đã mất kết nối ngầm (Không có heartbeat trong %.1fs). Đóng kết nối...",
+                        h.client_addr[0],
+                        h.client_addr[1],
+                        h.username or h.client_name,
+                        now - h.last_seen,
+                    )
+                    h.close()
+
+            self._stop_zombie_event.wait(timeout=self.zombie_check_interval)
+        logger.info("🛑 Luồng ZombieCleaner đã dừng.")
+
     def stop(self) -> None:
         """
         Đóng socket server và dọn dẹp toàn bộ các luồng Client đang kết nối.
@@ -355,6 +395,9 @@ class ServerCore:
             if not self.is_running and self.server_sock is None:
                 return
             self.is_running = False
+
+            # Dừng luồng ZombieCleaner
+            self._stop_zombie_event.set()
 
             # 1. Đóng toàn bộ các ClientHandler đang hoạt động
             with self._handlers_lock:

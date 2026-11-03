@@ -63,6 +63,9 @@ class ClientHandler(threading.Thread):
         self.is_authenticated: bool = False
         self.username: Optional[str] = None
 
+        # Giám sát nhịp tim (Liveness / Heartbeat tracking)
+        self.last_seen: float = time.time()
+
     def run(self) -> None:
         """
         Vòng lặp lắng nghe chính chạy trong luồng riêng.
@@ -120,6 +123,8 @@ class ClientHandler(threading.Thread):
         """
         Phân loại và điều hướng xử lý gói tin nhận được.
         """
+        # Cập nhật thời điểm nhận gói tin cuối cùng từ Client
+        self.last_seen = time.time()
         msg_type = packet.msg_type
         logger.debug(
             "[%s:%d] Nhận gói tin mã %s (Payload: %d bytes)",
