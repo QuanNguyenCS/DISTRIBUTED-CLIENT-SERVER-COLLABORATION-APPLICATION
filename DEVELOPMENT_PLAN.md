@@ -447,20 +447,20 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
   - Giao diện Tkinter dùng hàm `root.after(100, check_queue)` để định kỳ kiểm tra hàng đợi và cập nhật giao diện mượt mà 60fps.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 9.1: Xây dựng Cửa sổ Đăng nhập (`client/gui/login_view.py`)**
+- [x] **Micro-step 9.1: Xây dựng Cửa sổ Đăng nhập (`client/gui/login_view.py`)**
   - Form nhập: Server Host (mặc định `127.0.0.1`), Server Port (mặc định `9000`), Username.
   - Nút "Connect & Join". Hiển thị trạng thái kết nối hoặc thông báo lỗi nếu trùng tên.
-- [ ] **Micro-step 9.2: Xây dựng Cửa sổ Chính (`client/gui/app.py` & `chat_view.py`)**
+- [x] **Micro-step 9.2: Xây dựng Cửa sổ Chính (`client/gui/app.py` & `chat_view.py`)**
   - **Cột trái:** Danh sách người dùng online (`Listbox` có biểu tượng xanh/trạng thái). Click đúp vào tên để mở tab chat riêng.
   - **Khu vực trung tâm (Notebook Tabs):**
     - Tab 1: **"Phòng chung" (Global Chat)**.
     - Tab 2..N: Các tab **Chat riêng (Private)** với từng người.
   - **Khung dưới:** Ô nhập tin nhắn, nút "Gửi", nút "Chọn File đính kèm" (Paperclip icon).
-- [ ] **Micro-step 9.3: Xây dựng Cửa sổ Thanh Tiến Trình Truyền File (`client/gui/file_progress.py`)**
+- [x] **Micro-step 9.3: Xây dựng Cửa sổ Thanh Tiến Trình Truyền File (`client/gui/file_progress.py`)**
   - Hộp thoại popup: Tên file, dung lượng, tốc độ truyền (KB/s).
   - Thanh `ttk.Progressbar` hiển thị phần trăm từ `0%` đến `100%`.
   - Thông báo "Truyền file thành công!" hoặc nút "Hủy".
-- [ ] **Micro-step 9.4: Tích hợp Threading & Queue**
+- [x] **Micro-step 9.4: Tích hợp Threading & Queue**
   - Đảm bảo khi gửi file lớn 50MB, thanh tiến trình chạy mượt mà và người dùng vẫn có thể chat văn bản bình thường không bị đứng hình.
 
 #### 🧪 Tiêu chí nghiệm thu (Acceptance Criteria):
