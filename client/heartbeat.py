@@ -41,6 +41,13 @@ class HeartbeatSender(threading.Thread):
         logger.info("💓 Luồng Heartbeat bắt đầu hoạt động (Chu kỳ: %.1fs)...", self.interval)
 
         while not self._stop_event.is_set() and self.client.is_connected:
+            # Chờ chu kỳ tiếp theo hoặc sự kiện dừng
+            if self._stop_event.wait(timeout=self.interval):
+                break
+
+            if not self.client.is_connected:
+                break
+
             # Gửi gói tin PING
             try:
                 ping_payload = {
@@ -56,10 +63,6 @@ class HeartbeatSender(threading.Thread):
                     break
             except Exception as e:
                 logger.error("Lỗi trong luồng Heartbeat: %s", e)
-                break
-
-            # Chờ chu kỳ tiếp theo hoặc sự kiện dừng
-            if self._stop_event.wait(timeout=self.interval):
                 break
 
         self.is_running = False

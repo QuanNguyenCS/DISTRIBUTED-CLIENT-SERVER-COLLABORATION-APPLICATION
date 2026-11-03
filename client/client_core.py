@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from common.crypto_utils import derive_key
 from common.logger import get_logger
 from common.message_types import MessageType
 from common.protocol import (
@@ -113,6 +114,19 @@ class ClientCore:
         # Quản lý luồng gửi nhịp tim (Heartbeat / Keepalive)
         self.heartbeat_sender: Optional[HeartbeatSender] = None
         self.heartbeat_interval: float = 4.0
+
+        # Lớp mã hóa bảo mật (AES-Fernet)
+        self.crypto_key: Optional[bytes] = None
+
+    def enable_encryption(self, passphrase: Optional[str] = None) -> None:
+        """Kích hoạt mã hóa đối xứng AES cho toàn bộ payload gửi đi."""
+        self.crypto_key = derive_key(passphrase) if passphrase else derive_key()
+        logger.info("🔒 Đã kích hoạt lớp mã hóa AES cho Client.")
+
+    def disable_encryption(self) -> None:
+        """Tắt mã hóa payload."""
+        self.crypto_key = None
+        logger.info("🔓 Đã tắt lớp mã hóa AES.")
 
     def register_callback(
         self, msg_type: MessageType | int, callback: Callable[[Packet], None]
@@ -273,7 +287,7 @@ class ClientCore:
         """
         while self.is_connected and self.sock:
             try:
-                packet = recv_packet(self.sock)
+                packet = recv_packet(self.sock, decrypt_key=self.crypto_key)
                 # Đưa vào queue để GUI / Caller có thể lấy ra
                 self.received_queue.put(packet)
 
@@ -325,7 +339,22 @@ class ClientCore:
             return False
 
         try:
-            packet_bytes = create_packet(msg_type, payload, flags=flags)
+            # Chỉ mã hóa các gói tin nội dung dữ liệu (Data Plane: CHAT, FILE)
+            # Giữ nguyên các gói tin điều khiển (Control Plane: AUTH, HANDSHAKE, USER_LIST, PING)
+            encrypt_target = (
+                self.crypto_key is not None
+                and int(msg_type) in (
+                    MessageType.CHAT_BROADCAST,
+                    MessageType.CHAT_DIRECT,
+                    MessageType.FILE_CHUNK,
+                )
+            )
+            packet_bytes = create_packet(
+                msg_type,
+                payload,
+                flags=flags,
+                encrypt_key=self.crypto_key if encrypt_target else None,
+            )
             with self._send_lock:
                 if self.sock:
                     self.sock.sendall(packet_bytes)

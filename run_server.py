@@ -43,6 +43,12 @@ def main() -> None:
         default="CollabServer-Alpha",
         help="Mã định danh của Server (Mặc định: CollabServer-Alpha)",
     )
+    parser.add_argument(
+        "--passphrase",
+        type=str,
+        default=None,
+        help="Mật khẩu mã hóa AES phòng chat (nếu có)",
+    )
 
     args = parser.parse_args()
 
@@ -51,6 +57,8 @@ def main() -> None:
     print("=" * 65)
 
     server = ServerCore(host=args.host, port=args.port, server_id=args.server_id)
+    if args.passphrase:
+        server.enable_encryption(args.passphrase)
 
     try:
         server.serve_forever()

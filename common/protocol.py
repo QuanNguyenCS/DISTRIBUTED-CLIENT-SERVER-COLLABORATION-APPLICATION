@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Union
 
 from common.message_types import MessageType
+from common.crypto_utils import decrypt_payload, encrypt_payload
 
 # ==============================================================================
 # HẰNG SỐ GIAO THỨC (PROTOCOL CONSTANTS)
@@ -119,6 +120,22 @@ class Packet:
         """Giải mã payload dạng chuỗi UTF-8."""
         return self.payload.decode("utf-8")
 
+    def get_decrypted_packet(self, key: bytes) -> Packet:
+        """
+        Nếu gói tin được mã hóa (FLAG_ENCRYPTED), tiến hành giải mã payload
+        và trả về một đối tượng Packet mới với payload đã được giải mã.
+        """
+        if not self.is_encrypted:
+            return self
+
+        decrypted_bytes = decrypt_payload(self.payload, key)
+        return Packet(
+            msg_type=self.msg_type,
+            payload=decrypted_bytes,
+            flags=self.flags & ~FLAG_ENCRYPTED,
+            version=self.version,
+        )
+
 
 # ==============================================================================
 # CÁC HÀM XỬ LÝ ĐÓNG GÓI & TRUYỀN NHẬN (PACK / UNPACK / SOCKET IO)
@@ -128,15 +145,18 @@ def create_packet(
     payload: Union[bytes, str, dict, list] = b"",
     flags: int = FLAG_NONE,
     version: int = PROTOCOL_VERSION,
+    encrypt_key: Optional[bytes] = None,
 ) -> bytes:
     """
     Đóng gói Header nhị phân 16 bytes cùng với Payload thành một chuỗi bytes hoàn chỉnh.
+    Hỗ trợ mã hóa đối xứng nếu truyền vào encrypt_key.
 
     Args:
         msg_type: Loại thông điệp (MessageType enum hoặc int).
         payload: Dữ liệu cần gửi (bytes nhị phân, str văn bản, hoặc dict/list JSON).
         flags: Các cờ bitmask (mã hóa, nén,...).
         version: Phiên bản giao thức (mặc định là 1).
+        encrypt_key: Khóa bí mật AES-Fernet nếu muốn mã hóa payload trước khi gửi.
 
     Returns:
         bytes: Dữ liệu hoàn chỉnh sẵn sàng để gửi qua socket.sendall().
@@ -150,6 +170,11 @@ def create_packet(
         payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     else:
         raise TypeError(f"Payload không hợp lệ: {type(payload)}. Phải là bytes, str hoặc dict/list.")
+
+    # Mã hóa payload nếu có encrypt_key
+    if encrypt_key is not None:
+        payload_bytes = encrypt_payload(payload_bytes, encrypt_key)
+        flags |= FLAG_ENCRYPTED
 
     payload_len = len(payload_bytes)
     if payload_len > MAX_PAYLOAD_SIZE:
@@ -204,16 +229,18 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
     return bytes(buffer)
 
 
-def recv_packet(sock: socket.socket) -> Packet:
+def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Packet:
     """
     Đọc một gói tin hoàn chỉnh từ TCP socket:
       Bước 1: Đọc chính xác 16 bytes Header cố định bằng recv_exact.
       Bước 2: Parse thông tin Header bằng struct.unpack, kiểm tra Magic Bytes và Version.
       Bước 3: Đọc chính xác payload_length bytes tiếp theo bằng recv_exact.
-      Bước 4: Trả về đối tượng Packet.
+      Bước 4: Giải mã nếu có decrypt_key và cờ FLAG_ENCRYPTED được bật.
+      Bước 5: Trả về đối tượng Packet.
 
     Args:
         sock: Socket TCP đang kết nối.
+        decrypt_key: Khóa giải mã AES (nếu muốn tự động giải mã).
 
     Returns:
         Packet: Đối tượng gói tin hoàn chỉnh.
@@ -262,10 +289,16 @@ def recv_packet(sock: socket.socket) -> Packet:
         # Nếu gặp mã chưa biết nhưng header vẫn hợp lệ, vẫn giữ dạng int để không crash
         msg_type = raw_msg_type  # type: ignore
 
-    # Bước 4: Trả về Packet object
-    return Packet(
+    # Bước 4: Tạo Packet object
+    packet = Packet(
         msg_type=msg_type,
         payload=payload_bytes,
         flags=flags,
         version=version,
     )
+
+    # Bước 5: Giải mã nếu có decrypt_key
+    if decrypt_key is not None and packet.is_encrypted:
+        packet = packet.get_decrypted_packet(decrypt_key)
+
+    return packet

@@ -82,7 +82,7 @@ class ClientHandler(threading.Thread):
         try:
             while self.is_running:
                 # Đọc gói tin hoàn chỉnh theo chuẩn Application Layer Framing
-                packet = recv_packet(self.client_sock)
+                packet = recv_packet(self.client_sock, decrypt_key=self.server.crypto_key)
                 self._dispatch_packet(packet)
 
         except ConnectionClosedError:
@@ -320,7 +320,20 @@ class ClientHandler(threading.Thread):
             return False
 
         try:
-            packet_bytes = create_packet(msg_type, payload, flags=flags)
+            encrypt_target = (
+                self.server.crypto_key is not None
+                and int(msg_type) in (
+                    MessageType.CHAT_BROADCAST,
+                    MessageType.CHAT_DIRECT,
+                    MessageType.FILE_CHUNK,
+                )
+            )
+            packet_bytes = create_packet(
+                msg_type,
+                payload,
+                flags=flags,
+                encrypt_key=self.server.crypto_key if encrypt_target else None,
+            )
             with self._send_lock:
                 if self.client_sock:
                     self.client_sock.sendall(packet_bytes)

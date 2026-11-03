@@ -417,16 +417,16 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - Header của gói tin (16 bytes) giữ nguyên để định tuyến, nhưng toàn bộ Payload bên trong được mã hóa thành chuỗi bytes ngẫu nhiên.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 8.1: Xây dựng Module Mật mã (`common/crypto_utils.py`)**
+- [x] **Micro-step 8.1: Xây dựng Module Mật mã (`common/crypto_utils.py`)**
   - Sử dụng thư viện `cryptography.fernet.Fernet` (chuẩn AES-128-CBC + HMAC SHA256) hoặc `AES-GCM` (Authenticated Encryption).
   - Viết hàm `encrypt_payload(plain_bytes, key) -> bytes`.
   - Viết hàm `decrypt_payload(cipher_bytes, key) -> bytes`.
-- [ ] **Micro-step 8.2: Quản lý Khóa Bí mật (Pre-Shared Key / Secret Key)**
+- [x] **Micro-step 8.2: Quản lý Khóa Bí mật (Pre-Shared Key / Secret Key)**
   - Thiết lập khóa bảo mật cho phòng chat (được cấu hình trước qua file config hoặc sinh từ mật khẩu chung bằng PBKDF2).
-- [ ] **Micro-step 8.3: Tích hợp vào Quy trình Đóng/Mở Gói tin (`common/protocol.py`)**
+- [x] **Micro-step 8.3: Tích hợp vào Quy trình Đóng/Mở Gói tin (`common/protocol.py`)**
   - Khi gửi: Payload gốc -> `encrypt_payload` -> Gán cờ `FLAG_ENCRYPTED = 0x02` trong Header -> Gửi socket.
   - Khi nhận: Đọc Header thấy có cờ `FLAG_ENCRYPTED` -> `decrypt_payload` -> Trả về dữ liệu gốc để xử lý.
-- [ ] **Micro-step 8.4: Kiểm thử bắt gói tin với Wireshark (Bằng chứng cho Báo cáo)**
+- [x] **Micro-step 8.4: Kiểm thử bắt gói tin với Wireshark (Bằng chứng cho Báo cáo)**
   - Chạy Wireshark bắt cổng `9000`.
   - Gửi tin nhắn "Mat ma tuyet mat 123456".
   - Chụp màn hình Wireshark cho thấy trường Payload chỉ là các byte rác vô nghĩa không đọc được.

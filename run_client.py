@@ -120,6 +120,12 @@ def main() -> None:
         default=None,
         help="Tên đăng nhập của người dùng (3-20 ký tự, không dấu cách)",
     )
+    parser.add_argument(
+        "--passphrase",
+        type=str,
+        default=None,
+        help="Mật khẩu mã hóa AES phòng chat (nếu có)",
+    )
 
     args = parser.parse_args()
 
@@ -132,6 +138,8 @@ def main() -> None:
         server_port=args.port,
         client_name=args.username or "Guest-Client",
     )
+    if args.passphrase:
+        client.enable_encryption(args.passphrase)
 
     # Đăng ký callbacks xử lý các sự kiện đến từ Server
     client.register_callback(MessageType.CHAT_BROADCAST, handle_incoming_packet)

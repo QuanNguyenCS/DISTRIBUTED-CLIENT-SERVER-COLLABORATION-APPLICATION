@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from common.crypto_utils import derive_key
 from common.logger import get_logger
 from common.message_types import MessageType
 from common.protocol import (
@@ -74,6 +75,19 @@ class ServerCore:
         self.zombie_check_interval: float = 3.0
         self._zombie_cleaner_thread: Optional[threading.Thread] = None
         self._stop_zombie_event = threading.Event()
+
+        # Lớp Bảo mật & Mã hóa dữ liệu (Security Layer - AES/Fernet)
+        self.crypto_key: Optional[bytes] = None
+
+    def enable_encryption(self, passphrase: str) -> None:
+        """Kích hoạt mã hóa đối xứng AES (Fernet) cho Server."""
+        self.crypto_key = derive_key(passphrase)
+        logger.info("🔒 Đã kích hoạt lớp mã hóa AES cho Server.")
+
+    def disable_encryption(self) -> None:
+        """Tắt mã hóa đối xứng trên Server."""
+        self.crypto_key = None
+        logger.info("🔓 Đã tắt lớp mã hóa AES trên Server.")
 
     def start(self) -> None:
         """
