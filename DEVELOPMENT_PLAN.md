@@ -353,7 +353,7 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - **Mã băm SHA-256 (Checksum):** Tính mã hash của toàn bộ file trước khi gửi và sau khi ghép file xong để đối chiếu tính toàn vẹn 100% bit-by-bit.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 6.1: Thiết kế Giao thức Truyền File 3 Bước**
+- [x] **Micro-step 6.1: Thiết kế Giao thức Truyền File 3 Bước**
   1. **Bước 1 - Chào hỏi & Đề nghị truyền file (`FILE_OFFER_REQ`):**
      - Payload: `{"file_id": "uuid", "sender": "alice", "recipient": "bob", "file_name": "report.pdf", "file_size": 1048576, "total_chunks": 32, "sha256": "abc...123"}`.
   2. **Bước 2 - Phản hồi Chấp nhận / Từ chối (`FILE_OFFER_RESP`):**
@@ -362,13 +362,13 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
      - Header chunk: `{"file_id": "uuid", "chunk_index": 0, "chunk_size": 32768}` + Dữ liệu nhị phân của chunk.
   4. **Bước 4 - Hoàn tất & Xác nhận (`FILE_ACK`):**
      - Bên nhận ráp các chunk, tính lại SHA-256, so sánh với mã gốc và phản hồi thành công.
-- [ ] **Micro-step 6.2: Xây dựng Module File Transfer Client (`client/file_transfer.py`)**
+- [x] **Micro-step 6.2: Xây dựng Module File Transfer Client (`client/file_transfer.py`)**
   - Hàm `read_file_in_chunks(file_path, chunk_size=32768)` (dùng generator để tối ưu RAM).
   - Hàm `calculate_file_hash(file_path) -> str` (tính SHA-256).
   - Hàm `assemble_file_chunks(chunks_dict, output_path) -> bool`.
-- [ ] **Micro-step 6.3: Cơ chế Chuyển tiếp (Relay) File trên Server**
+- [x] **Micro-step 6.3: Cơ chế Chuyển tiếp (Relay) File trên Server**
   - Server nhận từng chunk từ Sender và chuyển tiếp ngay lập tức sang Recipient dựa trên `file_id` và `recipient_username` mà không cần lưu toàn bộ file vào đĩa cứng của server.
-- [ ] **Micro-step 6.4: Kiểm thử với các định dạng file khác nhau**
+- [x] **Micro-step 6.4: Kiểm thử với các định dạng file khác nhau**
   - File văn bản `.txt`, `.docx`.
   - File hình ảnh `.png`, `.jpg`.
   - File nén `.zip`, file nhị phân `.exe` hoặc `.pdf` dung lượng từ 1MB đến 50MB.

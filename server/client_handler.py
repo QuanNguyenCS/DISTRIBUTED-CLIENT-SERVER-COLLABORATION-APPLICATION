@@ -245,6 +245,47 @@ class ClientHandler(threading.Thread):
         elif msg_type == MessageType.CHAT_ACK:
             logger.debug("[%s] Nhận CHAT_ACK từ client.", self.client_name)
 
+        elif msg_type == MessageType.FILE_OFFER_REQ:
+            # Chuyển tiếp đề nghị gửi file
+            try:
+                offer_data = packet.to_json()
+            except Exception:
+                offer_data = {}
+            self.server.router.route_file_offer(
+                sender_username=self.username or self.client_name,
+                offer_data=offer_data,
+                sender_handler=self,
+            )
+
+        elif msg_type == MessageType.FILE_OFFER_RESP:
+            # Chuyển tiếp phản hồi nhận file
+            try:
+                resp_data = packet.to_json()
+            except Exception:
+                resp_data = {}
+            self.server.router.route_file_offer_response(
+                recipient_username=self.username or self.client_name,
+                resp_data=resp_data,
+            )
+
+        elif msg_type == MessageType.FILE_CHUNK:
+            # Chuyển tiếp mảnh dữ liệu file
+            self.server.router.route_file_chunk(
+                sender_username=self.username or self.client_name,
+                chunk_payload=packet.payload,
+            )
+
+        elif msg_type == MessageType.FILE_ACK:
+            # Chuyển tiếp xác nhận nhận file
+            try:
+                ack_data = packet.to_json()
+            except Exception:
+                ack_data = {}
+            self.server.router.route_file_ack(
+                recipient_username=self.username or self.client_name,
+                ack_data=ack_data,
+            )
+
         else:
             logger.warning(
                 "[%s:%d] Nhận loại gói tin chưa hỗ trợ xử lý ở giai đoạn này: %s",

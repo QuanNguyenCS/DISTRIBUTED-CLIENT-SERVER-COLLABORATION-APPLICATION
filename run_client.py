@@ -141,6 +141,12 @@ def main() -> None:
     client.register_callback(MessageType.USER_STATUS_BROADCAST, handle_incoming_packet)
     client.register_callback(MessageType.HEARTBEAT_PONG, handle_incoming_packet)
 
+    # Đăng ký callback khi nhận file thành công
+    def on_received_file(sender: str, file_name: str, save_path: str):
+        print(f"\n📁 [File Nhận Được] Bạn vừa nhận được file '{file_name}' từ '{sender}'! Đã lưu tại: {save_path}\n> ", end="", flush=True)
+
+    client.on_file_received = on_received_file
+
     try:
         # 1. Kết nối và thực hiện Handshake TCP
         success = client.connect(timeout=5.0)
@@ -187,6 +193,7 @@ def main() -> None:
         print("  HƯỚNG DẪN TRÒ CHUYỆN:")
         print("  - Gõ tin nhắn và Enter để chat phòng chung (Broadcast).")
         print("  - Gõ '@<username> <nội dung>' hoặc '/msg <username> <nội dung>' để chat riêng 1-1.")
+        print("  - Gõ '/file <username> <đường_dẫn>' để gửi file tin cậy (kèm SHA-256).")
         print("  - Gõ '/users' hoặc '/who' để xem danh sách đang online.")
         print("  - Gõ '/ping' để kiểm tra nhịp tim (Keepalive).")
         print("  - Gõ '/quit' hoặc '/exit' để đăng xuất và thoát an toàn.")
@@ -232,6 +239,22 @@ def main() -> None:
                     client.send_direct_message(target_user.strip(), direct_text.strip())
                 else:
                     print("⚠️ Cú pháp chat riêng: /msg <username> <nội dung>")
+            elif cmd_lower.startswith("/file ") or cmd_lower.startswith("/sendfile "):
+                # Gửi file theo cú pháp: /file username đường_dẫn_file
+                parts = user_input.split(maxsplit=2)
+                if len(parts) == 3:
+                    _, target_user, file_path = parts
+                    print(f"🚀 Bắt đầu gửi file '{file_path}' tới '{target_user}'...")
+                    def cli_progress(sent, total, pct):
+                        print(f"\r🚀 Đang truyền: {sent}/{total} chunks ({pct:.1f}%)...", end="", flush=True)
+                    ok, msg = client.send_file(target_user.strip(), file_path.strip(), progress_callback=cli_progress)
+                    print()
+                    if ok:
+                        print(f"✅ {msg}")
+                    else:
+                        print(f"❌ {msg}")
+                else:
+                    print("⚠️ Cú pháp gửi file: /file <username> <đường_dẫn_file>")
             else:
                 # Chat phòng chung
                 client.send_broadcast(user_input)

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 from common.logger import get_logger
 from common.message_types import MessageType
+from client.file_transfer import unpack_chunk_payload
 
 if TYPE_CHECKING:
     from server.client_handler import ClientHandler
@@ -31,6 +32,8 @@ class MessageRouter:
 
     def __init__(self, server: ServerCore) -> None:
         self.server = server
+        # Bản đồ file_id -> (sender_username, recipient_username)
+        self._file_routes: Dict[str, Tuple[str, str]] = {}
 
     def route_broadcast_message(
         self,
@@ -169,3 +172,102 @@ class MessageRouter:
             sender_handler.send_packet(MessageType.CHAT_ACK, ack_payload)
 
         return True, "Tin nhắn riêng đã được gửi thành công."
+
+    # ==========================================================================
+    # CÁC PHƯƠNG THỨC ĐỊNH TUYẾN TRUYỀN FILE (FILE TRANSFER RELAY)
+    # ==========================================================================
+    def route_file_offer(
+        self,
+        sender_username: str,
+        offer_data: Dict[str, Any],
+        sender_handler: Optional[ClientHandler] = None,
+    ) -> bool:
+        """Chuyển tiếp đề xuất gửi file (FILE_OFFER_REQ) tới người nhận."""
+        recipient = offer_data.get("recipient", "")
+        file_id = offer_data.get("file_id", "")
+
+        session = self.server.session_mgr.get_session(recipient)
+        if not session or not session.handler:
+            logger.warning("Truyền file thất bại: Người nhận '%s' không online.", recipient)
+            if sender_handler:
+                sender_handler.send_packet(
+                    MessageType.FILE_OFFER_RESP,
+                    {
+                        "file_id": file_id,
+                        "status": "REJECTED",
+                        "reason": f"Người nhận '{recipient}' không online.",
+                    },
+                )
+            return False
+
+        # Lưu ánh xạ file_id để chuyển tiếp các chunk tiếp theo
+        self._file_routes[file_id] = (sender_username, session.username)
+
+        logger.info(
+            "📁 [File Offer] %s đề xuất gửi file '%s' (%s bytes) cho %s",
+            sender_username,
+            offer_data.get("file_name"),
+            offer_data.get("file_size"),
+            session.username,
+        )
+
+        return session.handler.send_packet(MessageType.FILE_OFFER_REQ, offer_data)
+
+    def route_file_offer_response(
+        self,
+        recipient_username: str,
+        resp_data: Dict[str, Any],
+    ) -> bool:
+        """Chuyển tiếp phản hồi đồng ý/từ chối nhận file (FILE_OFFER_RESP) về cho người gửi."""
+        file_id = resp_data.get("file_id", "")
+        route = self._file_routes.get(file_id)
+
+        sender_username = resp_data.get("sender") or (route[0] if route else "")
+        session = self.server.session_mgr.get_session(sender_username)
+        if not session or not session.handler:
+            logger.warning("Không tìm thấy người gửi '%s' để trả lời FILE_OFFER_RESP.", sender_username)
+            return False
+
+        return session.handler.send_packet(MessageType.FILE_OFFER_RESP, resp_data)
+
+    def route_file_chunk(
+        self,
+        sender_username: str,
+        chunk_payload: bytes,
+    ) -> bool:
+        """Chuyển tiếp mảnh dữ liệu file (FILE_CHUNK) tới người nhận."""
+        try:
+            meta, _ = unpack_chunk_payload(chunk_payload)
+            file_id = meta.get("file_id", "")
+        except Exception as e:
+            logger.error("Lỗi giải mã FILE_CHUNK: %s", e)
+            return False
+
+        route = self._file_routes.get(file_id)
+        if not route:
+            logger.warning("Không tìm thấy tuyến đường cho file_id '%s'", file_id)
+            return False
+
+        recipient_username = route[1]
+        session = self.server.session_mgr.get_session(recipient_username)
+        if not session or not session.handler:
+            return False
+
+        # Chuyển tiếp nguyên vẹn payload nhị phân sang người nhận (zero-copy relay)
+        return session.handler.send_packet(MessageType.FILE_CHUNK, chunk_payload)
+
+    def route_file_ack(
+        self,
+        recipient_username: str,
+        ack_data: Dict[str, Any],
+    ) -> bool:
+        """Chuyển tiếp xác nhận hoàn tất nhận file (FILE_ACK) về cho người gửi."""
+        file_id = ack_data.get("file_id", "")
+        route = self._file_routes.pop(file_id, None)
+
+        sender_username = ack_data.get("sender") or (route[0] if route else "")
+        session = self.server.session_mgr.get_session(sender_username)
+        if not session or not session.handler:
+            return False
+
+        return session.handler.send_packet(MessageType.FILE_ACK, ack_data)

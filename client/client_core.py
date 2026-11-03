@@ -7,10 +7,12 @@ Mô tả: Lớp Client chính quản lý TCP Socket áp dụng kiến trúc 2 lu
 
 from __future__ import annotations
 
+import os
 import queue
 import socket
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from common.logger import get_logger
@@ -22,6 +24,14 @@ from common.protocol import (
     ProtocolError,
     create_packet,
     recv_packet,
+)
+from client.file_transfer import (
+    DEFAULT_CHUNK_SIZE,
+    IncomingFileTransfer,
+    calculate_file_hash,
+    pack_chunk_payload,
+    read_file_chunks,
+    unpack_chunk_payload,
 )
 
 logger = get_logger("client.core")
@@ -84,6 +94,20 @@ class ClientCore:
         self.register_callback(MessageType.AUTH_RESP_FAIL, self._handle_auth_fail)
         self.register_callback(MessageType.USER_LIST_RESP, self._handle_user_list_resp)
         self.register_callback(MessageType.USER_STATUS_BROADCAST, self._handle_user_status_broadcast)
+
+        # Quản lý truyền và nhận file tin cậy
+        self.incoming_files: Dict[str, IncomingFileTransfer] = {}
+        self.download_dir: str = os.path.join("storage", "client_downloads")
+        self.auto_accept_files: bool = True
+        self._file_events: Dict[str, threading.Event] = {}
+        self._file_results: Dict[str, dict] = {}
+        self.on_file_progress: Optional[Callable[[str, int, int, float], None]] = None
+        self.on_file_received: Optional[Callable[[str, str, str], None]] = None
+
+        self.register_callback(MessageType.FILE_OFFER_REQ, self._handle_file_offer_req)
+        self.register_callback(MessageType.FILE_OFFER_RESP, self._handle_file_offer_resp)
+        self.register_callback(MessageType.FILE_CHUNK, self._handle_file_chunk)
+        self.register_callback(MessageType.FILE_ACK, self._handle_file_ack)
 
     def register_callback(
         self, msg_type: MessageType | int, callback: Callable[[Packet], None]
@@ -357,6 +381,121 @@ class ClientCore:
         except Exception as e:
             logger.error("Lỗi khi xử lý USER_STATUS_BROADCAST: %s", e)
 
+    def _handle_file_offer_req(self, packet: Packet) -> None:
+        """Xử lý khi nhận được đề nghị gửi file (FILE_OFFER_REQ) từ người khác."""
+        try:
+            offer = packet.to_json()
+            file_id = offer["file_id"]
+            sender = offer["sender"]
+            file_name = offer["file_name"]
+            file_size = offer["file_size"]
+            total_chunks = offer["total_chunks"]
+            expected_sha256 = offer["sha256"]
+
+            logger.info("📥 Nhận đề xuất gửi file '%s' (%s bytes, %d chunks) từ '%s'.", file_name, file_size, total_chunks, sender)
+
+            if self.auto_accept_files:
+                os.makedirs(self.download_dir, exist_ok=True)
+                save_path = os.path.join(self.download_dir, file_name)
+                transfer = IncomingFileTransfer(
+                    file_id=file_id,
+                    sender=sender,
+                    file_name=file_name,
+                    file_size=file_size,
+                    total_chunks=total_chunks,
+                    expected_sha256=expected_sha256,
+                    save_path=save_path,
+                )
+                self.incoming_files[file_id] = transfer
+
+                resp = {
+                    "file_id": file_id,
+                    "sender": sender,
+                    "recipient": self.username or self.client_name,
+                    "status": "ACCEPTED",
+                }
+                self.send_packet(MessageType.FILE_OFFER_RESP, resp)
+                logger.info("✅ Đã đồng ý nhận file '%s'.", file_name)
+            else:
+                resp = {
+                    "file_id": file_id,
+                    "sender": sender,
+                    "recipient": self.username or self.client_name,
+                    "status": "REJECTED",
+                    "reason": "Người nhận từ chối nhận file.",
+                }
+                self.send_packet(MessageType.FILE_OFFER_RESP, resp)
+        except Exception as e:
+            logger.error("Lỗi xử lý FILE_OFFER_REQ: %s", e)
+
+    def _handle_file_offer_resp(self, packet: Packet) -> None:
+        """Xử lý phản hồi chấp nhận/từ chối từ người nhận (FILE_OFFER_RESP)."""
+        try:
+            resp = packet.to_json()
+            file_id = resp.get("file_id")
+            if file_id and file_id in self._file_events:
+                self._file_results[file_id] = resp
+                self._file_events[file_id].set()
+        except Exception as e:
+            logger.error("Lỗi xử lý FILE_OFFER_RESP: %s", e)
+
+    def _handle_file_chunk(self, packet: Packet) -> None:
+        """Xử lý khi nhận được một chunk dữ liệu nhị phân của file (FILE_CHUNK)."""
+        try:
+            meta, chunk_data = unpack_chunk_payload(packet.payload)
+            file_id = meta["file_id"]
+            chunk_index = meta["chunk_index"]
+
+            transfer = self.incoming_files.get(file_id)
+            if not transfer:
+                logger.warning("Nhận chunk cho file_id không tồn tại: %s", file_id)
+                return
+
+            is_finished = transfer.add_chunk(chunk_index, chunk_data)
+
+            if self.on_file_progress:
+                try:
+                    self.on_file_progress(
+                        file_id,
+                        len(transfer.received_chunks),
+                        transfer.total_chunks,
+                        transfer.progress_percentage,
+                    )
+                except Exception:
+                    pass
+
+            if is_finished:
+                ok, reason = transfer.assemble_and_verify()
+                ack_payload = {
+                    "file_id": file_id,
+                    "sender": transfer.sender,
+                    "recipient": self.username or self.client_name,
+                    "status": "SUCCESS" if ok else "FAILED",
+                    "reason": reason,
+                    "file_name": transfer.file_name,
+                    "save_path": transfer.save_path,
+                }
+                self.send_packet(MessageType.FILE_ACK, ack_payload)
+
+                if ok and self.on_file_received:
+                    try:
+                        self.on_file_received(transfer.sender, transfer.file_name, transfer.save_path)
+                    except Exception as e:
+                        logger.error("Lỗi callback on_file_received: %s", e)
+        except Exception as e:
+            logger.error("Lỗi xử lý FILE_CHUNK: %s", e)
+
+    def _handle_file_ack(self, packet: Packet) -> None:
+        """Xử lý khi nhận được xác nhận nhận file (FILE_ACK)."""
+        try:
+            ack = packet.to_json()
+            file_id = ack.get("file_id")
+            if file_id and file_id in self._file_events:
+                self._file_results[file_id] = ack
+                self._file_events[file_id].set()
+        except Exception as e:
+            logger.error("Lỗi xử lý FILE_ACK: %s", e)
+
     # ==========================================================================
     # CÁC TIỆN ÍCH NGHIỆP VỤ (PUBLIC API)
     # ==========================================================================
@@ -451,6 +590,112 @@ class ClientCore:
                 "timestamp": time.time(),
             },
         )
+
+    def send_file(
+        self,
+        recipient: str,
+        file_path: str,
+        progress_callback: Optional[Callable[[int, int, float], None]] = None,
+        timeout: float = 30.0,
+    ) -> Tuple[bool, str]:
+        """
+        Gửi một file cho người dùng khác qua cơ chế cắt nhỏ (Chunking) và kiểm tra SHA-256.
+
+        Args:
+            recipient: Tên người nhận.
+            file_path: Đường dẫn tới file cần gửi.
+            progress_callback: Hàm callback nhận (chunks_sent, total_chunks, percent).
+            timeout: Thời gian tối đa chờ phản hồi.
+
+        Returns:
+            Tuple[bool, str]: (Thành công hay không, Thông báo kết quả).
+        """
+        if not self.is_connected:
+            return False, "Chưa kết nối tới Server."
+
+        from pathlib import Path
+        path = Path(file_path)
+        if not path.is_file():
+            return False, f"File không tồn tại: {file_path}"
+
+        file_size = path.stat().st_size
+        total_chunks = (file_size + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
+        if total_chunks == 0:
+            total_chunks = 1
+
+        sha256 = calculate_file_hash(path)
+        file_id = str(uuid.uuid4())[:8]
+
+        # 1. Gửi FILE_OFFER_REQ
+        offer_event = threading.Event()
+        self._file_events[file_id] = offer_event
+
+        offer_payload = {
+            "file_id": file_id,
+            "sender": self.username or self.client_name,
+            "recipient": recipient,
+            "file_name": path.name,
+            "file_size": file_size,
+            "total_chunks": total_chunks,
+            "sha256": sha256,
+        }
+        logger.info(
+            "Đang đề xuất gửi file '%s' (%s bytes, %d chunks) cho '%s'...",
+            path.name,
+            file_size,
+            total_chunks,
+            recipient,
+        )
+        self.send_packet(MessageType.FILE_OFFER_REQ, offer_payload)
+
+        # Chờ người nhận phản hồi
+        if not offer_event.wait(timeout=timeout):
+            self._file_events.pop(file_id, None)
+            return False, "Quá thời gian chờ người nhận phản hồi đề nghị gửi file."
+
+        offer_resp = self._file_results.pop(file_id, {})
+        if offer_resp.get("status") != "ACCEPTED":
+            self._file_events.pop(file_id, None)
+            reason = offer_resp.get("reason", "Người nhận từ chối nhận file.")
+            return False, reason
+
+        logger.info("Người nhận '%s' đã đồng ý! Bắt đầu truyền %d chunks...", recipient, total_chunks)
+
+        # 2. Truyền từng chunk
+        ack_event = threading.Event()
+        self._file_events[file_id] = ack_event
+
+        sent_chunks = 0
+        for chunk_index, chunk_data in read_file_chunks(path, chunk_size=DEFAULT_CHUNK_SIZE):
+            chunk_payload = pack_chunk_payload(
+                file_id=file_id,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                chunk_data=chunk_data,
+            )
+            self.send_packet(MessageType.FILE_CHUNK, chunk_payload)
+            sent_chunks += 1
+
+            percent = (sent_chunks / total_chunks) * 100.0
+            if progress_callback:
+                try:
+                    progress_callback(sent_chunks, total_chunks, percent)
+                except Exception:
+                    pass
+
+        logger.info("Đã gửi xong %d/%d chunks. Đang chờ xác nhận SHA-256 từ người nhận...", sent_chunks, total_chunks)
+
+        # 3. Chờ FILE_ACK
+        if not ack_event.wait(timeout=timeout):
+            self._file_events.pop(file_id, None)
+            return False, "Quá thời gian chờ xác nhận FILE_ACK từ người nhận."
+
+        self._file_events.pop(file_id, None)
+        ack_resp = self._file_results.pop(file_id, {})
+        if ack_resp.get("status") == "SUCCESS":
+            return True, f"File '{path.name}' đã gửi thành công và xác thực toàn vẹn 100% (SHA-256 khớp)."
+        else:
+            return False, f"Xác thực file thất bại tại người nhận: {ack_resp.get('reason')}"
 
     def send_heartbeat(self) -> bool:
         """Tiện ích gửi gói tin kiểm tra nhịp tim (PING) lên Server."""
