@@ -323,16 +323,16 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - **Unicast / Direct Routing:** Tra cứu socket của người nhận cụ thể trong `SessionManager`. Nếu người nhận tồn tại thì forward tin nhắn; nếu không tồn tại hoặc đã offline thì phản hồi báo lỗi về cho người gửi.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 5.1: Xây dựng Module Định tuyến (`server/router.py`)**
+- [x] **Micro-step 5.1: Xây dựng Module Định tuyến (`server/router.py`)**
   - Hàm `route_broadcast_message(sender_username, content, timestamp)`: Lấy tất cả socket từ `SessionManager` và gọi `send_packet` lần lượt.
   - Hàm `route_private_message(sender_username, recipient_username, content, timestamp)`: Tìm socket của `recipient_username` và gửi. Trả về `False` nếu không tìm thấy.
-- [ ] **Micro-step 5.2: Định nghĩa cấu trúc Payload tin nhắn (JSON)**
+- [x] **Micro-step 5.2: Định nghĩa cấu trúc Payload tin nhắn (JSON)**
   - Gói `CHAT_BROADCAST`: `{"sender": "alice", "content": "Hello mọi người!", "timestamp": 1719999999}`.
   - Gói `CHAT_DIRECT`: `{"sender": "alice", "recipient": "bob", "content": "Tin nhắn riêng", "timestamp": 1719999999}`.
-- [ ] **Micro-step 5.3: Xử lý cú pháp lệnh trên Client CLI**
+- [x] **Micro-step 5.3: Xử lý cú pháp lệnh trên Client CLI**
   - Mặc định gõ văn bản thông thường -> Gửi broadcast cho cả phòng.
   - Gõ `@username <nội dung>` hoặc `/msg <username> <nội dung>` -> Gửi tin nhắn riêng (Private Message).
-- [ ] **Micro-step 5.4: Hiển thị tin nhắn rõ ràng tại Client**
+- [x] **Micro-step 5.4: Hiển thị tin nhắn rõ ràng tại Client**
   - Tin nhắn chung: `[14:30:05] [GLOBAL] Alice: Chào mọi người!`
   - Tin nhắn riêng: `[14:31:00] [PRIVATE from Alice]: Bí mật nhé!`
   - Tin nhắn riêng gửi đi: `[14:31:00] [PRIVATE to Bob]: Bí mật nhé!`

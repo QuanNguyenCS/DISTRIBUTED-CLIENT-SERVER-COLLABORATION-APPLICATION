@@ -10,7 +10,8 @@ from __future__ import annotations
 import queue
 import socket
 import threading
-from typing import Any, Callable, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from common.logger import get_logger
 from common.message_types import MessageType
@@ -410,12 +411,45 @@ class ClientCore:
 
         return None
 
-    def send_chat(self, text: str) -> bool:
-        """Tiện ích gửi tin nhắn trò chuyện lên phòng chat chung."""
+    def send_broadcast(self, content: str) -> bool:
+        """
+        Gửi tin nhắn phát thanh tới toàn bộ phòng chat chung.
+        """
         sender_name = self.username if self.username else self.client_name
         return self.send_packet(
             MessageType.CHAT_BROADCAST,
-            {"sender": sender_name, "text": text},
+            {
+                "sender": sender_name,
+                "content": content,
+                "text": content,
+                "timestamp": time.time(),
+            },
+        )
+
+    def send_chat(self, text: str) -> bool:
+        """Tiện ích gửi tin nhắn trò chuyện lên phòng chat chung (alias cho send_broadcast)."""
+        return self.send_broadcast(text)
+
+    def send_direct_message(self, recipient: str, content: str) -> bool:
+        """
+        Gửi tin nhắn riêng 1-1 (Private Message / Unicast) tới một người dùng cụ thể.
+
+        Args:
+            recipient: Tên người nhận.
+            content: Nội dung tin nhắn.
+
+        Returns:
+            bool: True nếu gói tin gửi thành công lên server.
+        """
+        sender_name = self.username if self.username else self.client_name
+        return self.send_packet(
+            MessageType.CHAT_DIRECT,
+            {
+                "sender": sender_name,
+                "recipient": recipient,
+                "content": content,
+                "timestamp": time.time(),
+            },
         )
 
     def send_heartbeat(self) -> bool:

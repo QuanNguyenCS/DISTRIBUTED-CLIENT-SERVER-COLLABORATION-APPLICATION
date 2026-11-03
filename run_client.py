@@ -3,12 +3,15 @@ File: run_client.py
 Mô tả: Entrypoint khởi chạy TCP Client với giao diện dòng lệnh (CLI).
 Hỗ trợ kiến trúc 2 luồng: Luồng nền đón nhận tin nhắn từ Server và Luồng chính
 nhập tin nhắn gửi đi trong thời gian thực.
-Tích hợp quy trình xác thực người dùng (Auth) và quản lý trạng thái online/offline.
+Tích hợp quy trình xác thực người dùng và định tuyến tin nhắn:
+  - Chat phòng chung (Broadcast)
+  - Chat riêng tư 1-1 (Private Message / Unicast) với cú pháp @username hoặc /msg username
 """
 
 import argparse
 import sys
 import time
+from typing import Optional
 
 # Đảm bảo console Windows in đúng tiếng Việt UTF-8
 if sys.platform == "win32":
@@ -26,31 +29,70 @@ from client.client_core import ClientCore
 logger = get_logger("run_client")
 
 
+def format_ts(ts: Optional[float] = None) -> str:
+    """Định dạng dấu thời gian thành chuỗi HH:MM:SS."""
+    if ts is None:
+        ts = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
 def handle_incoming_packet(packet: Packet) -> None:
     """Callback xử lý khi nhận được gói tin từ Server trả về."""
-    if packet.msg_type == MessageType.CHAT_BROADCAST:
+    msg_type = packet.msg_type
+
+    if msg_type == MessageType.CHAT_BROADCAST:
         try:
             data = packet.to_json()
             sender = data.get("sender", "Hệ thống")
-            text = data.get("text", "")
-            print(f"\n💬 [{sender}]: {text}\n> ", end="", flush=True)
+            content = data.get("content") or data.get("text", "")
+            ts_str = format_ts(data.get("timestamp"))
+            print(f"\n💬 [{ts_str}] [GLOBAL] {sender}: {content}\n> ", end="", flush=True)
         except Exception:
             print(f"\n💬 [Server]: {packet.to_text()}\n> ", end="", flush=True)
 
-    elif packet.msg_type == MessageType.USER_STATUS_BROADCAST:
+    elif msg_type == MessageType.CHAT_DIRECT:
+        try:
+            data = packet.to_json()
+            sender = data.get("sender", "Ẩn danh")
+            content = data.get("content") or data.get("text", "")
+            ts_str = format_ts(data.get("timestamp"))
+            print(f"\n🔒 [{ts_str}] [PRIVATE from {sender}]: {content}\n> ", end="", flush=True)
+        except Exception:
+            print(f"\n🔒 [PRIVATE]: {packet.to_text()}\n> ", end="", flush=True)
+
+    elif msg_type == MessageType.CHAT_ACK:
+        try:
+            data = packet.to_json()
+            recipient = data.get("recipient", "")
+            content = data.get("content", "")
+            ts_str = format_ts(data.get("timestamp"))
+            print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: {content}\n> ", end="", flush=True)
+        except Exception:
+            pass
+
+    elif msg_type == MessageType.ERROR_NOTICE:
+        try:
+            data = packet.to_json()
+            msg = data.get("message", "Lỗi không xác định.")
+            print(f"\n⚠️ [Lỗi] {msg}\n> ", end="", flush=True)
+        except Exception:
+            print(f"\n⚠️ [Lỗi]: {packet.to_text()}\n> ", end="", flush=True)
+
+    elif msg_type == MessageType.USER_STATUS_BROADCAST:
         try:
             data = packet.to_json()
             event = data.get("event")
             user = data.get("username")
             count = data.get("online_count", "?")
+            ts_str = format_ts(data.get("timestamp"))
             if event == "JOINED":
-                print(f"\n🔔 [Thông báo] Người dùng '{user}' vừa tham gia! (Đang online: {count})\n> ", end="", flush=True)
+                print(f"\n🔔 [{ts_str}] [Thông báo] '{user}' vừa tham gia! (Đang online: {count})\n> ", end="", flush=True)
             elif event == "LEFT":
-                print(f"\n🔔 [Thông báo] Người dùng '{user}' đã rời phòng! (Đang online: {count})\n> ", end="", flush=True)
+                print(f"\n🔔 [{ts_str}] [Thông báo] '{user}' đã rời phòng! (Đang online: {count})\n> ", end="", flush=True)
         except Exception as e:
             logger.debug("Lỗi parse USER_STATUS_BROADCAST: %s", e)
 
-    elif packet.msg_type == MessageType.HEARTBEAT_PONG:
+    elif msg_type == MessageType.HEARTBEAT_PONG:
         logger.debug("Nhận phản hồi nhịp tim (PONG) từ Server.")
 
 
@@ -93,6 +135,9 @@ def main() -> None:
 
     # Đăng ký callbacks xử lý các sự kiện đến từ Server
     client.register_callback(MessageType.CHAT_BROADCAST, handle_incoming_packet)
+    client.register_callback(MessageType.CHAT_DIRECT, handle_incoming_packet)
+    client.register_callback(MessageType.CHAT_ACK, handle_incoming_packet)
+    client.register_callback(MessageType.ERROR_NOTICE, handle_incoming_packet)
     client.register_callback(MessageType.USER_STATUS_BROADCAST, handle_incoming_packet)
     client.register_callback(MessageType.HEARTBEAT_PONG, handle_incoming_packet)
 
@@ -139,11 +184,12 @@ def main() -> None:
             return
 
         print("-" * 65)
-        print("  CÁC LỆNH HỖ TRỢ:")
-        print("  - Gõ văn bản bất kỳ và nhấn Enter để chat trong phòng chung.")
-        print("  - Gõ '/users' hoặc '/who' để cập nhật danh sách người dùng online.")
+        print("  HƯỚNG DẪN TRÒ CHUYỆN:")
+        print("  - Gõ tin nhắn và Enter để chat phòng chung (Broadcast).")
+        print("  - Gõ '@<username> <nội dung>' hoặc '/msg <username> <nội dung>' để chat riêng 1-1.")
+        print("  - Gõ '/users' hoặc '/who' để xem danh sách đang online.")
         print("  - Gõ '/ping' để kiểm tra nhịp tim (Keepalive).")
-        print("  - Gõ '/quit' hoặc '/exit' để đăng xuất và ngắt kết nối an toàn.")
+        print("  - Gõ '/quit' hoặc '/exit' để đăng xuất và thoát an toàn.")
         print("-" * 65)
 
         # 3. Vòng lặp đọc lệnh và tin nhắn từ bàn phím
@@ -170,8 +216,25 @@ def main() -> None:
             elif cmd_lower == "/ping":
                 client.send_heartbeat()
                 print("Đã gửi PING lên Server...")
+            elif user_input.startswith("@"):
+                # Chat riêng theo cú pháp: @username nội dung
+                parts = user_input[1:].split(maxsplit=1)
+                if len(parts) == 2:
+                    target_user, direct_text = parts
+                    client.send_direct_message(target_user.strip(), direct_text.strip())
+                else:
+                    print("⚠️ Cú pháp chat riêng: @<username> <nội dung>")
+            elif cmd_lower.startswith("/msg ") or cmd_lower.startswith("/dm "):
+                # Chat riêng theo cú pháp: /msg username nội dung
+                parts = user_input.split(maxsplit=2)
+                if len(parts) == 3:
+                    _, target_user, direct_text = parts
+                    client.send_direct_message(target_user.strip(), direct_text.strip())
+                else:
+                    print("⚠️ Cú pháp chat riêng: /msg <username> <nội dung>")
             else:
-                client.send_chat(user_input)
+                # Chat phòng chung
+                client.send_broadcast(user_input)
 
     except ConnectionRefusedError:
         logger.error("Không thể kết nối: Server chưa chạy tại %s:%d.", args.host, args.port)

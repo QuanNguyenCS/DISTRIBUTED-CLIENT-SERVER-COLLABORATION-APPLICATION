@@ -204,25 +204,42 @@ class ClientHandler(threading.Thread):
             self.send_packet(MessageType.HEARTBEAT_PONG, {"status": "ALIVE"})
 
         elif msg_type == MessageType.CHAT_BROADCAST:
-            # Phát thanh tin nhắn cho tất cả các Client khác đang kết nối
+            # Định tuyến phát thanh tin nhắn phòng chung qua Router
             try:
                 chat_data = packet.to_json()
-                text = chat_data.get("text", "")
+                content = chat_data.get("content") or chat_data.get("text", "")
+                timestamp = chat_data.get("timestamp")
             except Exception:
-                text = packet.to_text()
+                content = packet.to_text()
+                timestamp = None
 
             sender_name = self.username if self.is_authenticated else self.client_name
-            logger.info("💬 [Phòng chung] %s: %s", sender_name, text)
+            self.server.router.route_broadcast_message(
+                sender_username=sender_name,
+                content=content,
+                sender_handler=self,
+                timestamp=timestamp,
+            )
 
-            broadcast_payload = {
-                "sender": sender_name,
-                "text": text,
-                "type": "broadcast",
-            }
-            # Server phát lại cho tất cả client (kể cả người gửi để xác nhận)
-            self.server.broadcast_packet(
-                MessageType.CHAT_BROADCAST,
-                broadcast_payload,
+        elif msg_type == MessageType.CHAT_DIRECT:
+            # Định tuyến tin nhắn riêng 1-1 (Unicast) qua Router
+            try:
+                chat_data = packet.to_json()
+                recipient = chat_data.get("recipient", "")
+                content = chat_data.get("content") or chat_data.get("text", "")
+                timestamp = chat_data.get("timestamp")
+            except Exception:
+                recipient = ""
+                content = packet.to_text()
+                timestamp = None
+
+            sender_name = self.username if self.is_authenticated else self.client_name
+            self.server.router.route_direct_message(
+                sender_username=sender_name,
+                recipient_username=recipient,
+                content=content,
+                sender_handler=self,
+                timestamp=timestamp,
             )
 
         elif msg_type == MessageType.CHAT_ACK:

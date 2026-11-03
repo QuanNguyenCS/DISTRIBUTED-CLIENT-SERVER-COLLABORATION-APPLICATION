@@ -22,6 +22,7 @@ from common.protocol import (
     recv_packet,
 )
 from server.client_handler import ClientHandler
+from server.router import MessageRouter
 from server.session_manager import SessionManager
 
 logger = get_logger("server.core")
@@ -63,6 +64,9 @@ class ServerCore:
 
         # Quản lý phiên và trạng thái người dùng (Active User Sessions)
         self.session_mgr = SessionManager()
+
+        # Bộ định tuyến tin nhắn (Message Router)
+        self.router = MessageRouter(self)
 
     def start(self) -> None:
         """
