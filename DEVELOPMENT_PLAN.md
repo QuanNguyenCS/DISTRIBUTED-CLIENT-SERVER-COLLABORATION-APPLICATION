@@ -290,22 +290,22 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - Cơ chế bảo vệ bảng dữ liệu dùng chung bằng `threading.Lock`: Tránh lỗi `RuntimeError: dictionary changed size during iteration` khi một user đăng xuất cùng lúc với việc server đang duyệt danh sách để gửi dữ liệu.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 4.1: Xây dựng lớp `SessionManager` (`server/session_manager.py`)**
+- [x] **Micro-step 4.1: Xây dựng lớp `SessionManager` (`server/session_manager.py`)**
   - Lưu trữ dictionary `active_users = {}`.
   - Cung cấp các phương thức thread-safe (dùng `with self.lock:`):
     - `register_user(username, socket, address) -> (bool, str)`: Kiểm tra tên có hợp lệ không, có bị trùng không.
     - `unregister_user(username)`: Xóa user khi ngắt kết nối.
     - `get_user_socket(username)`: Lấy socket của một user để gửi tin riêng.
     - `get_all_online_users() -> list`: Trả về danh sách tên tất cả user đang online.
-- [ ] **Micro-step 4.2: Hiện thực luồng Đăng nhập (Authentication Flow)**
+- [x] **Micro-step 4.2: Hiện thực luồng Đăng nhập (Authentication Flow)**
   - Client gửi gói tin `AUTH_REQ` với payload JSON: `{"username": "alice"}`.
   - Server xử lý trong `ClientHandler`:
     - Nếu tên đã tồn tại: Phản hồi `AUTH_RESP_FAIL` kèm mã lỗi "Username already taken". Client yêu cầu nhập lại tên khác.
     - Nếu thành công: Phản hồi `AUTH_RESP_SUCCESS` kèm thông tin chào mừng.
-- [ ] **Micro-step 4.3: Cơ chế Broadcast cập nhật người dùng (User Presence Discovery)**
+- [x] **Micro-step 4.3: Cơ chế Broadcast cập nhật người dùng (User Presence Discovery)**
   - Ngay khi có user mới login thành công: Server tạo gói tin `USER_STATUS_BROADCAST` (status: "JOINED", username: "alice") gửi đến TẤT CẢ các client khác.
   - Đồng thời gửi gói tin `USER_LIST_RESP` chứa toàn bộ danh sách người dùng hiện tại về cho riêng client mới vừa vào.
-- [ ] **Micro-step 4.4: Xử lý khi User đăng xuất**
+- [x] **Micro-step 4.4: Xử lý khi User đăng xuất**
   - Khi client thoát: Server tự động broadcast `USER_STATUS_BROADCAST` (status: "LEFT", username: "alice") tới các client còn lại.
 
 #### 🧪 Tiêu chí nghiệm thu (Acceptance Criteria):

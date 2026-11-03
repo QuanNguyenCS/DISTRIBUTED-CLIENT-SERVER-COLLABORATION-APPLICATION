@@ -70,7 +70,8 @@ class TestClientServerHandshake:
         assert client.server_info["server_id"] == "TestServer-01"
         assert client.server_info["version"] == PROTOCOL_VERSION
 
-        # Ngắt kết nối
+        # Chờ socket TCP ổn định rồi ngắt kết nối
+        time.sleep(0.05)
         client.disconnect()
         sthread.join(timeout=2.0)
         server.stop()

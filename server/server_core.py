@@ -22,6 +22,7 @@ from common.protocol import (
     recv_packet,
 )
 from server.client_handler import ClientHandler
+from server.session_manager import SessionManager
 
 logger = get_logger("server.core")
 
@@ -59,6 +60,9 @@ class ServerCore:
         # Quản lý danh sách các ClientHandler đang hoạt động theo (IP, Port)
         self.handlers: Dict[Tuple[str, int], ClientHandler] = {}
         self._handlers_lock = threading.Lock()
+
+        # Quản lý phiên và trạng thái người dùng (Active User Sessions)
+        self.session_mgr = SessionManager()
 
     def start(self) -> None:
         """
@@ -240,6 +244,7 @@ class ServerCore:
         msg_type: MessageType | int,
         payload: Any = b"",
         exclude_addr: Optional[Tuple[str, int]] = None,
+        only_authenticated: bool = False,
     ) -> int:
         """
         Gửi gói tin phát thanh (Broadcast) đến tất cả các Client đang kết nối.
@@ -248,6 +253,7 @@ class ServerCore:
             msg_type: Loại thông điệp.
             payload: Dữ liệu cần gửi.
             exclude_addr: Địa chỉ của Client cần loại trừ (ví dụ không gửi lại cho người vừa gửi).
+            only_authenticated: Chỉ gửi tới các client đã xác thực đăng nhập nếu True.
 
         Returns:
             int: Số lượng client gửi thành công.
@@ -256,6 +262,8 @@ class ServerCore:
         success_count = 0
         for handler in handlers:
             if exclude_addr and handler.client_addr == exclude_addr:
+                continue
+            if only_authenticated and not handler.is_authenticated:
                 continue
             if handler.send_packet(msg_type, payload):
                 success_count += 1
@@ -348,6 +356,9 @@ class ServerCore:
             with self._handlers_lock:
                 active_handlers = list(self.handlers.values())
                 self.handlers.clear()
+
+            # Xóa sạch phiên người dùng
+            self.session_mgr.clear()
 
             logger.info("Đang đóng toàn bộ %d kết nối Client...", len(active_handlers))
             for handler in active_handlers:

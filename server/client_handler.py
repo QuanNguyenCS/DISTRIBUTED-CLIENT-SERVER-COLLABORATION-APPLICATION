@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from common.logger import get_logger
@@ -57,6 +58,10 @@ class ClientHandler(threading.Thread):
         self.client_name: str = self.client_info.get("client_name", f"User@{client_addr[1]}")
         self.is_running: bool = False
         self._send_lock = threading.Lock()
+
+        # Quản lý xác thực và danh tính người dùng
+        self.is_authenticated: bool = False
+        self.username: Optional[str] = None
 
     def run(self) -> None:
         """
@@ -133,6 +138,67 @@ class ClientHandler(threading.Thread):
             )
             self.is_running = False
 
+        elif msg_type == MessageType.AUTH_REQ:
+            # Xử lý yêu cầu xác thực / đăng nhập
+            try:
+                auth_payload = packet.to_json()
+                req_username = auth_payload.get("username", "") if isinstance(auth_payload, dict) else packet.to_text()
+            except Exception:
+                req_username = packet.to_text()
+
+            if self.is_authenticated:
+                fail_payload = {
+                    "status": "FAIL",
+                    "reason": f"Bạn đã đăng nhập với tên '{self.username}'.",
+                }
+                self.send_packet(MessageType.AUTH_RESP_FAIL, fail_payload)
+                return
+
+            success, reason, session = self.server.session_mgr.register_user(
+                username=req_username,
+                handler=self,
+                address=self.client_addr,
+            )
+
+            if not success or not session:
+                fail_payload = {"status": "FAIL", "reason": reason}
+                self.send_packet(MessageType.AUTH_RESP_FAIL, fail_payload)
+            else:
+                self.is_authenticated = True
+                self.username = session.username
+                self.client_name = session.username
+
+                # Phản hồi đăng nhập thành công kèm danh sách user hiện tại
+                success_payload = {
+                    "status": "SUCCESS",
+                    "username": self.username,
+                    "online_users": self.server.session_mgr.get_all_users(),
+                    "message": "Đăng nhập thành công.",
+                }
+                self.send_packet(MessageType.AUTH_RESP_SUCCESS, success_payload)
+
+                # Phát thông báo cho tất cả client khác biết có người vừa tham gia
+                join_broadcast = {
+                    "event": "JOINED",
+                    "username": self.username,
+                    "online_count": self.server.session_mgr.get_user_count(),
+                    "timestamp": time.time(),
+                }
+                self.server.broadcast_packet(
+                    MessageType.USER_STATUS_BROADCAST,
+                    join_broadcast,
+                    exclude_addr=self.client_addr,
+                )
+
+        elif msg_type == MessageType.USER_LIST_REQ:
+            # Trả về danh sách tất cả các user đang online
+            online_users = self.server.session_mgr.get_all_users()
+            list_payload = {
+                "users": online_users,
+                "count": len(online_users),
+            }
+            self.send_packet(MessageType.USER_LIST_RESP, list_payload)
+
         elif msg_type == MessageType.HEARTBEAT_PING:
             # Phản hồi ngay PONG để giữ nhịp tim
             self.send_packet(MessageType.HEARTBEAT_PONG, {"status": "ALIVE"})
@@ -145,10 +211,11 @@ class ClientHandler(threading.Thread):
             except Exception:
                 text = packet.to_text()
 
-            logger.info("💬 [Phòng chung] %s: %s", self.client_name, text)
+            sender_name = self.username if self.is_authenticated else self.client_name
+            logger.info("💬 [Phòng chung] %s: %s", sender_name, text)
 
             broadcast_payload = {
-                "sender": self.client_name,
+                "sender": sender_name,
                 "text": text,
                 "type": "broadcast",
             }
@@ -207,7 +274,7 @@ class ClientHandler(threading.Thread):
 
     def close(self) -> None:
         """
-        Đóng socket và hủy đăng ký khỏi ServerCore.
+        Đóng socket và hủy đăng ký khỏi ServerCore và SessionManager.
         """
         self.is_running = False
         if self.client_sock:
@@ -218,10 +285,45 @@ class ClientHandler(threading.Thread):
             finally:
                 self.client_sock = None
 
-        # Báo cho Server dọn dẹp handler này khỏi danh sách quản lý
+        # 1. Hủy đăng ký phiên người dùng nếu đã đăng nhập và phát thanh thông báo LEFT
+        if self.is_authenticated and self.username:
+            username_left = self.username
+            self.server.session_mgr.unregister_user(username_left)
+            self.is_authenticated = False
+            self.username = None
+
+            left_broadcast = {
+                "event": "LEFT",
+                "username": username_left,
+                "online_count": self.server.session_mgr.get_user_count(),
+                "timestamp": time.time(),
+            }
+            self.server.broadcast_packet(
+                MessageType.USER_STATUS_BROADCAST,
+                left_broadcast,
+                exclude_addr=self.client_addr,
+            )
+        else:
+            # Dự phòng: Hủy theo handler nếu có
+            removed_session = self.server.session_mgr.unregister_by_handler(self)
+            if removed_session:
+                left_broadcast = {
+                    "event": "LEFT",
+                    "username": removed_session.username,
+                    "online_count": self.server.session_mgr.get_user_count(),
+                    "timestamp": time.time(),
+                }
+                self.server.broadcast_packet(
+                    MessageType.USER_STATUS_BROADCAST,
+                    left_broadcast,
+                    exclude_addr=self.client_addr,
+                )
+
+        # 2. Báo cho Server dọn dẹp handler này khỏi danh sách quản lý
         self.server.unregister_handler(self.client_addr)
         logger.info(
             "🛑 Đã đóng kết nối và dọn dẹp tài nguyên của [%s:%d].",
             self.client_addr[0],
             self.client_addr[1],
         )
+

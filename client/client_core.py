@@ -67,6 +67,23 @@ class ClientCore:
         # Callback chung cho tất cả các gói tin đến
         self.on_packet_received: Optional[Callable[[Packet], None]] = None
 
+        # Trạng thái xác thực & Danh tính người dùng
+        self.username: Optional[str] = None
+        self.is_authenticated: bool = False
+        self.online_users: List[str] = []
+
+        # Cơ chế đồng bộ phản hồi xác thực & danh sách người dùng
+        self._auth_event = threading.Event()
+        self._auth_result: Tuple[bool, str] = (False, "")
+        self._user_list_event = threading.Event()
+        self._user_list_result: Optional[List[str]] = None
+
+        # Đăng ký các callback nội bộ xử lý trạng thái
+        self.register_callback(MessageType.AUTH_RESP_SUCCESS, self._handle_auth_success)
+        self.register_callback(MessageType.AUTH_RESP_FAIL, self._handle_auth_fail)
+        self.register_callback(MessageType.USER_LIST_RESP, self._handle_user_list_resp)
+        self.register_callback(MessageType.USER_STATUS_BROADCAST, self._handle_user_status_broadcast)
+
     def register_callback(
         self, msg_type: MessageType | int, callback: Callable[[Packet], None]
     ) -> None:
@@ -282,11 +299,123 @@ class ClientCore:
             self.is_connected = False
             return False
 
+    # ==========================================================================
+    # CÁC HÀM XỬ LÝ SỰ KIỆN NỘI BỘ (INTERNAL EVENT HANDLERS)
+    # ==========================================================================
+    def _handle_auth_success(self, packet: Packet) -> None:
+        """Xử lý khi nhận được phản hồi đăng nhập thành công."""
+        try:
+            data = packet.to_json()
+        except Exception:
+            data = {}
+        self.is_authenticated = True
+        self.username = data.get("username", self.client_name)
+        self.client_name = self.username
+        self.online_users = data.get("online_users", [self.username])
+        self._auth_result = (True, data.get("message", "Đăng nhập thành công."))
+        self._auth_event.set()
+        logger.info("🎉 Đã xác thực thành công danh tính: '%s'", self.username)
+
+    def _handle_auth_fail(self, packet: Packet) -> None:
+        """Xử lý khi Server từ chối đăng nhập."""
+        try:
+            data = packet.to_json()
+            reason = data.get("reason", "Đăng nhập thất bại.")
+        except Exception:
+            reason = packet.to_text() or "Đăng nhập thất bại."
+        self.is_authenticated = False
+        self._auth_result = (False, reason)
+        self._auth_event.set()
+        logger.warning("⛔ Đăng nhập bị từ chối: %s", reason)
+
+    def _handle_user_list_resp(self, packet: Packet) -> None:
+        """Xử lý danh sách user từ Server trả về."""
+        try:
+            data = packet.to_json()
+            users = data.get("users", [])
+        except Exception:
+            users = []
+        self.online_users = users
+        self._user_list_result = users
+        self._user_list_event.set()
+
+    def _handle_user_status_broadcast(self, packet: Packet) -> None:
+        """Cập nhật danh sách online khi có thông báo người dùng JOINED / LEFT."""
+        try:
+            data = packet.to_json()
+            event = data.get("event")
+            user = data.get("username")
+            if event == "JOINED" and user:
+                if user not in self.online_users:
+                    self.online_users.append(user)
+                logger.info("👤 [%s] vừa tham gia hệ thống.", user)
+            elif event == "LEFT" and user:
+                if user in self.online_users:
+                    self.online_users.remove(user)
+                logger.info("👤 [%s] vừa rời hệ thống.", user)
+        except Exception as e:
+            logger.error("Lỗi khi xử lý USER_STATUS_BROADCAST: %s", e)
+
+    # ==========================================================================
+    # CÁC TIỆN ÍCH NGHIỆP VỤ (PUBLIC API)
+    # ==========================================================================
+    def authenticate(self, username: str, timeout: float = 5.0) -> Tuple[bool, str]:
+        """
+        Gửi yêu cầu đăng nhập và chờ phản hồi từ Server.
+
+        Args:
+            username: Tên người dùng muốn đăng ký.
+            timeout: Thời gian chờ phản hồi tối đa (giây).
+
+        Returns:
+            Tuple[bool, str]: (Thành công hay không, Lý do / Tin nhắn).
+        """
+        if not self.is_connected:
+            return False, "Chưa kết nối tới server."
+
+        self._auth_event.clear()
+        self._auth_result = (False, "Timeout")
+
+        success = self.send_packet(MessageType.AUTH_REQ, {"username": username})
+        if not success:
+            return False, "Không thể gửi gói tin AUTH_REQ."
+
+        if self._auth_event.wait(timeout=timeout):
+            return self._auth_result
+
+        return False, "Quá thời gian chờ phản hồi xác thực từ server."
+
+    def request_user_list(self, timeout: float = 5.0) -> Optional[List[str]]:
+        """
+        Yêu cầu lấy danh sách người dùng đang online từ Server.
+
+        Args:
+            timeout: Thời gian chờ phản hồi (giây).
+
+        Returns:
+            Optional[List[str]]: Danh sách username hoặc None nếu thất bại.
+        """
+        if not self.is_connected:
+            return None
+
+        self._user_list_event.clear()
+        self._user_list_result = None
+
+        success = self.send_packet(MessageType.USER_LIST_REQ, {})
+        if not success:
+            return None
+
+        if self._user_list_event.wait(timeout=timeout):
+            return self._user_list_result
+
+        return None
+
     def send_chat(self, text: str) -> bool:
         """Tiện ích gửi tin nhắn trò chuyện lên phòng chat chung."""
+        sender_name = self.username if self.username else self.client_name
         return self.send_packet(
             MessageType.CHAT_BROADCAST,
-            {"sender": self.client_name, "text": text},
+            {"sender": sender_name, "text": text},
         )
 
     def send_heartbeat(self) -> bool:
@@ -312,10 +441,18 @@ class ClientCore:
                 )
                 with self._send_lock:
                     self.sock.sendall(disconnect_packet)
+                    try:
+                        # Báo hiệu đã gửi xong dữ liệu (TCP FIN segment) trước khi đóng socket hoàn toàn
+                        self.sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
             except OSError:
                 pass
 
         self.is_connected = False
+        self.is_authenticated = False
+        self.username = None
+        self.online_users = []
         self._cleanup_socket()
 
         # Chờ Receiver thread kết thúc
