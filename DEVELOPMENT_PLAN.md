@@ -475,19 +475,19 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 - Đánh giá khả năng chịu tải (Load Capacity) của Server: Đảm bảo không xảy ra hiện tượng rò rỉ bộ nhớ (Memory Leak), không bị deadlock khi 20 client cùng gửi tin nhắn vào một thời điểm.
 
 #### 🛠️ Các Micro-steps thực hiện:
-- [ ] **Micro-step 10.1: Viết Script Stress-test tự động (`tests/stress_test.py`)**
+- [x] **Micro-step 10.1: Viết Script Stress-test tự động (`tests/stress_test.py`)**
   - Khởi tạo 15 luồng Client ảo (Headless bot clients) cùng kết nối vào Server.
   - Cho các bot liên tục gửi tin nhắn ngẫu nhiên trong vòng 30 giây.
   - Kiểm tra xem Server có giữ vững kết nối và phân phối tin nhắn chính xác không.
-- [ ] **Micro-step 10.2: Viết Unit Tests tự động bằng `pytest`**
+- [x] **Micro-step 10.2: Viết Unit Tests tự động bằng `pytest`**
   - Test đóng gói/mở gói packet (`tests/test_protocol.py`).
   - Test mã hóa/giải mã (`tests/test_crypto.py`).
   - Test chia nhỏ/ghép chunk file (`tests/test_file_transfer.py`).
-- [ ] **Micro-step 10.3: Chuẩn hóa Code Quality & Clean Code**
+- [x] **Micro-step 10.3: Chuẩn hóa Code Quality & Clean Code**
   - Định dạng chuẩn PEP 8.
   - Thêm Type Hints (`def send_packet(sock: socket.socket, msg_type: int) -> bool:`).
   - Bổ sung Docstring chi tiết cho mọi Class và Function (tiếng Anh hoặc tiếng Việt rõ ràng).
-- [ ] **Micro-step 10.4: Viết file `README.md` hướng dẫn sử dụng chuyên nghiệp**
+- [x] **Micro-step 10.4: Viết file `README.md` hướng dẫn sử dụng chuyên nghiệp**
   - Hướng dẫn cài đặt thư viện (`pip install -r requirements.txt`).
   - Hướng dẫn cấu hình IP/Port.
   - Hướng dẫn khởi động Server và nhiều Client trên một máy hoặc qua mạng LAN.
