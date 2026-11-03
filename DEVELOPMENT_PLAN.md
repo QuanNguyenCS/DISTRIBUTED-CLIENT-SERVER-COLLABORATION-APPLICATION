@@ -500,19 +500,21 @@ DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
 
 ### GIAI ĐOẠN 11: HOÀN THIỆN BÁO CÁO KỸ THUẬT (TECHNICAL REPORT PDF) & ÔN TẬP VẤN ĐÁP
 > **Mục tiêu:** Tạo bản báo cáo PDF theo đúng yêu cầu đề bài và trang bị đầy đủ kiến thức để bạn tự tin đạt điểm tuyệt đối trong phần thi vấn đáp.
+> **Trạng thái:** ✅ Đã hoàn thành toàn bộ nội dung tại `docs/technical_report.md`.
 
 #### 🛠️ Các nội dung bắt buộc trong Báo cáo:
-1. **System Architecture (Kiến trúc hệ thống):** Sơ đồ khối các thành phần, luồng tương tác Client - Server.
-2. **Protocol Specification (Đặc tả giao thức):** Bảng chi tiết từng byte trong Header, giải thích ý nghĩa các mã Message Type, cơ chế Framing.
-3. **Sequence Diagrams (Sơ đồ tuần tự):**
+- [x] 1. **System Architecture (Kiến trúc hệ thống):** Sơ đồ khối các thành phần, luồng tương tác Client - Server.
+- [x] 2. **Protocol Specification (Đặc tả giao thức):** Bảng chi tiết từng byte trong Header, giải thích ý nghĩa các mã Message Type, cơ chế Framing.
+- [x] 3. **Sequence Diagrams (Sơ đồ tuần tự):**
    - Vòng đời kết nối & Xác thực (Handshake & Authentication).
    - Quy trình gửi tin nhắn văn bản (Broadcast & Direct Message).
    - Quy trình bắt tay và truyền file nhiều chunks (File Transfer Lifecycle).
-4. **Challenges & Solutions (Thách thức & Giải pháp - 1 trang theo đề bài):**
+- [x] 4. **Challenges & Solutions (Thách thức & Giải pháp - 1 trang theo đề bài):**
    - *Vấn đề TCP Packet Streaming / Fragmentation:* Giải quyết bằng Fixed-Length Header và vòng lặp `recv_exact`.
    - *Vấn đề GUI Freezing:* Giải quyết bằng kiến trúc Đa luồng kết hợp hàng đợi `queue.Queue`.
    - *Vấn đề Half-Open Sockets (Client ngắt mạng đột ngột):* Giải quyết bằng cơ chế Heartbeat PING-PONG và Thread dọn dẹp Zombie.
    - *Vấn đề Race Condition khi nhiều client cùng gửi tin:* Giải quyết bằng `threading.Lock` trong `SessionManager`.
+- [x] 5. **Kiểm thử tải cao & Bộ 10 câu hỏi vấn đáp:** Đã chuẩn hóa chi tiết từng câu hỏi kỹ thuật.
 
 #### 🎓 10 Câu hỏi Vấn đáp Cốt lõi Giảng viên hay hỏi & Câu trả lời chuẩn:
 1. **Tại sao không thể dùng `sock.recv(1024)` đơn thuần để nhận toàn bộ tin nhắn?**
