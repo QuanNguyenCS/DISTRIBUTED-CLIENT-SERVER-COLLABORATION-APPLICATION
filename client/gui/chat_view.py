@@ -48,6 +48,10 @@ class ChatView(ttk.Frame):
 
         # Quản lý các tab chat: tab_id -> ScrolledText widget
         self.chat_tabs: Dict[str, scrolledtext.ScrolledText] = {}
+        # Ánh xạ tab_id -> Frame gốc gắn trực tiếp vào Notebook (tránh lỗi master của ScrolledText)
+        self.tab_frames: Dict[str, ttk.Frame] = {}
+        # Ánh xạ tab_id -> đúng username gốc
+        self.tab_recipients: Dict[str, str] = {}
         # Danh sách người dùng online hiện tại
         self.online_users_list: List[str] = []
 
@@ -212,11 +216,13 @@ class ChatView(ttk.Frame):
         text_widget.tag_config("error_badge", foreground="#D32F2F", font=("Segoe UI", 9, "italic"))
 
         self.chat_tabs[tab_id] = text_widget
+        self.tab_frames[tab_id] = tab_frame
         return text_widget
 
     def get_or_create_direct_tab(self, username: str) -> scrolledtext.ScrolledText:
         """Lấy tab chat riêng với một user, nếu chưa có thì tạo mới."""
         tab_id = f"user_{username.lower()}"
+        self.tab_recipients[tab_id] = username
         if tab_id not in self.chat_tabs:
             title = f"🔒 @{username}"
             text_widget = self._create_chat_tab(tab_id, title)
@@ -231,20 +237,22 @@ class ChatView(ttk.Frame):
 
     def _get_current_active_tab_id(self) -> str:
         """Xác định tab đang được chọn trên giao diện."""
-        selected_index = self.notebook.index(self.notebook.select())
-        if selected_index == 0:
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
             return "global"
-        # Tìm tab_id tương ứng
-        tab_widget_name = self.notebook.tabs()[selected_index]
-        for tid, txt_widget in self.chat_tabs.items():
-            if str(txt_widget.master) == tab_widget_name:
+        if not selected:
+            return "global"
+        # Tìm tab_id tương ứng theo tab_frame gốc (tránh ScrolledText.master là frame bọc nội bộ)
+        for tid, frame in self.tab_frames.items():
+            if str(frame) == str(selected):
                 return tid
         return "global"
 
     def _get_recipient_for_tab(self, tab_id: str) -> Optional[str]:
         """Nếu tab hiện tại là tab chat riêng, trả về tên người nhận."""
         if tab_id.startswith("user_"):
-            return tab_id[5:]  # Cắt tiền tố 'user_'
+            return self.tab_recipients.get(tab_id) or tab_id[5:]  # Cắt tiền tố 'user_'
         return None
 
     def append_message(
@@ -321,10 +329,10 @@ class ChatView(ttk.Frame):
 
         # Mở hoặc focus vào tab chat riêng
         self.get_or_create_direct_tab(target_username)
-        # Chuyển Notebook sang tab này
+        # Chuyển Notebook sang tab này (dùng đúng tab_frame đã add vào Notebook)
         tab_id = f"user_{target_username.lower()}"
-        target_widget = self.chat_tabs[tab_id]
-        self.notebook.select(target_widget.master)
+        target_frame = self.tab_frames[tab_id]
+        self.notebook.select(target_frame)
         self.msg_entry.focus_set()
 
     def _on_user_double_click(self, event: tk.Event) -> None:
@@ -361,18 +369,11 @@ class ChatView(ttk.Frame):
 
     def _on_attach_file_click(self) -> None:
         """Xử lý sự kiện nhấn nút Gửi File đính kèm 📎."""
-        file_path = filedialog.askopenfilename(
-            title="Chọn tập tin để gửi",
-            filetypes=[("Tất cả tập tin", "*.*")],
-        )
-        if not file_path:
-            return
-
         active_tab_id = self._get_current_active_tab_id()
         recipient = self._get_recipient_for_tab(active_tab_id)
 
         if not recipient:
-            # Nếu đang ở phòng chung, yêu cầu chọn người nhận từ danh sách
+            # Nếu đang ở phòng chung, yêu cầu chọn người nhận từ danh sách trước khi mở hộp thoại chọn file
             selected_indices = self.users_listbox.curselection()
             if selected_indices:
                 selected_text = self.users_listbox.get(selected_indices[0])
@@ -384,6 +385,13 @@ class ChatView(ttk.Frame):
                     "Vui lòng chọn một người nhận cụ thể từ danh sách Online (hoặc chuyển sang tab Chat riêng) để gửi file.",
                 )
                 return
+
+        file_path = filedialog.askopenfilename(
+            title="Chọn tập tin để gửi",
+            filetypes=[("Tất cả tập tin", "*.*")],
+        )
+        if not file_path:
+            return
 
         # Gọi callback gửi file
         self.on_send_file(recipient, file_path)

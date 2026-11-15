@@ -206,3 +206,170 @@ class TestCryptoIntegration:
 
         s1.close()
         s2.close()
+
+    def test_e2ee_chat_without_server_encryption(self):
+        """Server chạy chế độ thường (không --passphrase), 2 Client bật AES vẫn chat chung & riêng bình thường."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        alice.enable_encryption("RoomE2EEPass123")
+        bob.enable_encryption("RoomE2EEPass123")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceE2EE")[0]
+            assert bob.connect() and bob.authenticate("BobE2EE")[0]
+            assert alice.server_encryption_enabled is False
+            assert bob.server_encryption_enabled is False
+
+            bc_event = threading.Event()
+            dm_event = threading.Event()
+            bob_broadcasts = []
+            bob_directs = []
+
+            bob.register_callback(
+                MessageType.CHAT_BROADCAST,
+                lambda pkt: (bob_broadcasts.append(pkt.to_json()), bc_event.set()),
+            )
+            bob.register_callback(
+                MessageType.CHAT_DIRECT,
+                lambda pkt: (bob_directs.append(pkt.to_json()), dm_event.set()),
+            )
+
+            assert alice.send_broadcast("Tin nhắn chung E2EE không cần key server") is True
+            assert bc_event.wait(timeout=2.0)
+            assert bob_broadcasts[0]["content"] == "Tin nhắn chung E2EE không cần key server"
+            assert bob_broadcasts[0]["sender"] == "AliceE2EE"
+
+            assert alice.send_direct_message("BobE2EE", "Tin nhắn riêng E2EE bí mật") is True
+            assert dm_event.wait(timeout=2.0)
+            assert bob_directs[0]["content"] == "Tin nhắn riêng E2EE bí mật"
+            assert bob_directs[0]["sender"] == "AliceE2EE"
+            assert bob_directs[0]["recipient"] == "BobE2EE"
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_e2ee_file_transfer_without_server_encryption(self, tmp_path):
+        """Server chạy chế độ thường, 2 Client bật AES vẫn gửi file nhị phân & file 0-byte toàn vẹn SHA-256."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
+        alice.enable_encryption("FileE2EEPass456")
+        bob.enable_encryption("FileE2EEPass456")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceFileE2EE")[0]
+            assert bob.connect() and bob.authenticate("BobFileE2EE")[0]
+
+            received = []
+            recv_event = threading.Event()
+
+            def on_recv(sender, file_name, save_path):
+                received.append((sender, file_name, save_path))
+                recv_event.set()
+
+            bob.on_file_received = on_recv
+
+            raw_data = bytes(range(256)) * 300  # 76,800 bytes (3 chunks)
+            src_file = tmp_path / "photo.jpg"
+            src_file.write_bytes(raw_data)
+
+            ok, msg = alice.send_file("BobFileE2EE", str(src_file), timeout=5.0)
+            assert ok is True, msg
+            assert recv_event.wait(timeout=2.0)
+            assert received[0][0] == "AliceFileE2EE"
+            assert received[0][1] == "photo.jpg"
+            assert (tmp_path / "downloads" / "photo.jpg").read_bytes() == raw_data
+
+            # Kiểm tra gửi file rỗng 0-byte qua kênh E2EE
+            recv_event.clear()
+            empty_file = tmp_path / "empty.txt"
+            empty_file.write_bytes(b"")
+            ok_empty, msg_empty = alice.send_file("BobFileE2EE", str(empty_file), timeout=5.0)
+            assert ok_empty is True, msg_empty
+            assert recv_event.wait(timeout=2.0)
+            assert (tmp_path / "downloads" / "empty.txt").read_bytes() == b""
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_mismatched_key_e2ee_negative_cases(self, tmp_path):
+        """Hai Client khác mật khẩu AES: không văng chuỗi mã hóa vào chat, không crash luồng nhận, báo lỗi rõ ràng."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
+        alice.enable_encryption("PasswordOne")
+        bob.enable_encryption("PasswordTwoMismatch")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceMismatch")[0]
+            assert bob.connect() and bob.authenticate("BobMismatch")[0]
+
+            err_event = threading.Event()
+            err_notices = []
+            bc_msgs = []
+            dm_msgs = []
+            file_errors = []
+            file_ok_calls = []
+
+            bob.register_callback(
+                MessageType.ERROR_NOTICE,
+                lambda pkt: (err_notices.append(pkt.to_json()), err_event.set()),
+            )
+            bob.register_callback(MessageType.CHAT_BROADCAST, lambda pkt: bc_msgs.append(pkt.to_json()))
+            bob.register_callback(MessageType.CHAT_DIRECT, lambda pkt: dm_msgs.append(pkt.to_json()))
+            bob.on_file_error = lambda sender, fname, reason: file_errors.append((sender, fname, reason))
+            bob.on_file_received = lambda sender, fname, path: file_ok_calls.append((sender, fname, path))
+
+            # 1. Broadcast sai key
+            assert alice.send_broadcast("Bi mat 1") is True
+            assert err_event.wait(timeout=2.0)
+            assert err_notices[-1]["code"] == "DECRYPTION_FAILED"
+            assert len(bc_msgs) == 0
+            assert bob.is_connected is True
+
+            # 2. Direct sai key
+            err_event.clear()
+            assert alice.send_direct_message("BobMismatch", "Bi mat 2") is True
+            assert err_event.wait(timeout=2.0)
+            assert err_notices[-1]["code"] == "DECRYPTION_FAILED"
+            assert len(dm_msgs) == 0
+            assert bob.is_connected is True
+
+            # 3. File transfer sai key
+            secret_file = tmp_path / "secret.bin"
+            secret_file.write_bytes(b"SecretBinaryContent" * 20)
+            ok, msg = alice.send_file("BobMismatch", str(secret_file), timeout=5.0)
+            assert ok is False
+            assert len(file_errors) >= 1
+            assert len(file_ok_calls) == 0
+            assert bob.is_connected is True
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)

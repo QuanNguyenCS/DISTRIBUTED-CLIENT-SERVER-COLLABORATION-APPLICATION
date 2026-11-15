@@ -163,20 +163,26 @@ class CollabChatApp(tk.Tk):
 
     def _bind_client_callbacks(self, client: ClientCore) -> None:
         """Đăng ký các hàm đón nhận gói tin từ socket receiver và chuyển vào GUI queue."""
+        def _safe_json(pkt: Packet) -> dict:
+            try:
+                return pkt.to_json()
+            except Exception:
+                return {"message": pkt.to_text(), "content": pkt.to_text()}
+
         def on_broadcast(pkt: Packet):
-            self.gui_queue.put(("chat_broadcast", pkt.to_json()))
+            self.gui_queue.put(("chat_broadcast", _safe_json(pkt)))
 
         def on_direct(pkt: Packet):
-            self.gui_queue.put(("chat_direct", pkt.to_json()))
+            self.gui_queue.put(("chat_direct", _safe_json(pkt)))
 
         def on_user_status(pkt: Packet):
-            self.gui_queue.put(("user_status", pkt.to_json()))
+            self.gui_queue.put(("user_status", _safe_json(pkt)))
 
         def on_user_list(pkt: Packet):
-            self.gui_queue.put(("user_list", pkt.to_json()))
+            self.gui_queue.put(("user_list", _safe_json(pkt)))
 
         def on_error(pkt: Packet):
-            self.gui_queue.put(("error_notice", pkt.to_json()))
+            self.gui_queue.put(("error_notice", _safe_json(pkt)))
 
         client.register_callback(MessageType.CHAT_BROADCAST, on_broadcast)
         client.register_callback(MessageType.CHAT_DIRECT, on_direct)
@@ -184,11 +190,19 @@ class CollabChatApp(tk.Tk):
         client.register_callback(MessageType.USER_LIST_RESP, on_user_list)
         client.register_callback(MessageType.ERROR_NOTICE, on_error)
 
-        # Hook nhận file
+        # Hook nhận file và thông báo lỗi / mất kết nối
         def on_file_received_done(sender: str, file_name: str, save_path: str):
             self.gui_queue.put(("incoming_file_done", (sender, file_name, save_path)))
 
+        def on_file_error(sender: str, file_name: str, reason: str):
+            self.gui_queue.put(("file_error", (sender, file_name, reason)))
+
+        def on_disconnected(reason: str):
+            self.gui_queue.put(("disconnected", reason))
+
         client.on_file_received = on_file_received_done
+        client.on_file_error = on_file_error
+        client.on_disconnected = on_disconnected
 
     # ==========================================================================
     # VÒNG LẶP ĐỌC HÀNG ĐỢI SỰ KIỆN (QUEUE CONSUMER ON MAIN THREAD)
@@ -243,6 +257,7 @@ class CollabChatApp(tk.Tk):
                 content = data.get("content") or data.get("text", "")
                 ts = data.get("timestamp")
                 tab_id = f"user_{sender.lower()}"
+                self.chat_view.get_or_create_direct_tab(sender)
                 self.chat_view.append_message(
                     tab_id=tab_id,
                     sender=sender,
@@ -290,15 +305,18 @@ class CollabChatApp(tk.Tk):
 
         elif event_type == "file_progress_update":
             file_id, sent, total, pct = data
-            if file_id in self.file_dialogs:
-                self.file_dialogs[file_id].update_progress(sent, total, pct)
+            dlg = self.file_dialogs.get(file_id)
+            if dlg and dlg.winfo_exists():
+                dlg.update_progress(sent, total, pct)
 
         elif event_type == "file_send_finished":
             file_id, success, message, target_user, file_name = data
-            if file_id in self.file_dialogs:
-                self.file_dialogs[file_id].set_completed(success, message)
+            dlg = self.file_dialogs.pop(file_id, None)
+            if dlg and dlg.winfo_exists():
+                dlg.set_completed(success, message)
             if self.chat_view:
                 tab_id = f"user_{target_user.lower()}"
+                self.chat_view.get_or_create_direct_tab(target_user)
                 status_txt = (
                     f"Đã gửi file '{file_name}' thành công tới @{target_user}."
                     if success
@@ -316,6 +334,7 @@ class CollabChatApp(tk.Tk):
             sender, file_name, save_path = data
             if self.chat_view:
                 tab_id = f"user_{sender.lower()}"
+                self.chat_view.get_or_create_direct_tab(sender)
                 self.chat_view.append_message(
                     tab_id=tab_id,
                     sender=sender,
@@ -327,6 +346,37 @@ class CollabChatApp(tk.Tk):
                     sender="Hệ thống",
                     content=f"Đã nhận file '{file_name}' từ @{sender}.",
                     is_system=True,
+                )
+
+        elif event_type == "file_error":
+            sender, file_name, reason = data
+            err_msg = f"Nhận file '{file_name}' từ @{sender} thất bại: {reason}"
+            if self.chat_view:
+                tab_id = f"user_{sender.lower()}"
+                self.chat_view.get_or_create_direct_tab(sender)
+                self.chat_view.append_message(
+                    tab_id=tab_id,
+                    sender="Cảnh báo",
+                    content=err_msg,
+                    is_error=True,
+                )
+                self.chat_view.append_message(
+                    tab_id="global",
+                    sender="Cảnh báo",
+                    content=err_msg,
+                    is_error=True,
+                )
+            else:
+                messagebox.showerror("Lỗi nhận file", err_msg)
+
+        elif event_type == "disconnected":
+            reason = data or "Kết nối tới Server đã bị ngắt."
+            if self.chat_view:
+                self.chat_view.append_message(
+                    tab_id="global",
+                    sender="Cảnh báo",
+                    content=f"Mất kết nối tới Server: {reason}",
+                    is_error=True,
                 )
 
     # ==========================================================================
@@ -380,12 +430,15 @@ class CollabChatApp(tk.Tk):
             self.gui_queue.put(("file_progress_update", (file_id, sent, total, pct)))
 
         def worker():
-            ok, msg = self.client.send_file(
-                recipient=recipient,
-                file_path=file_path,
-                progress_callback=progress_cb,
-                timeout=60.0,
-            )
+            try:
+                ok, msg = self.client.send_file(
+                    recipient=recipient,
+                    file_path=file_path,
+                    progress_callback=progress_cb,
+                    timeout=60.0,
+                )
+            except Exception as exc:
+                ok, msg = False, f"Lỗi khi gửi file: {exc}"
             self.gui_queue.put(
                 ("file_send_finished", (file_id, ok, msg, recipient, file_name))
             )

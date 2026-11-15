@@ -7,6 +7,7 @@ Mô tả: Lớp Client chính quản lý TCP Socket áp dụng kiến trúc 2 lu
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import socket
@@ -15,10 +16,14 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from common.crypto_utils import derive_key
+from cryptography.fernet import InvalidToken
+
+from common.crypto_utils import decrypt_payload, derive_key, encrypt_payload
 from common.logger import get_logger
 from common.message_types import MessageType
 from common.protocol import (
+    FLAG_ENCRYPTED,
+    FLAG_NONE,
     PROTOCOL_VERSION,
     ConnectionClosedError,
     Packet,
@@ -105,6 +110,8 @@ class ClientCore:
         self._file_results: Dict[str, dict] = {}
         self.on_file_progress: Optional[Callable[[str, int, int, float], None]] = None
         self.on_file_received: Optional[Callable[[str, str, str], None]] = None
+        self.on_file_error: Optional[Callable[[str, str, str], None]] = None
+        self.on_disconnected: Optional[Callable[[str], None]] = None
 
         self.register_callback(MessageType.FILE_OFFER_REQ, self._handle_file_offer_req)
         self.register_callback(MessageType.FILE_OFFER_RESP, self._handle_file_offer_resp)
@@ -117,6 +124,11 @@ class ClientCore:
 
         # Lớp mã hóa bảo mật (AES-Fernet)
         self.crypto_key: Optional[bytes] = None
+
+    @property
+    def server_encryption_enabled(self) -> bool:
+        """Kiểm tra xem Server có đang bật lớp mã hóa hay chỉ là relay trung gian."""
+        return bool((self.server_info or {}).get("encryption_enabled", False))
 
     def enable_encryption(self, passphrase: Optional[str] = None) -> None:
         """Kích hoạt mã hóa đối xứng AES cho toàn bộ payload gửi đi."""
@@ -280,40 +292,105 @@ class ClientCore:
         self._receiver_thread.start()
         logger.info("🎧 Receiver Thread đã khởi động và đang lắng nghe phản hồi từ Server...")
 
+    def _unwrap_incoming_packet(self, packet: Packet) -> Tuple[Optional[Packet], Optional[str]]:
+        """
+        Giải mã gói tin đến một cách an toàn:
+          1. Nếu có cờ FLAG_ENCRYPTED: giải mã bằng self.crypto_key.
+          2. Nếu là CHAT_DIRECT dạng E2EE envelope: giải mã trường ciphertext.
+        Trả về (Packet đã giải mã, None) hoặc (None, thông báo lỗi) nếu sai/thiếu khóa.
+        """
+        if packet.is_encrypted:
+            if not self.crypto_key:
+                return None, "Nhận được dữ liệu mã hóa AES nhưng bạn chưa nhập mật khẩu phòng."
+            try:
+                return packet.get_decrypted_packet(self.crypto_key), None
+            except InvalidToken:
+                return None, "Không thể giải mã dữ liệu AES (mật khẩu phòng không khớp với người gửi)."
+
+        if int(packet.msg_type) == int(MessageType.CHAT_DIRECT):
+            try:
+                data = packet.to_json()
+                if isinstance(data, dict) and data.get("e2ee") and "ciphertext" in data:
+                    sender_name = data.get("sender", "Ẩn danh")
+                    if not self.crypto_key:
+                        return None, f"Tin nhắn riêng từ '{sender_name}' được mã hóa AES, nhưng bạn chưa nhập mật khẩu phòng."
+                    plain_bytes = decrypt_payload(str(data["ciphertext"]).encode("ascii"), self.crypto_key)
+                    inner = json.loads(plain_bytes.decode("utf-8"))
+                    unwrapped_payload = {
+                        "sender": data.get("sender") or inner.get("sender", sender_name),
+                        "recipient": data.get("recipient") or inner.get("recipient", ""),
+                        "content": inner.get("content", ""),
+                        "timestamp": data.get("timestamp") or inner.get("timestamp"),
+                        "type": "direct",
+                    }
+                    return Packet(
+                        msg_type=MessageType.CHAT_DIRECT,
+                        payload=json.dumps(unwrapped_payload, ensure_ascii=False).encode("utf-8"),
+                        flags=FLAG_NONE,
+                        version=packet.version,
+                    ), None
+            except InvalidToken:
+                return None, "Không thể giải mã tin nhắn riêng AES (mật khẩu phòng không khớp)."
+            except Exception as exc:
+                logger.warning("Lỗi giải mã phong bì E2EE CHAT_DIRECT: %s", exc)
+                return None, "Không thể giải mã nội dung tin nhắn riêng E2EE."
+
+        return packet, None
+
+    def _dispatch_received_packet(self, packet: Packet) -> None:
+        """Đưa gói tin vào queue và kích hoạt các callbacks đã đăng ký."""
+        self.received_queue.put(packet)
+
+        if self.on_packet_received:
+            try:
+                self.on_packet_received(packet)
+            except Exception as e:
+                logger.error("Lỗi trong on_packet_received callback: %s", e)
+
+        msg_key = int(packet.msg_type)
+        if msg_key in self._packet_callbacks:
+            for cb in self._packet_callbacks[msg_key]:
+                try:
+                    cb(packet)
+                except Exception as e:
+                    logger.error("Lỗi trong packet callback [%s]: %s", msg_key, e)
+
     def _receiver_loop(self) -> None:
         """
         Vòng lặp chạy trong Receiver Thread:
         Đọc liên tục các gói tin từ Server trả về và phân phát cho callbacks / queue.
         """
+        disconnect_reason: Optional[str] = None
         while self.is_connected and self.sock:
             try:
-                packet = recv_packet(self.sock, decrypt_key=self.crypto_key)
-                # Đưa vào queue để GUI / Caller có thể lấy ra
-                self.received_queue.put(packet)
+                raw_packet = recv_packet(self.sock)
+                packet, decrypt_err = self._unwrap_incoming_packet(raw_packet)
 
-                # Gọi callback chung nếu có
-                if self.on_packet_received:
-                    try:
-                        self.on_packet_received(packet)
-                    except Exception as e:
-                        logger.error("Lỗi trong on_packet_received callback: %s", e)
+                if decrypt_err:
+                    logger.warning("🔒 %s", decrypt_err)
+                    err_packet = Packet(
+                        msg_type=MessageType.ERROR_NOTICE,
+                        payload=json.dumps(
+                            {"code": "DECRYPTION_FAILED", "message": decrypt_err},
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        flags=FLAG_NONE,
+                    )
+                    self._dispatch_received_packet(err_packet)
+                    continue
 
-                # Gọi các callback chuyên biệt theo msg_type
-                msg_key = int(packet.msg_type)
-                if msg_key in self._packet_callbacks:
-                    for cb in self._packet_callbacks[msg_key]:
-                        try:
-                            cb(packet)
-                        except Exception as e:
-                            logger.error("Lỗi trong packet callback [%s]: %s", msg_key, e)
+                if packet is not None:
+                    self._dispatch_received_packet(packet)
 
             except ConnectionClosedError:
                 if self.is_connected:
                     logger.warning("🔌 Server đã ngắt kết nối.")
+                    disconnect_reason = "Server đã đóng kết nối."
                 break
             except (ConnectionResetError, ConnectionAbortedError):
                 if self.is_connected:
                     logger.warning("⚠️ Kết nối tới Server bị reset đột ngột.")
+                    disconnect_reason = "Kết nối tới Server bị gián đoạn đột ngột."
                 break
             except OSError:
                 # Socket có thể đã được close bởi disconnect()
@@ -321,9 +398,16 @@ class ClientCore:
             except Exception as exc:
                 if self.is_connected:
                     logger.error("❌ Lỗi không mong muốn trong Receiver Loop: %s", exc)
+                    disconnect_reason = f"Lỗi kết nối: {exc}"
                 break
 
+        was_connected = self.is_connected
         self.is_connected = False
+        if was_connected and disconnect_reason and self.on_disconnected:
+            try:
+                self.on_disconnected(disconnect_reason)
+            except Exception:
+                pass
 
     def send_packet(
         self,
@@ -339,21 +423,23 @@ class ClientCore:
             return False
 
         try:
-            # Chỉ mã hóa các gói tin nội dung dữ liệu (Data Plane: CHAT, FILE)
-            # Giữ nguyên các gói tin điều khiển (Control Plane: AUTH, HANDSHAKE, USER_LIST, PING)
-            encrypt_target = (
-                self.crypto_key is not None
-                and int(msg_type) in (
-                    MessageType.CHAT_BROADCAST,
-                    MessageType.CHAT_DIRECT,
-                    MessageType.FILE_CHUNK,
-                )
-            )
+            # Mã hóa toàn bộ payload Data Plane khi phù hợp:
+            # - CHAT_BROADCAST: luôn mã hóa toàn packet (Server relay nguyên dạng nếu không giữ khóa).
+            # - CHAT_DIRECT & FILE_CHUNK: mã hóa toàn packet nếu Server giữ khóa; ngược lại giữ metadata rõ
+            #   và mã hóa riêng phần nội dung/chunk bên trong để Server định tuyến chính xác.
+            encrypt_full_packet = False
+            if self.crypto_key is not None and not (flags & FLAG_ENCRYPTED):
+                mtype = int(msg_type)
+                if mtype == int(MessageType.CHAT_BROADCAST):
+                    encrypt_full_packet = True
+                elif mtype in (int(MessageType.CHAT_DIRECT), int(MessageType.FILE_CHUNK)):
+                    encrypt_full_packet = self.server_encryption_enabled
+
             packet_bytes = create_packet(
                 msg_type,
                 payload,
                 flags=flags,
-                encrypt_key=self.crypto_key if encrypt_target else None,
+                encrypt_key=self.crypto_key if encrypt_full_packet else None,
             )
             with self._send_lock:
                 if self.sock:
@@ -436,11 +522,12 @@ class ClientCore:
 
             if self.auto_accept_files:
                 os.makedirs(self.download_dir, exist_ok=True)
-                save_path = os.path.join(self.download_dir, file_name)
+                safe_file_name = os.path.basename(file_name) or f"file_{file_id}"
+                save_path = os.path.join(self.download_dir, safe_file_name)
                 transfer = IncomingFileTransfer(
                     file_id=file_id,
                     sender=sender,
-                    file_name=file_name,
+                    file_name=safe_file_name,
                     file_size=file_size,
                     total_chunks=total_chunks,
                     expected_sha256=expected_sha256,
@@ -491,6 +578,36 @@ class ClientCore:
                 logger.warning("Nhận chunk cho file_id không tồn tại: %s", file_id)
                 return
 
+            # Nếu chunk được mã hóa E2EE trực tiếp bởi người gửi, giải mã trước khi lưu
+            if meta.get("encrypted"):
+                err_reason: Optional[str] = None
+                if not self.crypto_key:
+                    err_reason = "Tập tin được mã hóa AES nhưng bạn chưa nhập mật khẩu phòng."
+                else:
+                    try:
+                        chunk_data = decrypt_payload(chunk_data, self.crypto_key)
+                    except InvalidToken:
+                        err_reason = "Mật khẩu giải mã AES không khớp giữa người gửi và bạn."
+
+                if err_reason:
+                    self.incoming_files.pop(file_id, None)
+                    logger.warning("🔒 Giải mã FILE_CHUNK '%s' thất bại: %s", transfer.file_name, err_reason)
+                    ack_payload = {
+                        "file_id": file_id,
+                        "sender": transfer.sender,
+                        "recipient": self.username or self.client_name,
+                        "status": "FAILED",
+                        "reason": err_reason,
+                        "file_name": transfer.file_name,
+                    }
+                    self.send_packet(MessageType.FILE_ACK, ack_payload)
+                    if self.on_file_error:
+                        try:
+                            self.on_file_error(transfer.sender, transfer.file_name, err_reason)
+                        except Exception:
+                            pass
+                    return
+
             is_finished = transfer.add_chunk(chunk_index, chunk_data)
 
             if self.on_file_progress:
@@ -505,6 +622,7 @@ class ClientCore:
                     pass
 
             if is_finished:
+                self.incoming_files.pop(file_id, None)
                 ok, reason = transfer.assemble_and_verify()
                 ack_payload = {
                     "file_id": file_id,
@@ -522,6 +640,11 @@ class ClientCore:
                         self.on_file_received(transfer.sender, transfer.file_name, transfer.save_path)
                     except Exception as e:
                         logger.error("Lỗi callback on_file_received: %s", e)
+                elif not ok and self.on_file_error:
+                    try:
+                        self.on_file_error(transfer.sender, transfer.file_name, reason)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.error("Lỗi xử lý FILE_CHUNK: %s", e)
 
@@ -621,13 +744,39 @@ class ClientCore:
             bool: True nếu gói tin gửi thành công lên server.
         """
         sender_name = self.username if self.username else self.client_name
+        ts = time.time()
+
+        # Nếu Client bật mã hóa mà Server không giữ khóa (E2EE relay),
+        # giữ trường recipient rõ để Server định tuyến, nhưng mã hóa AES toàn bộ nội dung bên trong.
+        if self.crypto_key is not None and not self.server_encryption_enabled:
+            inner_data = json.dumps(
+                {
+                    "sender": sender_name,
+                    "recipient": recipient,
+                    "content": content,
+                    "timestamp": ts,
+                },
+                ensure_ascii=False,
+            )
+            cipher_token = encrypt_payload(inner_data, self.crypto_key).decode("ascii")
+            return self.send_packet(
+                MessageType.CHAT_DIRECT,
+                {
+                    "sender": sender_name,
+                    "recipient": recipient,
+                    "e2ee": True,
+                    "ciphertext": cipher_token,
+                    "timestamp": ts,
+                },
+            )
+
         return self.send_packet(
             MessageType.CHAT_DIRECT,
             {
                 "sender": sender_name,
                 "recipient": recipient,
                 "content": content,
-                "timestamp": time.time(),
+                "timestamp": ts,
             },
         )
 
@@ -706,12 +855,16 @@ class ClientCore:
         self._file_events[file_id] = ack_event
 
         sent_chunks = 0
-        for chunk_index, chunk_data in read_file_chunks(path, chunk_size=DEFAULT_CHUNK_SIZE):
+        use_e2ee_chunks = self.crypto_key is not None and not self.server_encryption_enabled
+        chunk_iter = read_file_chunks(path, chunk_size=DEFAULT_CHUNK_SIZE) if file_size > 0 else [(0, b"")]
+        for chunk_index, chunk_data in chunk_iter:
+            wire_data = encrypt_payload(chunk_data, self.crypto_key) if use_e2ee_chunks else chunk_data
             chunk_payload = pack_chunk_payload(
                 file_id=file_id,
                 chunk_index=chunk_index,
                 total_chunks=total_chunks,
-                chunk_data=chunk_data,
+                chunk_data=wire_data,
+                encrypted=use_e2ee_chunks,
             )
             self.send_packet(MessageType.FILE_CHUNK, chunk_payload)
             sent_chunks += 1

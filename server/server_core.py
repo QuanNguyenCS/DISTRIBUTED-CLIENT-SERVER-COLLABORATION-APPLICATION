@@ -215,6 +215,7 @@ class ServerCore:
                 "status": "OK",
                 "server_id": self.server_id,
                 "version": PROTOCOL_VERSION,
+                "encryption_enabled": self.crypto_key is not None,
                 "message": f"Welcome to {self.server_id}! Handshake successful.",
             }
             client_sock.sendall(
@@ -279,6 +280,7 @@ class ServerCore:
         payload: Any = b"",
         exclude_addr: Optional[Tuple[str, int]] = None,
         only_authenticated: bool = False,
+        flags: int = 0,
     ) -> int:
         """
         Gửi gói tin phát thanh (Broadcast) đến tất cả các Client đang kết nối.
@@ -288,6 +290,7 @@ class ServerCore:
             payload: Dữ liệu cần gửi.
             exclude_addr: Địa chỉ của Client cần loại trừ (ví dụ không gửi lại cho người vừa gửi).
             only_authenticated: Chỉ gửi tới các client đã xác thực đăng nhập nếu True.
+            flags: Cờ bitmask gói tin.
 
         Returns:
             int: Số lượng client gửi thành công.
@@ -299,7 +302,7 @@ class ServerCore:
                 continue
             if only_authenticated and not handler.is_authenticated:
                 continue
-            if handler.send_packet(msg_type, payload):
+            if handler.send_packet(msg_type, payload, flags=flags):
                 success_count += 1
         return success_count
 

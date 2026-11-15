@@ -83,6 +83,7 @@ class MessageRouter:
         content: str,
         sender_handler: Optional[ClientHandler] = None,
         timestamp: Optional[float] = None,
+        e2ee_ciphertext: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Định tuyến tin nhắn riêng 1-1 (Unicast) đến một người nhận cụ thể.
@@ -93,11 +94,12 @@ class MessageRouter:
             content: Nội dung tin nhắn.
             sender_handler: Handler của người gửi (để phản hồi ACK hoặc báo lỗi).
             timestamp: Dấu thời gian (giây).
+            e2ee_ciphertext: Chuỗi mã hóa E2EE (nếu Server chỉ chuyển tiếp không giữ khóa).
 
         Returns:
             Tuple[bool, str]: (Thành công hay không, Thông điệp kết quả).
         """
-        if not content:
+        if not content and not e2ee_ciphertext:
             return False, "Nội dung tin nhắn không được để trống."
 
         # 1. Chặn việc tự gửi tin nhắn riêng cho chính mình
@@ -136,13 +138,23 @@ class MessageRouter:
         ts = timestamp if timestamp is not None else time.time()
 
         # 3. Đóng gói và gửi tin nhắn riêng tới người nhận
-        direct_payload = {
-            "sender": sender_username,
-            "recipient": session.username,  # Giữ đúng chữ hoa/thường chuẩn của người nhận
-            "content": content,
-            "timestamp": ts,
-            "type": "direct",
-        }
+        if e2ee_ciphertext is not None:
+            direct_payload: Dict[str, Any] = {
+                "sender": sender_username,
+                "recipient": session.username,
+                "e2ee": True,
+                "ciphertext": e2ee_ciphertext,
+                "timestamp": ts,
+                "type": "direct",
+            }
+        else:
+            direct_payload = {
+                "sender": sender_username,
+                "recipient": session.username,  # Giữ đúng chữ hoa/thường chuẩn của người nhận
+                "content": content,
+                "timestamp": ts,
+                "type": "direct",
+            }
 
         sent = session.handler.send_packet(
             MessageType.CHAT_DIRECT,

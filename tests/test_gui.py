@@ -121,6 +121,40 @@ class TestGuiComponents(unittest.TestCase):
         self.assertEqual(dlg.progress_bar["value"], 100.0)
         dlg.destroy()
 
+    def test_chat_view_double_click_open_direct_tab(self):
+        """Chọn user trong Listbox và gọi _open_selected_user_chat không gây TclError và chuyển đúng tab."""
+        chat_view = ChatView(
+            self.root,
+            current_username="Alice",
+            on_send_broadcast=MagicMock(),
+            on_send_direct=MagicMock(),
+            on_send_file=MagicMock(),
+            on_refresh_users=MagicMock(),
+            on_logout=MagicMock(),
+            is_encrypted=True,
+        )
+        chat_view.pack()
+        chat_view.update_online_users(["Alice", "Bob", "Charlie"])
+        self.root.update_idletasks()
+
+        bob_idx = None
+        for idx in range(chat_view.users_listbox.size()):
+            if "Bob" in chat_view.users_listbox.get(idx):
+                bob_idx = idx
+                break
+        self.assertIsNotNone(bob_idx)
+
+        chat_view.users_listbox.selection_clear(0, tk.END)
+        chat_view.users_listbox.selection_set(bob_idx)
+        chat_view._open_selected_user_chat()
+        self.root.update_idletasks()
+
+        self.assertIn("user_bob", chat_view.chat_tabs)
+        self.assertIn("user_bob", chat_view.tab_frames)
+        self.assertEqual(chat_view._get_current_active_tab_id(), "user_bob")
+        self.assertEqual(chat_view._get_recipient_for_tab("user_bob"), "Bob")
+        chat_view.destroy()
+
     def test_collab_chat_app_initialization(self):
         """Khởi tạo App root window."""
         app = CollabChatApp()

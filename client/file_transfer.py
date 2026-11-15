@@ -58,10 +58,11 @@ def pack_chunk_payload(
     chunk_index: int,
     total_chunks: int,
     chunk_data: bytes,
+    encrypted: bool = False,
 ) -> bytes:
     """
     Đóng gói mảnh dữ liệu file thành payload nhị phân:
-    [4 bytes độ dài metadata JSON] + [metadata JSON bytes] + [dữ liệu file thô]
+    [4 bytes độ dài metadata JSON] + [metadata JSON bytes] + [dữ liệu file thô / mã hóa]
     """
     meta = {
         "file_id": file_id,
@@ -69,6 +70,8 @@ def pack_chunk_payload(
         "total_chunks": total_chunks,
         "chunk_size": len(chunk_data),
     }
+    if encrypted:
+        meta["encrypted"] = True
     meta_bytes = json.dumps(meta).encode("utf-8")
     prefix = struct.pack("!I", len(meta_bytes))
     return prefix + meta_bytes + chunk_data

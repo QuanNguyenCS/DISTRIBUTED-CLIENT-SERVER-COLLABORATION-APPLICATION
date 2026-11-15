@@ -12,9 +12,12 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
+from cryptography.fernet import InvalidToken
+
 from common.logger import get_logger
 from common.message_types import MessageType
 from common.protocol import (
+    FLAG_ENCRYPTED,
     ConnectionClosedError,
     Packet,
     ProtocolError,
@@ -82,7 +85,16 @@ class ClientHandler(threading.Thread):
         try:
             while self.is_running:
                 # Đọc gói tin hoàn chỉnh theo chuẩn Application Layer Framing
-                packet = recv_packet(self.client_sock, decrypt_key=self.server.crypto_key)
+                packet = recv_packet(self.client_sock)
+                if packet.is_encrypted and self.server.crypto_key is not None:
+                    try:
+                        packet = packet.get_decrypted_packet(self.server.crypto_key)
+                    except InvalidToken:
+                        logger.warning(
+                            "⚠️ [%s:%d] Không thể giải mã gói tin bằng khóa Server (Client dùng khóa E2EE riêng?).",
+                            self.client_addr[0],
+                            self.client_addr[1],
+                        )
                 self._dispatch_packet(packet)
 
         except ConnectionClosedError:
@@ -209,6 +221,22 @@ class ClientHandler(threading.Thread):
             self.send_packet(MessageType.HEARTBEAT_PONG, {"status": "ALIVE"})
 
         elif msg_type == MessageType.CHAT_BROADCAST:
+            if packet.is_encrypted:
+                # Server không có khóa giải mã (chế độ E2EE Client-to-Client):
+                # Chuyển tiếp nguyên vẹn payload đã mã hóa và giữ nguyên cờ FLAG_ENCRYPTED!
+                sender_name = self.username if self.is_authenticated else self.client_name
+                logger.info(
+                    "🔒📢 [Encrypted Broadcast Relay] từ '%s' (%d bytes ciphertext)",
+                    sender_name,
+                    len(packet.payload),
+                )
+                self.server.broadcast_packet(
+                    MessageType.CHAT_BROADCAST,
+                    packet.payload,
+                    flags=packet.flags,
+                )
+                return
+
             # Định tuyến phát thanh tin nhắn phòng chung qua Router
             try:
                 chat_data = packet.to_json()
@@ -227,11 +255,26 @@ class ClientHandler(threading.Thread):
             )
 
         elif msg_type == MessageType.CHAT_DIRECT:
+            if packet.is_encrypted:
+                self.send_packet(
+                    MessageType.ERROR_NOTICE,
+                    {
+                        "code": "E2EE_ROUTING_REQUIRED",
+                        "message": "Server không thể đọc tên người nhận vì toàn bộ gói tin CHAT_DIRECT bị mã hóa.",
+                    },
+                )
+                return
+
             # Định tuyến tin nhắn riêng 1-1 (Unicast) qua Router
+            e2ee_ciphertext: Optional[str] = None
             try:
                 chat_data = packet.to_json()
                 recipient = chat_data.get("recipient", "")
-                content = chat_data.get("content") or chat_data.get("text", "")
+                if chat_data.get("e2ee") and "ciphertext" in chat_data:
+                    e2ee_ciphertext = str(chat_data["ciphertext"])
+                    content = "[Tin nhắn mã hóa E2EE]"
+                else:
+                    content = chat_data.get("content") or chat_data.get("text", "")
                 timestamp = chat_data.get("timestamp")
             except Exception:
                 recipient = ""
@@ -245,6 +288,7 @@ class ClientHandler(threading.Thread):
                 content=content,
                 sender_handler=self,
                 timestamp=timestamp,
+                e2ee_ciphertext=e2ee_ciphertext,
             )
 
         elif msg_type == MessageType.CHAT_ACK:
@@ -274,6 +318,13 @@ class ClientHandler(threading.Thread):
             )
 
         elif msg_type == MessageType.FILE_CHUNK:
+            if packet.is_encrypted:
+                logger.warning(
+                    "⚠️ [%s] Nhận FILE_CHUNK có cờ FLAG_ENCRYPTED nhưng Server không có khóa giải mã metadata.",
+                    self.username or self.client_name,
+                )
+                return
+
             # Chuyển tiếp mảnh dữ liệu file
             self.server.router.route_file_chunk(
                 sender_username=self.username or self.client_name,
@@ -322,6 +373,7 @@ class ClientHandler(threading.Thread):
         try:
             encrypt_target = (
                 self.server.crypto_key is not None
+                and not (flags & FLAG_ENCRYPTED)
                 and int(msg_type) in (
                     MessageType.CHAT_BROADCAST,
                     MessageType.CHAT_DIRECT,
