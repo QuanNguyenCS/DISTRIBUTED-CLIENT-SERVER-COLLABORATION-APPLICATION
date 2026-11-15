@@ -373,3 +373,89 @@ class TestCryptoIntegration:
             bob.disconnect()
             server.stop()
             sthread.join(timeout=2.0)
+
+    def test_p2p_encrypted_file_missing_key_and_wire_security(self, tmp_path):
+        """Gửi file P2P bật AES: bên nhận chưa nhập key phải báo lỗi rõ & gói P2P trên wire mang FLAG_ENCRYPTED."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
+        alice.enable_encryption("P2PSecretKey")
+
+        # Kiểm tra wire packet từ Alice tới fake P2P sniffer mang FLAG_ENCRYPTED, không lộ plaintext
+        sniffed_packets = []
+        sniffer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sniffer_sock.bind(("127.0.0.1", 0))
+        sniffer_sock.listen(4)
+        sniff_port = sniffer_sock.getsockname()[1]
+
+        def run_sniffer():
+            conn, _ = sniffer_sock.accept()
+            with conn:
+                pkt1 = recv_packet(conn)
+                sniffed_packets.append(pkt1)
+                conn.sendall(
+                    create_packet(MessageType.PEER_HELLO_ACK, {"status": "OK", "username": "Sniffer", "protocol_version": 1})
+                )
+                pkt2 = recv_packet(conn)
+                sniffed_packets.append(pkt2)
+                offer = pkt2.to_json()
+                conn.sendall(
+                    create_packet(
+                        MessageType.FILE_OFFER_RESP,
+                        {"file_id": offer["file_id"], "sender": "Alice", "recipient": "Sniffer", "status": "ACCEPTED"},
+                    )
+                )
+                pkt3 = recv_packet(conn)
+                sniffed_packets.append(pkt3)
+                conn.sendall(
+                    create_packet(
+                        MessageType.FILE_ACK,
+                        {"file_id": offer["file_id"], "sender": "Alice", "recipient": "Sniffer", "status": "SUCCESS", "reason": "OK"},
+                    )
+                )
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceSecP2P")[0]
+            assert bob.connect() and bob.authenticate("BobNoKeyP2P")[0]
+
+            file_errors = []
+            bob.on_file_error = lambda sender, fname, reason: file_errors.append((sender, fname, reason))
+
+            secret_file = tmp_path / "secret_p2p.txt"
+            secret_text = b"TOP_SECRET_P2P_BINARY_PAYLOAD_DO_NOT_LEAK"
+            secret_file.write_bytes(secret_text)
+
+            # Bob chưa nhập key -> reject ngay tại FILE_OFFER_REQ
+            ok, reason = alice.send_file("BobNoKeyP2P", str(secret_file), timeout=5.0)
+            assert ok is False
+            assert "mật khẩu phòng" in reason
+            assert len(file_errors) == 1
+            assert not (tmp_path / "downloads" / "secret_p2p.txt").exists()
+
+            # Xác minh packet FILE_CHUNK gửi trên P2P TCP bị mã hóa hoàn toàn
+            sniff_thread = threading.Thread(target=run_sniffer, daemon=True)
+            sniff_thread.start()
+
+            # Đăng ký endpoint trỏ sang sniffer trên Tracker
+            server.session_mgr.register_user("WireSniffer", object(), ("127.0.0.1", 55555), p2p_port=sniff_port)
+            ok_wire, _ = alice.send_file("WireSniffer", str(secret_file), timeout=5.0)
+            sniff_thread.join(timeout=2.0)
+
+            assert ok_wire is True
+            chunk_pkt = sniffed_packets[-1]
+            assert chunk_pkt.msg_type == MessageType.FILE_CHUNK
+            assert chunk_pkt.is_encrypted is True
+            assert secret_text not in chunk_pkt.payload
+        finally:
+            sniffer_sock.close()
+            server.session_mgr.unregister_user("WireSniffer")
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)

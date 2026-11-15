@@ -226,10 +226,11 @@ class CollabChatApp(tk.Tk):
         if event_type == "login_success":
             self._show_chat_view()
             if self.chat_view:
+                p2p_note = f" (Cổng P2P: {self.client.p2p_port})" if self.client and self.client.p2p_port else ""
                 self.chat_view.append_message(
                     tab_id="global",
                     sender="Hệ thống",
-                    content=f"Chào mừng {data} đã tham gia phòng cộng tác!",
+                    content=f"Chào mừng {data} đã tham gia phòng cộng tác!{p2p_note}",
                     is_system=True,
                 )
 
@@ -317,18 +318,21 @@ class CollabChatApp(tk.Tk):
             if self.chat_view:
                 tab_id = f"user_{target_user.lower()}"
                 self.chat_view.get_or_create_direct_tab(target_user)
-                status_txt = (
-                    f"Đã gửi file '{file_name}' thành công tới @{target_user}."
-                    if success
-                    else f"Gửi file '{file_name}' thất bại: {message}"
-                )
-                self.chat_view.append_message(
-                    tab_id=tab_id,
-                    sender=self.current_username,
-                    content=status_txt,
-                    is_file=True,
-                    is_self=True,
-                )
+                if success:
+                    self.chat_view.append_message(
+                        tab_id=tab_id,
+                        sender=self.current_username,
+                        content=f"Đã gửi P2P file '{file_name}' thành công tới @{target_user}.",
+                        is_file=True,
+                        is_self=True,
+                    )
+                else:
+                    self.chat_view.append_message(
+                        tab_id=tab_id,
+                        sender="Cảnh báo",
+                        content=f"Gửi file P2P '{file_name}' tới @{target_user} thất bại: {message}",
+                        is_error=True,
+                    )
 
         elif event_type == "incoming_file_done":
             sender, file_name, save_path = data

@@ -202,11 +202,13 @@ class TestAuthenticationIntegration:
         # Chờ gói tin phát thanh lan truyền tới Alice
         time.sleep(0.4)
 
-        # Alice phải nhận được thông báo Bob JOINED
+        # Alice phải nhận được thông báo Bob JOINED kèm P2P endpoint
         assert len(alice_events) >= 1
         assert alice_events[-1]["event"] == "JOINED"
         assert alice_events[-1]["username"] == "Bob"
+        assert alice_events[-1].get("peer", {}).get("p2p_port") == bob.p2p_port
         assert "Bob" in alice.online_users
+        assert "Bob" in alice.peer_directory
 
         # Alice chủ động truy vấn danh sách người dùng online
         current_users = alice.request_user_list()
@@ -218,10 +220,11 @@ class TestAuthenticationIntegration:
         bob.disconnect()
         time.sleep(0.4)
 
-        # Alice phải nhận được thông báo Bob LEFT
+        # Alice phải nhận được thông báo Bob LEFT và xóa khỏi peer directory
         assert alice_events[-1]["event"] == "LEFT"
         assert alice_events[-1]["username"] == "Bob"
         assert "Bob" not in alice.online_users
+        assert "Bob" not in alice.peer_directory
 
         alice.disconnect()
         server.stop()

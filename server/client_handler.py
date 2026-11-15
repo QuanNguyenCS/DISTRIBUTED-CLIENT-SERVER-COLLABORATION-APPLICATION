@@ -156,10 +156,17 @@ class ClientHandler(threading.Thread):
             self.is_running = False
 
         elif msg_type == MessageType.AUTH_REQ:
-            # Xử lý yêu cầu xác thực / đăng nhập
+            # Xử lý yêu cầu xác thực / đăng nhập kèm đăng ký cổng P2P lên Tracker
+            req_p2p_port: Optional[int] = None
+            req_p2p_host: Optional[str] = None
             try:
                 auth_payload = packet.to_json()
-                req_username = auth_payload.get("username", "") if isinstance(auth_payload, dict) else packet.to_text()
+                if isinstance(auth_payload, dict):
+                    req_username = auth_payload.get("username", "")
+                    req_p2p_port = auth_payload.get("p2p_port")
+                    req_p2p_host = auth_payload.get("p2p_host")
+                else:
+                    req_username = packet.to_text()
             except Exception:
                 req_username = packet.to_text()
 
@@ -175,6 +182,8 @@ class ClientHandler(threading.Thread):
                 username=req_username,
                 handler=self,
                 address=self.client_addr,
+                p2p_port=req_p2p_port,
+                p2p_host=req_p2p_host,
             )
 
             if not success or not session:
@@ -185,22 +194,25 @@ class ClientHandler(threading.Thread):
                 self.username = session.username
                 self.client_name = session.username
 
-                # Phản hồi đăng nhập thành công kèm danh sách user hiện tại
+                # Phản hồi đăng nhập thành công kèm danh sách user & danh bạ P2P hiện tại
                 success_payload = {
                     "status": "SUCCESS",
                     "username": self.username,
                     "online_users": self.server.session_mgr.get_all_users(),
+                    "peers": self.server.session_mgr.get_all_peer_endpoints(),
                     "message": "Đăng nhập thành công.",
                 }
                 self.send_packet(MessageType.AUTH_RESP_SUCCESS, success_payload)
 
                 # Phát thông báo cho tất cả client khác biết có người vừa tham gia
-                join_broadcast = {
+                join_broadcast: Dict[str, Any] = {
                     "event": "JOINED",
                     "username": self.username,
                     "online_count": self.server.session_mgr.get_user_count(),
                     "timestamp": time.time(),
                 }
+                if session.p2p_port is not None:
+                    join_broadcast["peer"] = session.to_peer_dict()
                 self.server.broadcast_packet(
                     MessageType.USER_STATUS_BROADCAST,
                     join_broadcast,
@@ -208,13 +220,79 @@ class ClientHandler(threading.Thread):
                 )
 
         elif msg_type == MessageType.USER_LIST_REQ:
-            # Trả về danh sách tất cả các user đang online
+            # Trả về danh sách tất cả các user đang online kèm danh bạ IP:P2P_Port
             online_users = self.server.session_mgr.get_all_users()
             list_payload = {
                 "users": online_users,
+                "peers": self.server.session_mgr.get_all_peer_endpoints(),
                 "count": len(online_users),
             }
             self.send_packet(MessageType.USER_LIST_RESP, list_payload)
+
+        elif msg_type == MessageType.PEER_LOOKUP_REQ:
+            # Control Plane Tracker: Tra cứu địa chỉ IP:P2P_Port cho Client
+            try:
+                lookup_data = packet.to_json()
+                target = str(
+                    lookup_data.get("target") or lookup_data.get("username") or ""
+                ).strip()
+            except Exception:
+                target = ""
+
+            if not target:
+                self.send_packet(
+                    MessageType.PEER_LOOKUP_RESP,
+                    {
+                        "found": False,
+                        "target": "",
+                        "username": "",
+                        "reason": "Thiếu tên người nhận cần tra cứu P2P.",
+                    },
+                )
+                return
+
+            session = self.server.session_mgr.get_session(target)
+            if not session or not session.handler:
+                self.send_packet(
+                    MessageType.PEER_LOOKUP_RESP,
+                    {
+                        "found": False,
+                        "target": target,
+                        "username": target,
+                        "reason": f"Người dùng '{target}' hiện không online hoặc không tồn tại.",
+                    },
+                )
+                return
+
+            if session.p2p_port is None:
+                self.send_packet(
+                    MessageType.PEER_LOOKUP_RESP,
+                    {
+                        "found": False,
+                        "target": target,
+                        "username": session.username,
+                        "reason": f"Người dùng '{session.username}' chưa mở cổng nhận file P2P.",
+                    },
+                )
+                return
+
+            logger.info(
+                "🔍 [Tracker Lookup] %s hỏi địa chỉ P2P của %s -> %s:%d",
+                self.username or self.client_name,
+                session.username,
+                session.effective_ip,
+                session.p2p_port,
+            )
+            self.send_packet(
+                MessageType.PEER_LOOKUP_RESP,
+                {
+                    "found": True,
+                    "target": target,
+                    "username": session.username,
+                    "ip": session.effective_ip,
+                    "p2p_port": session.p2p_port,
+                },
+            )
 
         elif msg_type == MessageType.HEARTBEAT_PING:
             # Phản hồi ngay PONG để giữ nhịp tim
@@ -294,52 +372,23 @@ class ClientHandler(threading.Thread):
         elif msg_type == MessageType.CHAT_ACK:
             logger.debug("[%s] Nhận CHAT_ACK từ client.", self.client_name)
 
-        elif msg_type == MessageType.FILE_OFFER_REQ:
-            # Chuyển tiếp đề nghị gửi file
-            try:
-                offer_data = packet.to_json()
-            except Exception:
-                offer_data = {}
-            self.server.router.route_file_offer(
-                sender_username=self.username or self.client_name,
-                offer_data=offer_data,
-                sender_handler=self,
+        elif msg_type in (
+            MessageType.FILE_OFFER_REQ,
+            MessageType.FILE_OFFER_RESP,
+            MessageType.FILE_CHUNK,
+            MessageType.FILE_ACK,
+        ):
+            logger.warning(
+                "⚠️ [%s] Từ chối chuyển tiếp gói tin %s qua Server: truyền file chỉ hỗ trợ P2P trực tiếp.",
+                self.username or self.client_name,
+                msg_type,
             )
-
-        elif msg_type == MessageType.FILE_OFFER_RESP:
-            # Chuyển tiếp phản hồi nhận file
-            try:
-                resp_data = packet.to_json()
-            except Exception:
-                resp_data = {}
-            self.server.router.route_file_offer_response(
-                recipient_username=self.username or self.client_name,
-                resp_data=resp_data,
-            )
-
-        elif msg_type == MessageType.FILE_CHUNK:
-            if packet.is_encrypted:
-                logger.warning(
-                    "⚠️ [%s] Nhận FILE_CHUNK có cờ FLAG_ENCRYPTED nhưng Server không có khóa giải mã metadata.",
-                    self.username or self.client_name,
-                )
-                return
-
-            # Chuyển tiếp mảnh dữ liệu file
-            self.server.router.route_file_chunk(
-                sender_username=self.username or self.client_name,
-                chunk_payload=packet.payload,
-            )
-
-        elif msg_type == MessageType.FILE_ACK:
-            # Chuyển tiếp xác nhận nhận file
-            try:
-                ack_data = packet.to_json()
-            except Exception:
-                ack_data = {}
-            self.server.router.route_file_ack(
-                recipient_username=self.username or self.client_name,
-                ack_data=ack_data,
+            self.send_packet(
+                MessageType.ERROR_NOTICE,
+                {
+                    "code": "FILE_P2P_ONLY",
+                    "message": "Server chỉ đóng vai trò Tracker (Lookup IP:P2P_Port); truyền file phải thực hiện trực tiếp P2P giữa 2 Client.",
+                },
             )
 
         else:
@@ -377,7 +426,6 @@ class ClientHandler(threading.Thread):
                 and int(msg_type) in (
                     MessageType.CHAT_BROADCAST,
                     MessageType.CHAT_DIRECT,
-                    MessageType.FILE_CHUNK,
                 )
             )
             packet_bytes = create_packet(

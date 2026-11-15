@@ -40,15 +40,28 @@ class ColoredFormatter(logging.Formatter):
         logging.CRITICAL: BOLD_RED,
     }
 
-    def format(self, record: logging.LogRecord) -> str:
-        color = self.LEVEL_COLORS.get(record.levelno, self.RESET)
-        log_fmt = (
+    def __init__(self) -> None:
+        super().__init__()
+        self._formatters = {
+            lvl: logging.Formatter(
+                f"{self.GRAY}%(asctime)s{self.RESET} | "
+                f"{color}%(levelname)-8s{self.RESET} | "
+                f"{self.CYAN}%(name)s{self.RESET} | "
+                f"%(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+            for lvl, color in self.LEVEL_COLORS.items()
+        }
+        self._default_formatter = logging.Formatter(
             f"{self.GRAY}%(asctime)s{self.RESET} | "
-            f"{color}%(levelname)-8s{self.RESET} | "
+            f"{self.RESET}%(levelname)-8s{self.RESET} | "
             f"{self.CYAN}%(name)s{self.RESET} | "
-            f"%(message)s"
+            f"%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
         )
-        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatter = self._formatters.get(record.levelno, self._default_formatter)
         return formatter.format(record)
 
 

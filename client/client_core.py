@@ -1,8 +1,9 @@
 """
 Module: client.client_core
-Mô tả: Lớp Client chính quản lý TCP Socket áp dụng kiến trúc 2 luồng đồng thời:
-  - Luồng 1 (Main/Sender Thread): Thực hiện kết nối, gửi lệnh, tin nhắn và file.
-  - Luồng 2 (Receiver Thread): Chạy ngầm liên tục lắng nghe và xử lý gói tin từ Server trả về.
+Mô tả: Lớp Client chính quản lý kiến trúc lai Client-Server + P2P File Transfer:
+  - Luồng 1 (Main/Sender Thread): Kết nối Tracker/Chat Server, gửi lệnh, tin nhắn và khởi tạo kết nối P2P gửi file.
+  - Luồng 2 (Receiver Thread): Lắng nghe nền các gói tin Control Plane & Chat từ Server.
+  - Luồng 3 (P2P Listener & Worker Threads): Lắng nghe TCP trực tiếp nhận file từ các Peer khác.
 """
 
 from __future__ import annotations
@@ -62,6 +63,8 @@ class ClientCore:
         server_host: str = DEFAULT_HOST,
         server_port: int = DEFAULT_PORT,
         client_name: str = "Client-App",
+        p2p_port: int = 0,
+        p2p_host: Optional[str] = None,
     ) -> None:
         self.server_host = server_host
         self.server_port = server_port
@@ -73,8 +76,18 @@ class ClientCore:
         # Khóa bảo vệ khi gửi dữ liệu từ nhiều luồng (Thread-Safe Send)
         self._send_lock = threading.Lock()
 
-        # Luồng lắng nghe ngầm
+        # Luồng lắng nghe ngầm từ Server
         self._receiver_thread: Optional[threading.Thread] = None
+
+        # Cấu hình & Listener P2P (Truyền file trực tiếp không qua Server)
+        self._configured_p2p_port: int = int(p2p_port)
+        self.p2p_host: Optional[str] = p2p_host
+        self.p2p_port: Optional[int] = None
+        self._p2p_server_sock: Optional[socket.socket] = None
+        self._p2p_accept_thread: Optional[threading.Thread] = None
+        self._p2p_worker_threads: List[threading.Thread] = []
+        self._p2p_workers_lock = threading.Lock()
+        self._p2p_running: bool = False
 
         # Hàng đợi chứa các gói tin nhận về (phục vụ GUI và Test)
         self.received_queue: queue.Queue[Packet] = queue.Queue()
@@ -90,33 +103,33 @@ class ClientCore:
         self.is_authenticated: bool = False
         self.online_users: List[str] = []
 
-        # Cơ chế đồng bộ phản hồi xác thực & danh sách người dùng
+        # Cơ chế đồng bộ phản hồi xác thực, danh sách user & tra cứu P2P từ Tracker
         self._auth_event = threading.Event()
         self._auth_result: Tuple[bool, str] = (False, "")
         self._user_list_event = threading.Event()
         self._user_list_result: Optional[List[str]] = None
+        self.peer_directory: Dict[str, Dict[str, Any]] = {}
+        self._peer_dir_lock = threading.Lock()
+        self._lookup_events: Dict[str, threading.Event] = {}
+        self._lookup_results: Dict[str, Dict[str, Any]] = {}
+        self._lookup_lock = threading.Lock()
 
-        # Đăng ký các callback nội bộ xử lý trạng thái
+        # Đăng ký các callback nội bộ xử lý Control Plane
         self.register_callback(MessageType.AUTH_RESP_SUCCESS, self._handle_auth_success)
         self.register_callback(MessageType.AUTH_RESP_FAIL, self._handle_auth_fail)
         self.register_callback(MessageType.USER_LIST_RESP, self._handle_user_list_resp)
         self.register_callback(MessageType.USER_STATUS_BROADCAST, self._handle_user_status_broadcast)
+        self.register_callback(MessageType.PEER_LOOKUP_RESP, self._handle_peer_lookup_resp)
 
-        # Quản lý truyền và nhận file tin cậy
+        # Quản lý truyền và nhận file P2P tin cậy
         self.incoming_files: Dict[str, IncomingFileTransfer] = {}
+        self._incoming_files_lock = threading.Lock()
         self.download_dir: str = os.path.join("storage", "client_downloads")
         self.auto_accept_files: bool = True
-        self._file_events: Dict[str, threading.Event] = {}
-        self._file_results: Dict[str, dict] = {}
         self.on_file_progress: Optional[Callable[[str, int, int, float], None]] = None
         self.on_file_received: Optional[Callable[[str, str, str], None]] = None
         self.on_file_error: Optional[Callable[[str, str, str], None]] = None
         self.on_disconnected: Optional[Callable[[str], None]] = None
-
-        self.register_callback(MessageType.FILE_OFFER_REQ, self._handle_file_offer_req)
-        self.register_callback(MessageType.FILE_OFFER_RESP, self._handle_file_offer_resp)
-        self.register_callback(MessageType.FILE_CHUNK, self._handle_file_chunk)
-        self.register_callback(MessageType.FILE_ACK, self._handle_file_ack)
 
         # Quản lý luồng gửi nhịp tim (Heartbeat / Keepalive)
         self.heartbeat_sender: Optional[HeartbeatSender] = None
@@ -155,14 +168,17 @@ class ClientCore:
         protocol_version: int = PROTOCOL_VERSION,
         start_receiver: bool = True,
         start_heartbeat: bool = True,
+        start_p2p: bool = True,
     ) -> bool:
         """
-        Kết nối tới Server TCP, thực hiện bắt tay và khởi chạy luồng lắng nghe nền.
+        Kết nối tới Server TCP, thực hiện bắt tay, mở cổng P2P Listener và khởi chạy luồng nền.
 
         Args:
             timeout: Thời gian tối đa chờ kết nối (giây).
             protocol_version: Phiên bản giao thức gửi đi (mặc định là PROTOCOL_VERSION).
             start_receiver: Có tự động bật Receiver Thread chạy nền hay không (mặc định True).
+            start_heartbeat: Có tự động bật Heartbeat Thread hay không (mặc định True).
+            start_p2p: Có tự động mở cổng P2P TCP Listener hay không (mặc định True).
 
         Returns:
             bool: True nếu kết nối và bắt tay thành công, False nếu thất bại.
@@ -194,11 +210,20 @@ class ClientCore:
                 # Bỏ timeout để socket hoạt động ở chế độ bình thường
                 self.sock.settimeout(None)
 
-                # 4. Kích hoạt Luồng 2 (Receiver Thread) chạy nền nếu được yêu cầu
+                # 4. Mở cổng P2P Listener trước khi authenticate để đăng ký IP:P2P_Port lên Tracker
+                if start_p2p:
+                    try:
+                        self.start_p2p_listener()
+                    except OSError as p2p_exc:
+                        logger.error("❌ Không thể mở cổng P2P Listener (%s): %s", self._configured_p2p_port, p2p_exc)
+                        self.disconnect(send_notice=False)
+                        return False
+
+                # 5. Kích hoạt Luồng 2 (Receiver Thread) chạy nền nếu được yêu cầu
                 if start_receiver:
                     self._start_receiver()
 
-                # 5. Kích hoạt Luồng Heartbeat định kỳ gửi PING duy trì kết nối
+                # 6. Kích hoạt Luồng Heartbeat định kỳ gửi PING duy trì kết nối
                 if start_heartbeat:
                     self.heartbeat_sender = HeartbeatSender(self, interval_seconds=self.heartbeat_interval)
                     self.heartbeat_sender.start()
@@ -423,16 +448,16 @@ class ClientCore:
             return False
 
         try:
-            # Mã hóa toàn bộ payload Data Plane khi phù hợp:
+            # Mã hóa toàn bộ payload Chat Data Plane khi phù hợp:
             # - CHAT_BROADCAST: luôn mã hóa toàn packet (Server relay nguyên dạng nếu không giữ khóa).
-            # - CHAT_DIRECT & FILE_CHUNK: mã hóa toàn packet nếu Server giữ khóa; ngược lại giữ metadata rõ
-            #   và mã hóa riêng phần nội dung/chunk bên trong để Server định tuyến chính xác.
+            # - CHAT_DIRECT: mã hóa toàn packet nếu Server giữ khóa; ngược lại giữ metadata rõ
+            #   và mã hóa riêng phần nội dung bên trong để Server định tuyến chính xác.
             encrypt_full_packet = False
             if self.crypto_key is not None and not (flags & FLAG_ENCRYPTED):
                 mtype = int(msg_type)
                 if mtype == int(MessageType.CHAT_BROADCAST):
                     encrypt_full_packet = True
-                elif mtype in (int(MessageType.CHAT_DIRECT), int(MessageType.FILE_CHUNK)):
+                elif mtype == int(MessageType.CHAT_DIRECT):
                     encrypt_full_packet = self.server_encryption_enabled
 
             packet_bytes = create_packet(
@@ -453,6 +478,27 @@ class ClientCore:
     # ==========================================================================
     # CÁC HÀM XỬ LÝ SỰ KIỆN NỘI BỘ (INTERNAL EVENT HANDLERS)
     # ==========================================================================
+    def _update_peer_directory(self, peers: Any) -> None:
+        """Cập nhật danh bạ địa chỉ IP:P2P_Port cục bộ từ dữ liệu Tracker."""
+        if not isinstance(peers, dict):
+            return
+        with self._peer_dir_lock:
+            for uname, info in peers.items():
+                if isinstance(info, dict) and info.get("ip") and info.get("p2p_port"):
+                    self.peer_directory[uname] = {
+                        "username": info.get("username", uname),
+                        "ip": str(info["ip"]),
+                        "p2p_port": int(info["p2p_port"]),
+                    }
+
+    def _remove_peer_from_directory(self, username: str) -> None:
+        """Xóa một peer khỏi danh bạ P2P cục bộ theo tên (không phân biệt hoa thường)."""
+        target_key = username.lower()
+        with self._peer_dir_lock:
+            stale = [k for k in self.peer_directory if k.lower() == target_key]
+            for k in stale:
+                del self.peer_directory[k]
+
     def _handle_auth_success(self, packet: Packet) -> None:
         """Xử lý khi nhận được phản hồi đăng nhập thành công."""
         try:
@@ -463,6 +509,7 @@ class ClientCore:
         self.username = data.get("username", self.client_name)
         self.client_name = self.username
         self.online_users = data.get("online_users", [self.username])
+        self._update_peer_directory(data.get("peers"))
         self._auth_result = (True, data.get("message", "Đăng nhập thành công."))
         self._auth_event.set()
         logger.info("🎉 Đã xác thực thành công danh tính: '%s'", self.username)
@@ -480,10 +527,11 @@ class ClientCore:
         logger.warning("⛔ Đăng nhập bị từ chối: %s", reason)
 
     def _handle_user_list_resp(self, packet: Packet) -> None:
-        """Xử lý danh sách user từ Server trả về."""
+        """Xử lý danh sách user và thông tin P2P endpoint từ Tracker trả về."""
         try:
             data = packet.to_json()
             users = data.get("users", [])
+            self._update_peer_directory(data.get("peers"))
         except Exception:
             users = []
         self.online_users = users
@@ -491,7 +539,7 @@ class ClientCore:
         self._user_list_event.set()
 
     def _handle_user_status_broadcast(self, packet: Packet) -> None:
-        """Cập nhật danh sách online khi có thông báo người dùng JOINED / LEFT."""
+        """Cập nhật danh sách online & danh bạ P2P khi có người dùng JOINED / LEFT."""
         try:
             data = packet.to_json()
             event = data.get("event")
@@ -499,165 +547,353 @@ class ClientCore:
             if event == "JOINED" and user:
                 if user not in self.online_users:
                     self.online_users.append(user)
+                peer_info = data.get("peer")
+                if isinstance(peer_info, dict) and peer_info.get("ip") and peer_info.get("p2p_port"):
+                    self._update_peer_directory({user: peer_info})
                 logger.info("👤 [%s] vừa tham gia hệ thống.", user)
             elif event == "LEFT" and user:
                 if user in self.online_users:
                     self.online_users.remove(user)
+                self._remove_peer_from_directory(user)
                 logger.info("👤 [%s] vừa rời hệ thống.", user)
         except Exception as e:
             logger.error("Lỗi khi xử lý USER_STATUS_BROADCAST: %s", e)
 
-    def _handle_file_offer_req(self, packet: Packet) -> None:
-        """Xử lý khi nhận được đề nghị gửi file (FILE_OFFER_REQ) từ người khác."""
+    def _handle_peer_lookup_resp(self, packet: Packet) -> None:
+        """Nhận kết quả tra cứu địa chỉ IP:P2P_Port (PEER_LOOKUP_RESP) từ Tracker Server."""
         try:
-            offer = packet.to_json()
-            file_id = offer["file_id"]
-            sender = offer["sender"]
-            file_name = offer["file_name"]
-            file_size = offer["file_size"]
-            total_chunks = offer["total_chunks"]
-            expected_sha256 = offer["sha256"]
+            data = packet.to_json()
+        except Exception:
+            return
+        target = data.get("target") or data.get("username")
+        resolved_name = data.get("username") or target
+        if not target:
+            return
+        key = str(target).lower()
+        if data.get("found") and data.get("ip") and data.get("p2p_port") and resolved_name:
+            self._update_peer_directory({str(resolved_name): data})
+        elif resolved_name:
+            self._remove_peer_from_directory(str(resolved_name))
 
-            logger.info("📥 Nhận đề xuất gửi file '%s' (%s bytes, %d chunks) từ '%s'.", file_name, file_size, total_chunks, sender)
+        with self._lookup_lock:
+            ev = self._lookup_events.get(key)
+            if ev is not None:
+                self._lookup_results[key] = data
+                ev.set()
 
-            if self.auto_accept_files:
-                os.makedirs(self.download_dir, exist_ok=True)
-                safe_file_name = os.path.basename(file_name) or f"file_{file_id}"
-                save_path = os.path.join(self.download_dir, safe_file_name)
-                transfer = IncomingFileTransfer(
-                    file_id=file_id,
-                    sender=sender,
-                    file_name=safe_file_name,
-                    file_size=file_size,
-                    total_chunks=total_chunks,
-                    expected_sha256=expected_sha256,
-                    save_path=save_path,
-                )
-                self.incoming_files[file_id] = transfer
+    # ==========================================================================
+    # QUẢN LÝ LISTENER & NHẬN FILE TRỰC TIẾP P2P (PEER-TO-PEER SERVER)
+    # ==========================================================================
+    def start_p2p_listener(self, bind_host: str = "0.0.0.0", port: Optional[int] = None) -> int:
+        """Khởi động TCP Listener nhận kết nối P2P truyền file trực tiếp từ các Peer."""
+        if self._p2p_running and self._p2p_server_sock is not None and self.p2p_port:
+            return self.p2p_port
 
-                resp = {
-                    "file_id": file_id,
-                    "sender": sender,
-                    "recipient": self.username or self.client_name,
-                    "status": "ACCEPTED",
-                }
-                self.send_packet(MessageType.FILE_OFFER_RESP, resp)
-                logger.info("✅ Đã đồng ý nhận file '%s'.", file_name)
-            else:
-                resp = {
-                    "file_id": file_id,
-                    "sender": sender,
-                    "recipient": self.username or self.client_name,
+        target_port = self._configured_p2p_port if port is None else int(port)
+        srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv_sock.bind((bind_host, target_port))
+            srv_sock.listen(16)
+            srv_sock.settimeout(0.5)
+        except OSError:
+            srv_sock.close()
+            raise
+
+        self._p2p_server_sock = srv_sock
+        self.p2p_port = int(srv_sock.getsockname()[1])
+        self._p2p_running = True
+        self._p2p_accept_thread = threading.Thread(
+            target=self._p2p_accept_loop,
+            name=f"P2PListener-{self.client_name}-{self.p2p_port}",
+            daemon=True,
+        )
+        self._p2p_accept_thread.start()
+        logger.info("📡 Đã mở cổng P2P TCP Listener tại %s:%d", bind_host, self.p2p_port)
+        return self.p2p_port
+
+    def stop_p2p_listener(self) -> None:
+        """Đóng P2P TCP Listener và thu dọn các luồng worker P2P đang chạy."""
+        self._p2p_running = False
+        srv_sock = self._p2p_server_sock
+        self._p2p_server_sock = None
+        if srv_sock:
+            try:
+                srv_sock.close()
+            except OSError:
+                pass
+
+        if self._p2p_accept_thread and threading.current_thread() != self._p2p_accept_thread:
+            self._p2p_accept_thread.join(timeout=1.0)
+        self._p2p_accept_thread = None
+
+        with self._p2p_workers_lock:
+            workers = list(self._p2p_worker_threads)
+            self._p2p_worker_threads.clear()
+        for worker in workers:
+            if threading.current_thread() != worker and worker.is_alive():
+                worker.join(timeout=1.0)
+
+        with self._incoming_files_lock:
+            self.incoming_files.clear()
+        self.p2p_port = None
+
+    def _p2p_accept_loop(self) -> None:
+        """Vòng lặp chấp nhận kết nối TCP trực tiếp từ các Peer gửi file."""
+        while self._p2p_running and self._p2p_server_sock:
+            try:
+                peer_sock, peer_addr = self._p2p_server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            worker = threading.Thread(
+                target=self._handle_p2p_connection,
+                args=(peer_sock, peer_addr),
+                name=f"P2PWorker-{peer_addr[0]}:{peer_addr[1]}",
+                daemon=True,
+            )
+            with self._p2p_workers_lock:
+                self._p2p_worker_threads = [t for t in self._p2p_worker_threads if t.is_alive()]
+                self._p2p_worker_threads.append(worker)
+            worker.start()
+
+    def _notify_file_error(self, sender: str, file_name: str, reason: str) -> None:
+        """Kích hoạt callback báo lỗi nhận/giải mã file một cách an toàn."""
+        if self.on_file_error:
+            try:
+                self.on_file_error(sender, file_name, reason)
+            except Exception:
+                pass
+
+    def _p2p_handshake_server(self, peer_sock: socket.socket) -> Optional[str]:
+        """Xác thực bước bắt tay ngắn PEER_HELLO / PEER_HELLO_ACK trên socket P2P."""
+        hello_pkt = recv_packet(peer_sock)
+        if hello_pkt.msg_type != MessageType.PEER_HELLO:
+            return None
+
+        hello_data = hello_pkt.to_json()
+        peer_sender = str(hello_data.get("sender") or "").strip()
+        peer_ver = hello_data.get("protocol_version")
+        if peer_ver != PROTOCOL_VERSION or not peer_sender:
+            reject_ack = create_packet(
+                MessageType.PEER_HELLO_ACK,
+                {
                     "status": "REJECTED",
-                    "reason": "Người nhận từ chối nhận file.",
-                }
-                self.send_packet(MessageType.FILE_OFFER_RESP, resp)
-        except Exception as e:
-            logger.error("Lỗi xử lý FILE_OFFER_REQ: %s", e)
+                    "protocol_version": PROTOCOL_VERSION,
+                    "reason": "Phiên bản giao thức hoặc danh tính P2P không hợp lệ.",
+                },
+            )
+            peer_sock.sendall(reject_ack)
+            return None
 
-    def _handle_file_offer_resp(self, packet: Packet) -> None:
-        """Xử lý phản hồi chấp nhận/từ chối từ người nhận (FILE_OFFER_RESP)."""
+        ok_ack = create_packet(
+            MessageType.PEER_HELLO_ACK,
+            {
+                "status": "OK",
+                "username": self.username or self.client_name,
+                "protocol_version": PROTOCOL_VERSION,
+            },
+        )
+        peer_sock.sendall(ok_ack)
+        return peer_sender
+
+    def _prepare_incoming_p2p_transfer(
+        self,
+        peer_sock: socket.socket,
+        offer: Dict[str, Any],
+        peer_sender: str,
+    ) -> Optional[Tuple[IncomingFileTransfer, bool]]:
+        """Kiểm tra FILE_OFFER_REQ, trả FILE_OFFER_RESP và tạo phiên nhận file."""
+        file_id = offer["file_id"]
+        sender = str(offer.get("sender") or peer_sender)
+        raw_name = offer["file_name"]
+        safe_file_name = os.path.basename(raw_name) or f"file_{file_id}"
+        file_size = int(offer["file_size"])
+        total_chunks = int(offer["total_chunks"])
+        expected_sha256 = offer["sha256"]
+        offer_encrypted = bool(offer.get("encrypted", False))
+        recipient_name = self.username or self.client_name
+
+        logger.info(
+            "📥 [P2P] Nhận đề xuất file '%s' (%s bytes, %d chunks, encrypted=%s) từ '%s'.",
+            safe_file_name,
+            file_size,
+            total_chunks,
+            offer_encrypted,
+            sender,
+        )
+
+        if not self.auto_accept_files:
+            reason = "Người nhận từ chối nhận file."
+            peer_sock.sendall(
+                create_packet(
+                    MessageType.FILE_OFFER_RESP,
+                    {"file_id": file_id, "sender": sender, "recipient": recipient_name, "status": "REJECTED", "reason": reason},
+                )
+            )
+            return None
+
+        if offer_encrypted and not self.crypto_key:
+            err_reason = "Tập tin được mã hóa AES nhưng bạn chưa nhập mật khẩu phòng."
+            self._notify_file_error(sender, safe_file_name, err_reason)
+            peer_sock.sendall(
+                create_packet(
+                    MessageType.FILE_OFFER_RESP,
+                    {"file_id": file_id, "sender": sender, "recipient": recipient_name, "status": "REJECTED", "reason": err_reason},
+                )
+            )
+            return None
+
+        os.makedirs(self.download_dir, exist_ok=True)
+        save_path = os.path.join(self.download_dir, safe_file_name)
+        transfer = IncomingFileTransfer(
+            file_id=file_id,
+            sender=sender,
+            file_name=safe_file_name,
+            file_size=file_size,
+            total_chunks=total_chunks,
+            expected_sha256=expected_sha256,
+            save_path=save_path,
+        )
+        with self._incoming_files_lock:
+            self.incoming_files[file_id] = transfer
+
+        peer_sock.sendall(
+            create_packet(
+                MessageType.FILE_OFFER_RESP,
+                {"file_id": file_id, "sender": sender, "recipient": recipient_name, "status": "ACCEPTED"},
+            )
+        )
+        logger.info("✅ [P2P] Đã đồng ý nhận file '%s' trực tiếp từ '%s'.", safe_file_name, sender)
+        return transfer, offer_encrypted
+
+    def _decode_p2p_chunk(self, chunk_pkt: Packet, offer_encrypted: bool) -> Tuple[Dict[str, Any], bytes]:
+        """Giải mã (nếu có FLAG_ENCRYPTED) và tách metadata + chunk bytes từ FILE_CHUNK."""
+        if chunk_pkt.is_encrypted:
+            if not self.crypto_key:
+                raise ValueError("Tập tin được mã hóa AES nhưng bạn chưa nhập mật khẩu phòng.")
+            try:
+                chunk_pkt = chunk_pkt.get_decrypted_packet(self.crypto_key)
+            except InvalidToken as exc:
+                raise ValueError("Mật khẩu giải mã AES không khớp giữa người gửi và bạn.") from exc
+        elif offer_encrypted:
+            raise ValueError("Chunk P2P không mang cờ mã hóa như FILE_OFFER_REQ đã thỏa thuận.")
+
+        return unpack_chunk_payload(chunk_pkt.payload)
+
+    def _finalize_p2p_transfer(self, peer_sock: socket.socket, transfer: IncomingFileTransfer) -> None:
+        """Lắp ráp file hoàn chỉnh, kiểm tra SHA-256 và gửi FILE_ACK trực tiếp qua socket P2P."""
+        with self._incoming_files_lock:
+            self.incoming_files.pop(transfer.file_id, None)
+
+        ok, reason = transfer.assemble_and_verify()
+        if ok and self.on_file_received:
+            try:
+                self.on_file_received(transfer.sender, transfer.file_name, transfer.save_path)
+            except Exception as exc:
+                logger.error("Lỗi callback on_file_received: %s", exc)
+        elif not ok:
+            self._notify_file_error(transfer.sender, transfer.file_name, reason)
+
+        ack_payload = {
+            "file_id": transfer.file_id,
+            "sender": transfer.sender,
+            "recipient": self.username or self.client_name,
+            "status": "SUCCESS" if ok else "FAILED",
+            "reason": reason,
+            "file_name": transfer.file_name,
+            "save_path": transfer.save_path,
+        }
+        peer_sock.sendall(create_packet(MessageType.FILE_ACK, ack_payload))
+
+    def _send_p2p_failure_ack(self, peer_sock: socket.socket, transfer: IncomingFileTransfer, reason: str) -> None:
+        """Gửi FILE_ACK trạng thái FAILED về peer gửi trước khi đóng kênh P2P."""
+        ack_payload = {
+            "file_id": transfer.file_id,
+            "sender": transfer.sender,
+            "recipient": self.username or self.client_name,
+            "status": "FAILED",
+            "reason": reason,
+            "file_name": transfer.file_name,
+        }
         try:
-            resp = packet.to_json()
-            file_id = resp.get("file_id")
-            if file_id and file_id in self._file_events:
-                self._file_results[file_id] = resp
-                self._file_events[file_id].set()
-        except Exception as e:
-            logger.error("Lỗi xử lý FILE_OFFER_RESP: %s", e)
+            peer_sock.sendall(create_packet(MessageType.FILE_ACK, ack_payload))
+            peer_sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
-    def _handle_file_chunk(self, packet: Packet) -> None:
-        """Xử lý khi nhận được một chunk dữ liệu nhị phân của file (FILE_CHUNK)."""
+    def _handle_p2p_connection(self, peer_sock: socket.socket, peer_addr: Tuple[str, int]) -> None:
+        """Xử lý trọn vẹn một phiên nhận file trực tiếp qua kết nối TCP P2P."""
+        transfer: Optional[IncomingFileTransfer] = None
         try:
-            meta, chunk_data = unpack_chunk_payload(packet.payload)
-            file_id = meta["file_id"]
-            chunk_index = meta["chunk_index"]
-
-            transfer = self.incoming_files.get(file_id)
-            if not transfer:
-                logger.warning("Nhận chunk cho file_id không tồn tại: %s", file_id)
+            peer_sock.settimeout(30.0)
+            peer_sender = self._p2p_handshake_server(peer_sock)
+            if not peer_sender:
                 return
 
-            # Nếu chunk được mã hóa E2EE trực tiếp bởi người gửi, giải mã trước khi lưu
-            if meta.get("encrypted"):
-                err_reason: Optional[str] = None
-                if not self.crypto_key:
-                    err_reason = "Tập tin được mã hóa AES nhưng bạn chưa nhập mật khẩu phòng."
-                else:
+            offer_pkt = recv_packet(peer_sock)
+            if offer_pkt.msg_type != MessageType.FILE_OFFER_REQ:
+                logger.warning("⚠️ [P2P] Nhận gói tin không hợp lệ %s từ %s", offer_pkt.msg_type, peer_addr)
+                return
+
+            prepared = self._prepare_incoming_p2p_transfer(peer_sock, offer_pkt.to_json(), peer_sender)
+            if prepared is None:
+                return
+            transfer, offer_encrypted = prepared
+
+            while True:
+                chunk_pkt = recv_packet(peer_sock)
+                if chunk_pkt.msg_type != MessageType.FILE_CHUNK:
+                    raise ProtocolError(f"Gói tin không mong đợi trên luồng FILE_CHUNK: {chunk_pkt.msg_type}")
+
+                meta, chunk_data = self._decode_p2p_chunk(chunk_pkt, offer_encrypted)
+                if meta.get("file_id") != transfer.file_id:
+                    raise ProtocolError("Gói FILE_CHUNK sai file_id trên kết nối P2P.")
+
+                is_finished = transfer.add_chunk(int(meta["chunk_index"]), chunk_data)
+                if self.on_file_progress:
                     try:
-                        chunk_data = decrypt_payload(chunk_data, self.crypto_key)
-                    except InvalidToken:
-                        err_reason = "Mật khẩu giải mã AES không khớp giữa người gửi và bạn."
-
-                if err_reason:
-                    self.incoming_files.pop(file_id, None)
-                    logger.warning("🔒 Giải mã FILE_CHUNK '%s' thất bại: %s", transfer.file_name, err_reason)
-                    ack_payload = {
-                        "file_id": file_id,
-                        "sender": transfer.sender,
-                        "recipient": self.username or self.client_name,
-                        "status": "FAILED",
-                        "reason": err_reason,
-                        "file_name": transfer.file_name,
-                    }
-                    self.send_packet(MessageType.FILE_ACK, ack_payload)
-                    if self.on_file_error:
-                        try:
-                            self.on_file_error(transfer.sender, transfer.file_name, err_reason)
-                        except Exception:
-                            pass
-                    return
-
-            is_finished = transfer.add_chunk(chunk_index, chunk_data)
-
-            if self.on_file_progress:
-                try:
-                    self.on_file_progress(
-                        file_id,
-                        len(transfer.received_chunks),
-                        transfer.total_chunks,
-                        transfer.progress_percentage,
-                    )
-                except Exception:
-                    pass
-
-            if is_finished:
-                self.incoming_files.pop(file_id, None)
-                ok, reason = transfer.assemble_and_verify()
-                ack_payload = {
-                    "file_id": file_id,
-                    "sender": transfer.sender,
-                    "recipient": self.username or self.client_name,
-                    "status": "SUCCESS" if ok else "FAILED",
-                    "reason": reason,
-                    "file_name": transfer.file_name,
-                    "save_path": transfer.save_path,
-                }
-                self.send_packet(MessageType.FILE_ACK, ack_payload)
-
-                if ok and self.on_file_received:
-                    try:
-                        self.on_file_received(transfer.sender, transfer.file_name, transfer.save_path)
-                    except Exception as e:
-                        logger.error("Lỗi callback on_file_received: %s", e)
-                elif not ok and self.on_file_error:
-                    try:
-                        self.on_file_error(transfer.sender, transfer.file_name, reason)
+                        self.on_file_progress(
+                            transfer.file_id,
+                            len(transfer.received_chunks),
+                            transfer.total_chunks,
+                            transfer.progress_percentage,
+                        )
                     except Exception:
                         pass
-        except Exception as e:
-            logger.error("Lỗi xử lý FILE_CHUNK: %s", e)
 
-    def _handle_file_ack(self, packet: Packet) -> None:
-        """Xử lý khi nhận được xác nhận nhận file (FILE_ACK)."""
-        try:
-            ack = packet.to_json()
-            file_id = ack.get("file_id")
-            if file_id and file_id in self._file_events:
-                self._file_results[file_id] = ack
-                self._file_events[file_id].set()
-        except Exception as e:
-            logger.error("Lỗi xử lý FILE_ACK: %s", e)
+                if is_finished:
+                    self._finalize_p2p_transfer(peer_sock, transfer)
+                    break
+
+        except ValueError as err:
+            err_reason = str(err)
+            if transfer:
+                with self._incoming_files_lock:
+                    self.incoming_files.pop(transfer.file_id, None)
+                logger.warning("🔒 [P2P] Lỗi giải mã/dữ liệu file '%s': %s", transfer.file_name, err_reason)
+                self._notify_file_error(transfer.sender, transfer.file_name, err_reason)
+                self._send_p2p_failure_ack(peer_sock, transfer, err_reason)
+        except (ConnectionClosedError, ProtocolError, OSError) as exc:
+            if transfer:
+                with self._incoming_files_lock:
+                    self.incoming_files.pop(transfer.file_id, None)
+                err_reason = f"Kết nối P2P bị gián đoạn khi nhận file '{transfer.file_name}': {exc}"
+                logger.warning("⚠️ [P2P] %s", err_reason)
+                self._notify_file_error(transfer.sender, transfer.file_name, err_reason)
+                self._send_p2p_failure_ack(peer_sock, transfer, err_reason)
+        except Exception as exc:
+            logger.error("❌ [P2P] Lỗi xử lý kết nối từ %s: %s", peer_addr, exc)
+            if transfer:
+                with self._incoming_files_lock:
+                    self.incoming_files.pop(transfer.file_id, None)
+        finally:
+            try:
+                peer_sock.close()
+            except OSError:
+                pass
 
     # ==========================================================================
     # CÁC TIỆN ÍCH NGHIỆP VỤ (PUBLIC API)
@@ -679,7 +915,13 @@ class ClientCore:
         self._auth_event.clear()
         self._auth_result = (False, "Timeout")
 
-        success = self.send_packet(MessageType.AUTH_REQ, {"username": username})
+        auth_payload: Dict[str, Any] = {"username": username}
+        if self.p2p_port is not None:
+            auth_payload["p2p_port"] = self.p2p_port
+        if self.p2p_host:
+            auth_payload["p2p_host"] = self.p2p_host
+
+        success = self.send_packet(MessageType.AUTH_REQ, auth_payload)
         if not success:
             return False, "Không thể gửi gói tin AUTH_REQ."
 
@@ -780,6 +1022,108 @@ class ClientCore:
             },
         )
 
+    def lookup_peer(
+        self, target_username: str, timeout: float = 5.0
+    ) -> Tuple[bool, Optional[Tuple[str, int]], str]:
+        """
+        Truy vấn Tracker Server (PEER_LOOKUP_REQ -> PEER_LOOKUP_RESP) để lấy (IP, P2P_Port) của peer.
+
+        Returns:
+            Tuple[bool, Optional[Tuple[str, int]], str]: (found, (ip, p2p_port) | None, message/reason).
+        """
+        if not self.is_connected:
+            return False, None, "Chưa kết nối tới Server."
+
+        target = str(target_username).strip()
+        if not target:
+            return False, None, "Tên người nhận không hợp lệ."
+
+        key = target.lower()
+        event = threading.Event()
+        with self._lookup_lock:
+            self._lookup_events[key] = event
+            self._lookup_results.pop(key, None)
+
+        if not self.send_packet(MessageType.PEER_LOOKUP_REQ, {"username": target}):
+            with self._lookup_lock:
+                self._lookup_events.pop(key, None)
+            return False, None, "Không thể gửi yêu cầu tra cứu Peer lên Tracker Server."
+
+        if not event.wait(timeout=timeout):
+            with self._lookup_lock:
+                self._lookup_events.pop(key, None)
+                self._lookup_results.pop(key, None)
+            return False, None, f"Quá thời gian tra cứu địa chỉ P2P cho '{target}' từ Tracker Server."
+
+        with self._lookup_lock:
+            self._lookup_events.pop(key, None)
+            result = self._lookup_results.pop(key, {})
+
+        if result.get("found") and result.get("ip") and result.get("p2p_port"):
+            return True, (str(result["ip"]), int(result["p2p_port"])), "OK"
+
+        reason = result.get("reason") or f"Không tìm thấy thông tin kết nối P2P cho '{target}'."
+        return False, None, reason
+
+    def _connect_p2p_peer(
+        self,
+        recipient: str,
+        peer_ip: str,
+        peer_port: int,
+        timeout: float,
+    ) -> Tuple[Optional[socket.socket], Optional[str]]:
+        """Thiết lập kết nối TCP P2P trực tiếp tới peer và bắt tay PEER_HELLO / PEER_HELLO_ACK."""
+        p2p_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connect_timeout = min(timeout, 5.0)
+        p2p_sock.settimeout(connect_timeout)
+        try:
+            p2p_sock.connect((peer_ip, peer_port))
+            p2p_sock.settimeout(timeout)
+
+            hello = create_packet(
+                MessageType.PEER_HELLO,
+                {
+                    "sender": self.username or self.client_name,
+                    "protocol_version": PROTOCOL_VERSION,
+                },
+            )
+            p2p_sock.sendall(hello)
+
+            ack_pkt = recv_packet(p2p_sock)
+            if ack_pkt.msg_type != MessageType.PEER_HELLO_ACK:
+                raise ProtocolError(f"Gói phản hồi handshake P2P không hợp lệ: {ack_pkt.msg_type}")
+
+            ack_data = ack_pkt.to_json()
+            if ack_data.get("status") != "OK":
+                reason = ack_data.get("reason", "Peer từ chối kết nối P2P.")
+                p2p_sock.close()
+                return None, f"Kết nối P2P tới '{recipient}' bị từ chối: {reason}"
+
+            return p2p_sock, None
+        except (ConnectionRefusedError, socket.timeout, TimeoutError, OSError, ConnectionClosedError, ProtocolError) as exc:
+            try:
+                p2p_sock.close()
+            except OSError:
+                pass
+            return (
+                None,
+                f"Không thể kết nối P2P trực tiếp tới '{recipient}' tại {peer_ip}:{peer_port} ({exc}). "
+                "Hệ thống không chuyển tiếp file qua Server.",
+            )
+
+    @staticmethod
+    def _try_read_p2p_failure_ack(p2p_sock: socket.socket) -> Optional[str]:
+        """Thử đọc gói FILE_ACK báo lỗi từ peer nhận khi luồng ghi bị ngắt sớm."""
+        try:
+            p2p_sock.settimeout(0.5)
+            ack_pkt = recv_packet(p2p_sock)
+            if ack_pkt.msg_type == MessageType.FILE_ACK:
+                ack_data = ack_pkt.to_json()
+                return ack_data.get("reason")
+        except (ConnectionClosedError, ProtocolError, socket.timeout, TimeoutError, OSError):
+            return None
+        return None
+
     def send_file(
         self,
         recipient: str,
@@ -788,107 +1132,127 @@ class ClientCore:
         timeout: float = 30.0,
     ) -> Tuple[bool, str]:
         """
-        Gửi một file cho người dùng khác qua cơ chế cắt nhỏ (Chunking) và kiểm tra SHA-256.
-
-        Args:
-            recipient: Tên người nhận.
-            file_path: Đường dẫn tới file cần gửi.
-            progress_callback: Hàm callback nhận (chunks_sent, total_chunks, percent).
-            timeout: Thời gian tối đa chờ phản hồi.
+        Gửi một file trực tiếp P2P cho người dùng khác (không qua Server relay):
+          1. Tra cứu IP:P2P_Port từ Tracker Server (PEER_LOOKUP_REQ -> PEER_LOOKUP_RESP).
+          2. Mở kết nối TCP trực tiếp tới Peer nhận và bắt tay PEER_HELLO / PEER_HELLO_ACK.
+          3. Gửi FILE_OFFER_REQ -> nhận FILE_OFFER_RESP -> stream FILE_CHUNK -> nhận FILE_ACK.
 
         Returns:
-            Tuple[bool, str]: (Thành công hay không, Thông báo kết quả).
+            Tuple[bool, str]: (Thành công hay không, Thông báo kết quả / lỗi).
         """
         if not self.is_connected:
             return False, "Chưa kết nối tới Server."
 
         from pathlib import Path
+
         path = Path(file_path)
         if not path.is_file():
             return False, f"File không tồn tại: {file_path}"
 
         file_size = path.stat().st_size
-        total_chunks = (file_size + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE
-        if total_chunks == 0:
-            total_chunks = 1
-
+        total_chunks = max(1, (file_size + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE)
         sha256 = calculate_file_hash(path)
         file_id = str(uuid.uuid4())[:8]
 
-        # 1. Gửi FILE_OFFER_REQ
-        offer_event = threading.Event()
-        self._file_events[file_id] = offer_event
+        # 1. Tra cứu địa chỉ P2P (IP:P2P_Port) từ Tracker Server
+        found, endpoint, lookup_reason = self.lookup_peer(recipient, timeout=min(timeout, 5.0))
+        if not found or not endpoint:
+            return False, lookup_reason
 
-        offer_payload = {
-            "file_id": file_id,
-            "sender": self.username or self.client_name,
-            "recipient": recipient,
-            "file_name": path.name,
-            "file_size": file_size,
-            "total_chunks": total_chunks,
-            "sha256": sha256,
-        }
-        logger.info(
-            "Đang đề xuất gửi file '%s' (%s bytes, %d chunks) cho '%s'...",
-            path.name,
-            file_size,
-            total_chunks,
-            recipient,
-        )
-        self.send_packet(MessageType.FILE_OFFER_REQ, offer_payload)
+        peer_ip, peer_port = endpoint
+        logger.info("📡 [P2P] Đã tra cứu '%s' tại %s:%d. Đang mở kết nối trực tiếp...", recipient, peer_ip, peer_port)
 
-        # Chờ người nhận phản hồi
-        if not offer_event.wait(timeout=timeout):
-            self._file_events.pop(file_id, None)
-            return False, "Quá thời gian chờ người nhận phản hồi đề nghị gửi file."
+        # 2. Mở kết nối TCP trực tiếp tới Peer nhận (không fallback qua Server)
+        p2p_sock, conn_err = self._connect_p2p_peer(recipient, peer_ip, peer_port, timeout=timeout)
+        if not p2p_sock:
+            return False, conn_err or "Không thể thiết lập kết nối P2P."
 
-        offer_resp = self._file_results.pop(file_id, {})
-        if offer_resp.get("status") != "ACCEPTED":
-            self._file_events.pop(file_id, None)
-            reason = offer_resp.get("reason", "Người nhận từ chối nhận file.")
-            return False, reason
-
-        logger.info("Người nhận '%s' đã đồng ý! Bắt đầu truyền %d chunks...", recipient, total_chunks)
-
-        # 2. Truyền từng chunk
-        ack_event = threading.Event()
-        self._file_events[file_id] = ack_event
-
-        sent_chunks = 0
-        use_e2ee_chunks = self.crypto_key is not None and not self.server_encryption_enabled
-        chunk_iter = read_file_chunks(path, chunk_size=DEFAULT_CHUNK_SIZE) if file_size > 0 else [(0, b"")]
-        for chunk_index, chunk_data in chunk_iter:
-            wire_data = encrypt_payload(chunk_data, self.crypto_key) if use_e2ee_chunks else chunk_data
-            chunk_payload = pack_chunk_payload(
-                file_id=file_id,
-                chunk_index=chunk_index,
-                total_chunks=total_chunks,
-                chunk_data=wire_data,
-                encrypted=use_e2ee_chunks,
+        use_encryption = self.crypto_key is not None
+        try:
+            # 3. Gửi FILE_OFFER_REQ trực tiếp tới Peer nhận
+            offer_payload = {
+                "file_id": file_id,
+                "sender": self.username or self.client_name,
+                "recipient": recipient,
+                "file_name": path.name,
+                "file_size": file_size,
+                "total_chunks": total_chunks,
+                "sha256": sha256,
+                "encrypted": use_encryption,
+            }
+            logger.info(
+                "📤 [P2P] Đề xuất gửi file '%s' (%s bytes, %d chunks, encrypted=%s) tới '%s'...",
+                path.name,
+                file_size,
+                total_chunks,
+                use_encryption,
+                recipient,
             )
-            self.send_packet(MessageType.FILE_CHUNK, chunk_payload)
-            sent_chunks += 1
+            p2p_sock.sendall(create_packet(MessageType.FILE_OFFER_REQ, offer_payload))
 
-            percent = (sent_chunks / total_chunks) * 100.0
-            if progress_callback:
+            offer_resp_pkt = recv_packet(p2p_sock)
+            if offer_resp_pkt.msg_type != MessageType.FILE_OFFER_RESP:
+                return False, f"Phản hồi P2P không mong đợi khi đề nghị gửi file: {offer_resp_pkt.msg_type}"
+
+            offer_resp = offer_resp_pkt.to_json()
+            if offer_resp.get("status") != "ACCEPTED":
+                return False, offer_resp.get("reason", "Người nhận từ chối nhận file.")
+
+            logger.info("✅ [P2P] '%s' đã đồng ý! Bắt đầu truyền %d chunks trực tiếp...", recipient, total_chunks)
+
+            # 4. Truyền từng chunk trực tiếp qua kênh TCP P2P (mã hóa toàn packet nếu bật AES)
+            sent_chunks = 0
+            chunk_iter = read_file_chunks(path, chunk_size=DEFAULT_CHUNK_SIZE) if file_size > 0 else [(0, b"")]
+            for chunk_index, chunk_data in chunk_iter:
+                chunk_payload = pack_chunk_payload(
+                    file_id=file_id,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks,
+                    chunk_data=chunk_data,
+                    encrypted=use_encryption,
+                )
+                pkt_bytes = create_packet(
+                    MessageType.FILE_CHUNK,
+                    chunk_payload,
+                    encrypt_key=self.crypto_key if use_encryption else None,
+                )
                 try:
-                    progress_callback(sent_chunks, total_chunks, percent)
-                except Exception:
-                    pass
+                    p2p_sock.sendall(pkt_bytes)
+                except OSError as send_exc:
+                    ack_reason = self._try_read_p2p_failure_ack(p2p_sock)
+                    if ack_reason:
+                        return False, f"Xác thực/giải mã file thất bại tại người nhận: {ack_reason}"
+                    return False, f"Kết nối P2P bị gián đoạn khi đang truyền file tới '{recipient}': {send_exc}"
 
-        logger.info("Đã gửi xong %d/%d chunks. Đang chờ xác nhận SHA-256 từ người nhận...", sent_chunks, total_chunks)
+                sent_chunks += 1
+                percent = (sent_chunks / total_chunks) * 100.0
+                if progress_callback:
+                    try:
+                        progress_callback(sent_chunks, total_chunks, percent)
+                    except Exception:
+                        pass
 
-        # 3. Chờ FILE_ACK
-        if not ack_event.wait(timeout=timeout):
-            self._file_events.pop(file_id, None)
-            return False, "Quá thời gian chờ xác nhận FILE_ACK từ người nhận."
+            logger.info("⏳ [P2P] Đã truyền xong %d/%d chunks. Đang chờ FILE_ACK...", sent_chunks, total_chunks)
 
-        self._file_events.pop(file_id, None)
-        ack_resp = self._file_results.pop(file_id, {})
-        if ack_resp.get("status") == "SUCCESS":
-            return True, f"File '{path.name}' đã gửi thành công và xác thực toàn vẹn 100% (SHA-256 khớp)."
-        else:
+            # 5. Chờ FILE_ACK trực tiếp từ Peer nhận
+            ack_pkt = recv_packet(p2p_sock)
+            if ack_pkt.msg_type != MessageType.FILE_ACK:
+                return False, f"Nhận gói tin không mong đợi thay cho FILE_ACK: {ack_pkt.msg_type}"
+
+            ack_resp = ack_pkt.to_json()
+            if ack_resp.get("status") == "SUCCESS":
+                return True, f"File '{path.name}' đã gửi P2P thành công và xác thực toàn vẹn 100% (SHA-256 khớp)."
             return False, f"Xác thực file thất bại tại người nhận: {ack_resp.get('reason')}"
+
+        except (socket.timeout, TimeoutError):
+            return False, f"Quá thời gian chờ phản hồi P2P khi truyền file cho '{recipient}'."
+        except (ConnectionClosedError, ProtocolError, OSError) as exc:
+            return False, f"Lỗi truyền file P2P tới '{recipient}': {exc}"
+        finally:
+            try:
+                p2p_sock.close()
+            except OSError:
+                pass
 
     def send_heartbeat(self) -> bool:
         """Tiện ích gửi gói tin kiểm tra nhịp tim (PING) lên Server."""
@@ -901,7 +1265,7 @@ class ClientCore:
         """
         Chủ động ngắt kết nối với Server (Graceful Disconnect).
         """
-        if not self.is_connected and not self.sock:
+        if not self.is_connected and not self.sock and not self._p2p_server_sock:
             return
 
         logger.info("Đang ngắt kết nối tới Server...")
@@ -926,10 +1290,21 @@ class ClientCore:
         self.username = None
         self.online_users = []
 
+        with self._peer_dir_lock:
+            self.peer_directory.clear()
+        with self._lookup_lock:
+            for ev in self._lookup_events.values():
+                ev.set()
+            self._lookup_events.clear()
+            self._lookup_results.clear()
+
         # Dừng luồng Heartbeat nếu đang chạy
         if self.heartbeat_sender:
             self.heartbeat_sender.stop()
             self.heartbeat_sender = None
+
+        # Đóng P2P TCP Listener trước/song song với dọn socket Server
+        self.stop_p2p_listener()
 
         self._cleanup_socket()
 

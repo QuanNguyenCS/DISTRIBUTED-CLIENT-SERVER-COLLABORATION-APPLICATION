@@ -126,6 +126,12 @@ def main() -> None:
         default=None,
         help="Mật khẩu mã hóa AES phòng chat (nếu có)",
     )
+    parser.add_argument(
+        "--p2p-port",
+        type=int,
+        default=0,
+        help="Cổng TCP lắng nghe kết nối nhận file P2P trực tiếp (mặc định 0 để OS tự cấp)",
+    )
 
     args = parser.parse_args()
 
@@ -137,6 +143,7 @@ def main() -> None:
         server_host=args.host,
         server_port=args.port,
         client_name=args.username or "Guest-Client",
+        p2p_port=args.p2p_port,
     )
     if args.passphrase:
         client.enable_encryption(args.passphrase)
@@ -188,7 +195,8 @@ def main() -> None:
 
             ok, msg = client.authenticate(chosen_user)
             if ok:
-                print(f"✅ {msg} Chào mừng '{client.username}' tham gia phòng hợp tác!")
+                p2p_info = f" | Cổng P2P nhận file: {client.p2p_port}" if client.p2p_port else ""
+                print(f"✅ {msg} Chào mừng '{client.username}' tham gia phòng hợp tác!{p2p_info}")
                 users = client.online_users or [client.username]
                 print(f"👥 Danh sách đang online ({len(users)}): {', '.join(users)}")
             else:

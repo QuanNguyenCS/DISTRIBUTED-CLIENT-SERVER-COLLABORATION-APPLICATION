@@ -4,9 +4,13 @@ Mô tả: Unit tests kiểm tra việc khởi tạo các thành phần giao di�
 LoginView, ChatView, FileProgressDialog và CollabChatApp.
 """
 
-import tkinter as tk
+import gc
 import unittest
 from unittest.mock import MagicMock
+
+import pytest
+
+tk = pytest.importorskip("tkinter", reason="Tkinter chưa được cài đặt trong môi trường Python này")
 
 from client.gui.chat_view import ChatView
 from client.gui.file_progress import FileProgressDialog, format_bytes
@@ -30,6 +34,8 @@ class TestGuiComponents(unittest.TestCase):
     def tearDownClass(cls):
         if cls.root:
             cls.root.destroy()
+            cls.root = None
+        gc.collect()
 
     def setUp(self):
         if not self.root:
@@ -161,3 +167,5 @@ class TestGuiComponents(unittest.TestCase):
         app.update_idletasks()
         self.assertIsNotNone(app.login_view)
         app.destroy()
+        del app
+        gc.collect()

@@ -170,3 +170,113 @@ class TestFileTransferIntegration:
         sthread.join(timeout=2.0)
         if os.path.exists(test_file):
             os.remove(test_file)
+
+    def test_tracker_lookup_and_server_rejects_file_relay(self, tmp_path):
+        """Server Tracker cung cấp IP:P2P_Port và từ chối mọi gói FILE_* đi qua Server relay."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        assert not hasattr(server.router, "route_file_offer")
+        assert not hasattr(server.router, "route_file_chunk")
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceLookup")[0]
+            assert bob.connect() and bob.authenticate("BobLookup")[0]
+            assert bob.p2p_port is not None and bob.p2p_port > 0
+
+            # Lookup qua Tracker trả về đúng địa chỉ (ip, p2p_port) của Bob
+            found, endpoint, msg = alice.lookup_peer("BobLookup")
+            assert found is True, msg
+            assert endpoint == ("127.0.0.1", bob.p2p_port)
+
+            # Lookup người dùng không online trả found=False
+            found_ghost, ep_ghost, reason_ghost = alice.lookup_peer("OfflineUser")
+            assert found_ghost is False
+            assert ep_ghost is None
+            assert "không online" in reason_ghost
+
+            # Gửi thẳng FILE_OFFER_REQ / FILE_CHUNK lên Server phải bị từ chối bằng FILE_P2P_ONLY
+            err_notices = []
+            err_event = threading.Event()
+            alice.register_callback(
+                MessageType.ERROR_NOTICE,
+                lambda pkt: (err_notices.append(pkt.to_json()), err_event.set()),
+            )
+            assert alice.send_packet(
+                MessageType.FILE_OFFER_REQ,
+                {"file_id": "bad1", "sender": "AliceLookup", "recipient": "BobLookup"},
+            )
+            assert err_event.wait(timeout=2.0)
+            assert err_notices[-1]["code"] == "FILE_P2P_ONLY"
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_p2p_unreachable_port_fails_without_server_fallback(self, tmp_path):
+        """Khi cổng P2P bị chặn/không thể kết nối, send_file báo lỗi P2P ngay lập tức, không fallback Server."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceBlocked")[0]
+            assert bob.connect() and bob.authenticate("BobBlocked")[0]
+
+            # Giả lập tường lửa chặn cổng P2P bằng cách đóng Listener P2P của Bob
+            bob.stop_p2p_listener()
+
+            src_file = tmp_path / "blocked.bin"
+            src_file.write_bytes(b"CannotRelayThroughServer" * 10)
+
+            ok, reason = alice.send_file("BobBlocked", str(src_file), timeout=3.0)
+            assert ok is False
+            assert "Không thể kết nối P2P" in reason
+            assert not (tmp_path / "downloads" / "blocked.bin").exists()
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_p2p_lookup_fails_when_peer_has_no_p2p_port(self, tmp_path):
+        """Peer kết nối nhưng không công bố cổng P2P (start_p2p=False): Tracker báo lỗi rõ ràng."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        no_p2p = ClientCore(server_host="127.0.0.1", server_port=port)
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceP2P")[0]
+            assert no_p2p.connect(start_p2p=False) and no_p2p.authenticate("NoP2P")[0]
+            assert no_p2p.p2p_port is None
+
+            src_file = tmp_path / "nop2p.txt"
+            src_file.write_text("hello", encoding="utf-8")
+
+            ok, reason = alice.send_file("NoP2P", str(src_file), timeout=3.0)
+            assert ok is False
+            assert "cổng nhận file P2P" in reason
+        finally:
+            alice.disconnect()
+            no_p2p.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)

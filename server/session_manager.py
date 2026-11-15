@@ -27,14 +27,32 @@ class UserSession:
     username: str
     handler: Any  # ClientHandler
     address: Tuple[str, int]
+    p2p_port: Optional[int] = None
+    p2p_host: Optional[str] = None
     login_time: float = field(default_factory=time.time)
+
+    @property
+    def effective_ip(self) -> str:
+        """Địa chỉ IP có thể kết nối P2P (mặc định dùng IP thực tế Tracker nhìn thấy)."""
+        if self.p2p_host and self.p2p_host not in ("0.0.0.0", ""):
+            return self.p2p_host
+        return self.address[0]
+
+    def to_peer_dict(self) -> Dict[str, Any]:
+        """Thông tin điểm cuối P2P phục vụ Tracker Lookup."""
+        return {
+            "username": self.username,
+            "ip": self.effective_ip,
+            "p2p_port": self.p2p_port,
+        }
 
     def to_dict(self) -> Dict[str, Any]:
         """Chuyển đổi thông tin session thành dict để serialize JSON."""
         return {
             "username": self.username,
-            "ip": self.address[0],
+            "ip": self.effective_ip,
             "port": self.address[1],
+            "p2p_port": self.p2p_port,
             "login_time": self.login_time,
         }
 
@@ -87,6 +105,8 @@ class SessionManager:
         username: str,
         handler: Any,
         address: Tuple[str, int],
+        p2p_port: Optional[int] = None,
+        p2p_host: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[UserSession]]:
         """
         Đăng ký một người dùng mới vào danh bạ trực tuyến (Thread-Safe).
@@ -94,7 +114,9 @@ class SessionManager:
         Args:
             username: Tên người dùng muốn đăng ký.
             handler: Đối tượng ClientHandler đang xử lý kết nối này.
-            address: Bộ (IP, Port) của client.
+            address: Bộ (IP, Port) kết nối tới Server.
+            p2p_port: Cổng TCP P2P Client đang lắng nghe để nhận file (nếu có).
+            p2p_host: Địa chỉ IP P2P khai báo (nếu không truyền sẽ lấy IP thực tế từ address).
 
         Returns:
             Tuple[bool, str, Optional[UserSession]]:
@@ -108,6 +130,16 @@ class SessionManager:
         clean_username = username.strip()
         key = clean_username.lower()
 
+        valid_p2p_port: Optional[int] = None
+        if isinstance(p2p_port, int) and not isinstance(p2p_port, bool) and 1 <= p2p_port <= 65535:
+            valid_p2p_port = p2p_port
+
+        clean_p2p_host: Optional[str] = None
+        if isinstance(p2p_host, str):
+            candidate = p2p_host.strip()
+            if candidate and candidate != "0.0.0.0":
+                clean_p2p_host = candidate
+
         # 2. Kiểm tra trùng lặp và đăng ký trong khối khóa an toàn
         with self._lock:
             if key in self._sessions:
@@ -120,15 +152,18 @@ class SessionManager:
                 username=clean_username,
                 handler=handler,
                 address=address,
+                p2p_port=valid_p2p_port,
+                p2p_host=clean_p2p_host,
             )
             self._sessions[key] = session
             online_count = len(self._sessions)
 
         logger.info(
-            "✅ [SessionManager] Đăng ký thành công User '%s' (%s:%d). Tổng online: %d",
+            "✅ [SessionManager] Đăng ký thành công User '%s' (%s:%d | P2P port: %s). Tổng online: %d",
             clean_username,
             address[0],
             address[1],
+            valid_p2p_port or "N/A",
             online_count,
         )
         return True, "Đăng nhập thành công.", session
@@ -200,6 +235,17 @@ class SessionManager:
         """
         with self._lock:
             return [session.username for session in self._sessions.values()]
+
+    def get_all_peer_endpoints(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Lấy danh bạ IP:P2P_Port của các người dùng đang mở cổng P2P (Thread-Safe).
+        """
+        with self._lock:
+            return {
+                session.username: session.to_peer_dict()
+                for session in self._sessions.values()
+                if session.p2p_port is not None
+            }
 
     def get_user_count(self) -> int:
         """Lấy tổng số lượng người dùng đang online."""

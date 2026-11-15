@@ -32,19 +32,23 @@ class MessageType(IntEnum):
 
     # --- 200-299: Quản lý người dùng & Trạng thái ---
     USER_LIST_REQ = 201         # Client yêu cầu lấy danh sách người dùng đang online
-    USER_LIST_RESP = 202        # Server trả về danh sách người dùng
+    USER_LIST_RESP = 202        # Server trả về danh sách người dùng (kèm danh bạ P2P)
     USER_STATUS_BROADCAST = 203 # Server thông báo có user vừa JOINED hoặc LEFT
+    PEER_LOOKUP_REQ = 204       # Client hỏi Tracker địa chỉ IP:P2P_Port của người nhận
+    PEER_LOOKUP_RESP = 205      # Tracker trả về IP:P2P_Port hoặc báo không tìm thấy
 
     # --- 300-399: Định tuyến tin nhắn trò chuyện ---
     CHAT_BROADCAST = 301        # Tin nhắn gửi đến toàn bộ phòng chat
     CHAT_DIRECT = 302           # Tin nhắn riêng tư 1-1 (Private Message)
     CHAT_ACK = 303              # Server hoặc bên nhận xác nhận đã nhận tin nhắn
 
-    # --- 400-499: Truyền tải file tin cậy ---
+    # --- 400-499: Truyền tải file tin cậy (P2P Direct) ---
     FILE_OFFER_REQ = 401        # Người gửi đề xuất gửi file (kèm tên file, dung lượng, sha256)
-    FILE_OFFER_RESP = 402       # Người nhận/Server đồng ý (ACCEPT) hoặc từ chối (REJECT) nhận file
-    FILE_CHUNK = 403            # Mảnh dữ liệu nhị phân của file (kèm chunk_id, offset, chunk_data)
-    FILE_ACK = 404              # Xác nhận đã nhận được mảnh file hoặc hoàn tất toàn bộ file
+    FILE_OFFER_RESP = 402       # Người nhận đồng ý (ACCEPTED) hoặc từ chối (REJECTED) nhận file
+    FILE_CHUNK = 403            # Mảnh dữ liệu nhị phân của file (kèm metadata JSON + chunk_data)
+    FILE_ACK = 404              # Xác nhận đã nhận hoàn tất & kiểm tra SHA-256 thành công/thất bại
+    PEER_HELLO = 405            # Bắt tay trực tiếp P2P giữa 2 Client (xác thực tên & phiên bản)
+    PEER_HELLO_ACK = 406        # Peer phản hồi đồng ý hoặc từ chối phiên kết nối P2P
 
     # --- 500-599: Giám sát kết nối & Nhịp tim ---
     HEARTBEAT_PING = 501        # Gói tin kiểm tra kết nối từ Client hoặc Server
