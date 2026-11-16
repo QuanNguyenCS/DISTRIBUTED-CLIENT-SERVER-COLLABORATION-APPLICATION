@@ -3,23 +3,6 @@ Module: common.protocol
 Mô tả: Định nghĩa cấu trúc khung gói tin (Packet Framing) và cơ chế đóng gói (pack) /
 giải gói (unpack) nhị phân theo giao thức tầng ứng dụng của ứng dụng phân tán.
 
-Cấu trúc Binary Header cố định 16 bytes:
-  0                   1                   2                   3
-  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |       Magic Bytes ("CA")      |    Version    |               |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+               +
- |         Message Type          |     Flags     |               |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |           Reserved            |                               |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
- |                                                               |
- +                     Payload Length (64-bit)                   +
- |                                                               |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
- |                        Payload Data...                        |
- |                                                               |
- +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 """
 
 from __future__ import annotations
@@ -28,7 +11,8 @@ import json
 import socket
 import struct
 from dataclasses import dataclass
-from typing import Any, Union
+import time
+from typing import Any, Optional, Union
 
 from common.message_types import MessageType
 from common.crypto_utils import decrypt_payload, encrypt_payload
@@ -198,7 +182,11 @@ def create_packet(
     return header_bytes + payload_bytes
 
 
-def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
+def recv_exact(
+    sock: socket.socket,
+    num_bytes: int,
+    deadline: Optional[float] = None,
+) -> bytes:
     """
     Đọc chính xác và đủ num_bytes từ TCP socket.
     
@@ -209,6 +197,7 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
     Args:
         sock: Socket TCP đang kết nối.
         num_bytes: Số lượng byte chính xác cần đọc.
+        deadline: Mốc time.monotonic() tối đa cho toàn bộ lần đọc (chống slowloris).
 
     Returns:
         bytes: Đủ num_bytes đã đọc.
@@ -218,6 +207,12 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
     """
     buffer = bytearray()
     while len(buffer) < num_bytes:
+        if deadline is not None:
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                raise socket.timeout("Handshake/packet read total deadline exceeded.")
+            sock.settimeout(remaining_time)
+
         remaining = num_bytes - len(buffer)
         chunk = sock.recv(remaining)
         if not chunk:
@@ -229,7 +224,12 @@ def recv_exact(sock: socket.socket, num_bytes: int) -> bytes:
     return bytes(buffer)
 
 
-def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Packet:
+def recv_packet(
+    sock: socket.socket,
+    decrypt_key: Optional[bytes] = None,
+    max_payload_size: int = MAX_PAYLOAD_SIZE,
+    deadline: Optional[float] = None,
+) -> Packet:
     """
     Đọc một gói tin hoàn chỉnh từ TCP socket:
       Bước 1: Đọc chính xác 16 bytes Header cố định bằng recv_exact.
@@ -241,6 +241,8 @@ def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Pac
     Args:
         sock: Socket TCP đang kết nối.
         decrypt_key: Khóa giải mã AES (nếu muốn tự động giải mã).
+        max_payload_size: Ngưỡng payload tối đa cho phép đối với lần đọc này.
+        deadline: Mốc time.monotonic() tối đa cho toàn gói tin.
 
     Returns:
         Packet: Đối tượng gói tin hoàn chỉnh.
@@ -252,7 +254,7 @@ def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Pac
         PayloadTooLargeError: Khi kích thước payload vượt ngưỡng cho phép.
     """
     # Bước 1: Đọc 16 bytes Header
-    header_bytes = recv_exact(sock, HEADER_SIZE)
+    header_bytes = recv_exact(sock, HEADER_SIZE, deadline=deadline)
 
     # Bước 2: Giải mã Header
     magic, version, raw_msg_type, flags, _reserved, payload_len = struct.unpack(
@@ -272,15 +274,15 @@ def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Pac
         )
 
     # Kiểm tra Payload Length
-    if payload_len > MAX_PAYLOAD_SIZE:
+    if payload_len > max_payload_size:
         raise PayloadTooLargeError(
-            f"Payload length khai báo ({payload_len} bytes) vượt ngưỡng cho phép."
+            f"Payload length khai báo ({payload_len} bytes) vượt ngưỡng cho phép ({max_payload_size} bytes)."
         )
 
     # Bước 3: Đọc Payload Data (nếu có)
     payload_bytes = b""
     if payload_len > 0:
-        payload_bytes = recv_exact(sock, payload_len)
+        payload_bytes = recv_exact(sock, payload_len, deadline=deadline)
 
     # Chuyển raw_msg_type thành MessageType enum nếu có thể
     try:

@@ -40,7 +40,7 @@ class TestConcurrencyAndMultiClients:
         time.sleep(0.3)
 
         num_clients = 5
-        clients = []
+        clients = [None] * num_clients
         threads = []
         results = [False] * num_clients
 
@@ -53,7 +53,7 @@ class TestConcurrencyAndMultiClients:
             success = c.connect(timeout=3.0)
             results[index] = success
             if success:
-                clients.append(c)
+                clients[index] = c
 
         for i in range(num_clients):
             t = threading.Thread(target=connect_worker, args=(i,))
@@ -63,16 +63,17 @@ class TestConcurrencyAndMultiClients:
         for t in threads:
             t.join(timeout=3.0)
 
+        active_clients = [c for c in clients if c is not None]
         # Kiểm tra tất cả 5 clients đều kết nối thành công
         assert all(results) is True
-        assert len(clients) == num_clients
+        assert len(active_clients) == num_clients
 
         # Kiểm tra Server ghi nhận đúng số client trực tuyến
         time.sleep(0.3)
         assert server.get_active_client_count() == num_clients
 
         # Ngắt kết nối tất cả các clients
-        for c in clients:
+        for c in active_clients:
             c.disconnect()
 
         time.sleep(0.3)
@@ -94,9 +95,9 @@ class TestConcurrencyAndMultiClients:
         bob = ClientCore(server_host="127.0.0.1", server_port=port, client_name="Bob")
         charlie = ClientCore(server_host="127.0.0.1", server_port=port, client_name="Charlie")
 
-        assert alice.connect() is True
-        assert bob.connect() is True
-        assert charlie.connect() is True
+        assert alice.connect() is True and alice.authenticate("Alice")[0] is True
+        assert bob.connect() is True and bob.authenticate("Bob")[0] is True
+        assert charlie.connect() is True and charlie.authenticate("Charlie")[0] is True
 
         time.sleep(0.2)
         assert server.get_active_client_count() == 3
@@ -152,8 +153,8 @@ class TestConcurrencyAndMultiClients:
         c1 = ClientCore(server_host="127.0.0.1", server_port=port, client_name="Client1")
         c2 = ClientCore(server_host="127.0.0.1", server_port=port, client_name="Client2")
 
-        c1.connect()
-        c2.connect()
+        assert c1.connect() is True and c1.authenticate("Client1")[0] is True
+        assert c2.connect() is True and c2.authenticate("Client2")[0] is True
         time.sleep(0.2)
         assert server.get_active_client_count() == 2
 
@@ -208,4 +209,101 @@ class TestConcurrencyAndMultiClients:
         # Server phải dọn sạch handlers
         assert server.get_active_client_count() == 0
         assert server.is_running is False
+
+    def test_simultaneous_burst_without_interleaving_or_loss(self):
+        """6 Clients đã xác thực cùng đồng loạt bắn tin nhắn ở cùng 1 mili-giây (Barrier): không đan xen byte, không mất gói."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        time.sleep(0.3)
+
+        n = 6
+        clients = [ClientCore(server_host="127.0.0.1", server_port=port) for _ in range(n)]
+        received_counts = [0] * n
+        lock = threading.Lock()
+        all_done = threading.Event()
+        expected_per_client = n  # Mỗi client nhận n tin broadcast
+
+        try:
+            for idx, c in enumerate(clients):
+                assert c.connect() is True
+                assert c.authenticate(f"BurstUser_{idx}")[0] is True
+
+                def make_cb(i: int):
+                    def _cb(pkt: Packet):
+                        data = pkt.to_json()
+                        assert "BurstMsg-" in data["content"]
+                        with lock:
+                            received_counts[i] += 1
+                            if all(cnt >= expected_per_client for cnt in received_counts):
+                                all_done.set()
+                    return _cb
+
+                c.register_callback(MessageType.CHAT_BROADCAST, make_cb(idx))
+
+            barrier = threading.Barrier(n)
+
+            def burst_sender(idx: int):
+                barrier.wait(timeout=3.0)
+                assert clients[idx].send_broadcast(f"BurstMsg-from-{idx}") is True
+
+            threads = [threading.Thread(target=burst_sender, args=(i,)) for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=3.0)
+
+            assert all_done.wait(timeout=3.0) is True
+            assert received_counts == [expected_per_client] * n
+        finally:
+            for c in clients:
+                c.disconnect()
+            server.stop()
+            server_thread.join(timeout=2.0)
+
+    def test_unauthenticated_client_blocked_from_chat_and_lookup(self):
+        """F3: Client mới chỉ connect/handshake (chưa AUTH_REQ) không được phép gửi hoặc nhận CHAT/LOOKUP."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port, client_name="Alice")
+        guest = ClientCore(server_host="127.0.0.1", server_port=port, client_name="SpoofedAlice")
+
+        try:
+            assert alice.connect() is True and alice.authenticate("Alice")[0] is True
+            assert guest.connect() is True  # Cố tình KHÔNG gọi authenticate
+
+            alice_broadcasts = []
+            guest_broadcasts = []
+            guest_errors = []
+            err_event = threading.Event()
+
+            alice.register_callback(MessageType.CHAT_BROADCAST, lambda p: alice_broadcasts.append(p.to_json()))
+            guest.register_callback(MessageType.CHAT_BROADCAST, lambda p: guest_broadcasts.append(p.to_json()))
+            guest.register_callback(
+                MessageType.ERROR_NOTICE,
+                lambda p: (guest_errors.append(p.to_json()), err_event.set()),
+            )
+
+            # Guest chưa login cố gửi chat -> bị chặn AUTH_REQUIRED
+            guest.send_broadcast("Tin nhan gia mao")
+            assert err_event.wait(timeout=2.0) is True
+            assert guest_errors[-1]["code"] == "AUTH_REQUIRED"
+
+            # Alice gửi chat -> Guest chưa auth không được nhận
+            assert alice.send_broadcast("Tin noi bo") is True
+            time.sleep(0.3)
+            assert len(alice_broadcasts) == 1
+            assert alice_broadcasts[0]["content"] == "Tin noi bo"
+            assert len(guest_broadcasts) == 0
+        finally:
+            alice.disconnect()
+            guest.disconnect()
+            server.stop()
+            server_thread.join(timeout=2.0)
+
 

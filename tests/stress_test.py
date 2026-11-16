@@ -48,6 +48,8 @@ class BotClient:
         self.port = port
         self.client = ClientCore(server_host=host, server_port=port, client_name=self.username)
         self.messages_sent = 0
+        self.broadcast_sent = 0
+        self.direct_sent = 0
         self.messages_received = 0
         self.is_active = False
 
@@ -88,10 +90,14 @@ class BotClient:
             recipient = random.choice(peers)
             content = f"[Direct from {self.username}] Hello @{recipient} #{self.messages_sent + 1}"
             ok = self.client.send_direct_message(recipient, content)
+            if ok:
+                self.direct_sent += 1
         else:
             # Gửi broadcast phòng chung
             content = f"[Broadcast from {self.username}] Status update #{self.messages_sent + 1}"
             ok = self.client.send_broadcast(content)
+            if ok:
+                self.broadcast_sent += 1
 
         if ok:
             self.messages_sent += 1
@@ -169,14 +175,18 @@ def run_stress_test(num_clients: int = 15, duration_seconds: float = 6.0) -> dic
     time.sleep(0.5)
 
     total_sent = sum(b.messages_sent for b in bots)
+    total_broadcast = sum(b.broadcast_sent for b in bots)
+    total_direct = sum(b.direct_sent for b in bots)
     total_received = sum(b.messages_received for b in bots)
+    expected_received = (total_broadcast * connected_count) + total_direct
+    delivery_ratio = (total_received / expected_received * 100.0) if expected_received > 0 else 0.0
     msg_rate = total_sent / traffic_elapsed if traffic_elapsed > 0 else 0
 
     print(f"📊 [Stress Test Metrics]:")
     print(f"   - Tổng số Clients hoạt động: {connected_count}/{num_clients}")
     print(f"   - Thời gian test tải: {traffic_elapsed:.2f}s")
-    print(f"   - Tổng số tin nhắn đã gửi: {total_sent} messages ({msg_rate:.1f} msgs/sec)")
-    print(f"   - Tổng số lượt tin nhắn nhận: {total_received} messages")
+    print(f"   - Tổng số tin nhắn đã gửi: {total_sent} messages (Broadcast: {total_broadcast}, Direct: {total_direct} | {msg_rate:.1f} msgs/sec)")
+    print(f"   - Tổng số lượt tin nhắn nhận: {total_received}/{expected_received} deliveries ({delivery_ratio:.1f}%)")
 
     # 3. Dọn dẹp ngắt kết nối toàn bộ bot
     print("🔌 [Stress Test] Đang ngắt kết nối an toàn toàn bộ clients...")
@@ -191,7 +201,11 @@ def run_stress_test(num_clients: int = 15, duration_seconds: float = 6.0) -> dic
         "num_clients": num_clients,
         "connected_count": connected_count,
         "total_sent": total_sent,
+        "total_broadcast": total_broadcast,
+        "total_direct": total_direct,
         "total_received": total_received,
+        "expected_received": expected_received,
+        "delivery_ratio": delivery_ratio,
         "msg_rate": msg_rate,
     }
 
@@ -201,7 +215,10 @@ def test_concurrent_stress_load():
     results = run_stress_test(num_clients=15, duration_seconds=4.0)
     assert results["connected_count"] == 15, "Tất cả 15 clients phải kết nối thành công!"
     assert results["total_sent"] >= 50, "Hệ thống phải xử lý gửi tối thiểu 50 tin nhắn!"
-    assert results["total_received"] > 0, "Các client phải nhận được tin nhắn từ server!"
+    assert results["expected_received"] > 0
+    assert results["delivery_ratio"] >= 98.0, (
+        f"Tỷ lệ phân phối tin nhắn dưới tải cao phải đạt >= 98%, thực tế: {results['delivery_ratio']:.2f}%"
+    )
 
 
 if __name__ == "__main__":

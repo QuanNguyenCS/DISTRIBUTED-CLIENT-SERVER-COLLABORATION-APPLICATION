@@ -224,3 +224,12 @@ storage/server_cache/*
 !storage/server_cache/.gitkeep
 storage/client_downloads/*
 !storage/client_downloads/.gitkeep
+
+# LaTeX intermediate build artifacts (keep main.tex & main.pdf)
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+

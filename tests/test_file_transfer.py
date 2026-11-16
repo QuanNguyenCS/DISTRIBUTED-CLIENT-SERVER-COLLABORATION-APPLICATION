@@ -17,7 +17,13 @@ import time
 from pathlib import Path
 import pytest
 
+from common.crypto_utils import (
+    derive_p2p_session_key,
+    generate_ephemeral_x25519_keypair,
+    get_shared_app_key,
+)
 from common.message_types import MessageType
+from common.protocol import PROTOCOL_VERSION, create_packet, recv_packet
 from server.server_core import ServerCore
 from client.client_core import ClientCore
 from client.file_transfer import (
@@ -34,6 +40,26 @@ def get_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def open_encrypted_p2p_session(port: int, sender_name: str):
+    """Mở socket P2P, thực hiện PEER_HELLO/ACK mã hóa khóa chung + trao đổi X25519 lấy khóa phiên tạm."""
+    app_key = get_shared_app_key()
+    priv_key, pub_b64 = generate_ephemeral_x25519_keypair()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    sock.connect(("127.0.0.1", port))
+    sock.sendall(
+        create_packet(
+            MessageType.PEER_HELLO,
+            {"sender": sender_name, "protocol_version": PROTOCOL_VERSION, "x25519_pub": pub_b64},
+            encrypt_key=app_key,
+        )
+    )
+    ack = recv_packet(sock, decrypt_key=app_key).to_json()
+    assert ack["status"] == "OK"
+    session_key = derive_p2p_session_key(priv_key, ack["x25519_pub"])
+    return sock, session_key
 
 
 class TestFileTransferUnit:
@@ -82,7 +108,7 @@ class TestFileTransferIntegration:
     """Kiểm thử truyền file tích hợp qua mạng TCP."""
 
     def test_full_file_transfer_between_clients(self):
-        """Alice gửi file nhị phân (ảnh/tài liệu) cho Bob qua Server."""
+        """Alice gửi file nhị phân (ảnh/tài liệu) trực tiếp P2P cho Bob (Server chỉ làm Tracker)."""
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -280,3 +306,248 @@ class TestFileTransferIntegration:
             no_p2p.disconnect()
             server.stop()
             sthread.join(timeout=2.0)
+
+    def test_corrupted_chunk_sha256_mismatch_rejected_and_cleaned_up(self, tmp_path):
+        """Khi dữ liệu chunk bị hỏng trên đường truyền (sai SHA-256), bên nhận phải từ chối và xóa sạch file lỗi."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "bob_downloads")
+        bob_errors = []
+        bob_err_event = threading.Event()
+        bob.on_file_error = lambda s, f, r: (bob_errors.append((s, f, r)), bob_err_event.set())
+
+        try:
+            assert bob.connect() and bob.authenticate("BobReceiver")[0]
+            assert bob.p2p_port is not None
+
+            # Mở kết nối P2P có bắt tay X25519 rồi cố tình gửi dữ liệu lật bit khác SHA-256 đã khai báo
+            p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "EvilAlice")
+            with p2p_sock:
+                # Khai báo SHA-256 giả (64 ký tự '0') không khớp với dữ liệu thực
+                p2p_sock.sendall(
+                    create_packet(
+                        MessageType.FILE_OFFER_REQ,
+                        {
+                            "file_id": "badsha01",
+                            "sender": "EvilAlice",
+                            "recipient": "BobReceiver",
+                            "file_name": "corrupted.bin",
+                            "file_size": 16,
+                            "total_chunks": 1,
+                            "sha256": "0" * 64,
+                        },
+                        encrypt_key=session_key,
+                    )
+                )
+                offer_resp = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
+                assert offer_resp["status"] == "ACCEPTED"
+
+                bad_chunk = pack_chunk_payload("badsha01", 0, 1, b"CORRUPTED_DATA!!", encrypted=True)
+                p2p_sock.sendall(create_packet(MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key))
+
+                ack_pkt = recv_packet(p2p_sock, decrypt_key=session_key)
+                assert ack_pkt.msg_type == MessageType.FILE_ACK
+                ack_data = ack_pkt.to_json()
+                assert ack_data["status"] == "FAILED"
+                assert "SHA-256" in ack_data["reason"]
+
+            assert bob_err_event.wait(timeout=2.0)
+            assert len(bob_errors) == 1
+            # Đảm bảo KHÔNG có file hỏng hoặc file .part nào bị bỏ sót trên ổ đĩa của Bob
+            assert not (tmp_path / "bob_downloads" / "corrupted.bin").exists()
+            leftover_files = list((tmp_path / "bob_downloads").glob("*")) if (tmp_path / "bob_downloads").exists() else []
+            assert leftover_files == []
+        finally:
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_p2p_path_traversal_filename_sanitized(self, tmp_path):
+        """Kiểm tra chống lỗ hổng Path Traversal: tên file chứa '../' hoặc '..\\' phải được lọc sạch về thư mục download."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        dl_dir = tmp_path / "safe_downloads"
+        bob.download_dir = str(dl_dir)
+
+        try:
+            assert bob.connect() and bob.authenticate("BobSafe")[0]
+            payload_bytes = b"SafeContentInsideDownloadDirOnly"
+            import hashlib
+            valid_sha = hashlib.sha256(payload_bytes).hexdigest()
+
+            for idx, malicious_name in enumerate(["../../escaped_unix.txt", "..\\..\\escaped_win.txt"]):
+                p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "Sender")
+                with p2p_sock:
+                    fid = f"trav0{idx}"
+                    p2p_sock.sendall(
+                        create_packet(
+                            MessageType.FILE_OFFER_REQ,
+                            {
+                                "file_id": fid,
+                                "sender": "Sender",
+                                "recipient": "BobSafe",
+                                "file_name": malicious_name,
+                                "file_size": len(payload_bytes),
+                                "total_chunks": 1,
+                                "sha256": valid_sha,
+                            },
+                            encrypt_key=session_key,
+                        )
+                    )
+                    assert recv_packet(p2p_sock, decrypt_key=session_key).to_json()["status"] == "ACCEPTED"
+                    p2p_sock.sendall(
+                        create_packet(MessageType.FILE_CHUNK, pack_chunk_payload(fid, 0, 1, payload_bytes, encrypted=True), encrypt_key=session_key)
+                    )
+                    ack = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
+                    assert ack["status"] == "SUCCESS"
+
+            # File phải nằm gọn bên trong safe_downloads, tuyệt đối không thoát ra tmp_path
+            assert (dl_dir / "escaped_unix.txt").is_file()
+            assert (dl_dir / "escaped_win.txt").is_file()
+            assert not (tmp_path / "escaped_unix.txt").exists()
+            assert not (tmp_path / "escaped_win.txt").exists()
+        finally:
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_concurrent_p2p_file_transfers_to_same_receiver(self, tmp_path):
+        """Hai client (Alice và Charlie) đồng thời truyền 2 file P2P tới cùng Bob một lúc."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        charlie = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "bob_concurrent")
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceP2P1")[0]
+            assert charlie.connect() and charlie.authenticate("CharlieP2P2")[0]
+            assert bob.connect() and bob.authenticate("BobTarget")[0]
+
+            file_a = tmp_path / "alice_data.bin"
+            file_c = tmp_path / "charlie_data.bin"
+            bytes_a = os.urandom(96 * 1024)  # 3 chunks
+            bytes_c = os.urandom(96 * 1024)  # 3 chunks
+            file_a.write_bytes(bytes_a)
+            file_c.write_bytes(bytes_c)
+
+            results = {}
+
+            def send_worker(client_obj, key, path):
+                results[key] = client_obj.send_file("BobTarget", str(path), timeout=10.0)
+
+            t1 = threading.Thread(target=send_worker, args=(alice, "A", file_a))
+            t2 = threading.Thread(target=send_worker, args=(charlie, "C", file_c))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+            assert results["A"][0] is True, results["A"][1]
+            assert results["C"][0] is True, results["C"][1]
+            assert (tmp_path / "bob_concurrent" / "alice_data.bin").read_bytes() == bytes_a
+            assert (tmp_path / "bob_concurrent" / "charlie_data.bin").read_bytes() == bytes_c
+        finally:
+            alice.disconnect()
+            charlie.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_duplicate_good_filename_not_overwritten(self, tmp_path):
+        """F8: File tốt có sẵn trong thư mục tải về tuyệt đối không bị ghi đè khi nhận file trùng tên."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        dl_dir = tmp_path / "downloads"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        existing_good = dl_dir / "report.txt"
+        existing_good.write_bytes(b"ORIGINAL_VALUABLE_DATA")
+        bob.download_dir = str(dl_dir)
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceDup")[0]
+            assert bob.connect() and bob.authenticate("BobDup")[0]
+
+            new_src = tmp_path / "report.txt"
+            new_src.write_bytes(b"SECOND_FILE_CONTENT")
+
+            ok, msg = alice.send_file("BobDup", str(new_src), timeout=5.0)
+            assert ok is True, msg
+            assert existing_good.read_bytes() == b"ORIGINAL_VALUABLE_DATA"
+            renamed = dl_dir / "report (1).txt"
+            assert renamed.is_file()
+            assert renamed.read_bytes() == b"SECOND_FILE_CONTENT"
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_malformed_chunk_index_or_size_rejected_and_cleaned(self, tmp_path):
+        """F9: Gửi chunk sai chỉ số [0, total_chunks) hoặc vượt file_size phải bị từ chối và xóa sạch file .part."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        dl_dir = tmp_path / "bob_clean"
+        bob.download_dir = str(dl_dir)
+
+        try:
+            assert bob.connect() and bob.authenticate("BobStrict")[0]
+            p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "Sender")
+            with p2p_sock:
+                p2p_sock.sendall(
+                    create_packet(
+                        MessageType.FILE_OFFER_REQ,
+                        {
+                            "file_id": "badidx01",
+                            "sender": "Sender",
+                            "recipient": "BobStrict",
+                            "file_name": "test.bin",
+                            "file_size": 10,
+                            "total_chunks": 1,
+                            "sha256": "a" * 64,
+                        },
+                        encrypt_key=session_key,
+                    )
+                )
+                assert recv_packet(p2p_sock, decrypt_key=session_key).to_json()["status"] == "ACCEPTED"
+
+                # Cố tình gửi chunk_index = 5 khi total_chunks = 1
+                bad_chunk = pack_chunk_payload("badidx01", 5, 1, b"1234567890", encrypted=True)
+                p2p_sock.sendall(create_packet(MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key))
+
+                ack = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
+                assert ack["status"] == "FAILED"
+
+            leftovers = list(dl_dir.glob("*")) if dl_dir.exists() else []
+            assert leftovers == []
+        finally:
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+

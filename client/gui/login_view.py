@@ -1,12 +1,12 @@
 """
 File: client/gui/login_view.py
 Mô tả: Giao diện đăng nhập (Login View) cho ứng dụng phân tán.
-Cho phép người dùng nhập IP Server, Port, Tên đăng nhập và Mật khẩu mã hóa AES phòng chat.
+Cho phép người dùng nhập IP Server, Port và Tên đăng nhập; mã hóa AES được bật tự động.
 """
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Callable, Optional
+from typing import Callable
 
 
 class LoginView(ttk.Frame):
@@ -17,14 +17,14 @@ class LoginView(ttk.Frame):
     def __init__(
         self,
         parent: tk.Widget,
-        on_connect: Callable[[str, int, str, Optional[str]], None],
+        on_connect: Callable[[str, int, str], None],
     ) -> None:
         """
         Khởi tạo LoginView.
 
         Args:
             parent: Widget cha (thường là root Tk).
-            on_connect: Callback nhận (host, port, username, passphrase).
+            on_connect: Callback nhận (host, port, username).
         """
         super().__init__(parent, padding=25)
         self.parent = parent
@@ -78,23 +78,14 @@ class LoginView(ttk.Frame):
         self.user_entry = ttk.Entry(form_frame, textvariable=self.user_var, width=32)
         self.user_entry.grid(row=2, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
 
-        # 4. Passphrase (Mã hóa phòng chat AES-256)
-        ttk.Label(form_frame, text="Mật khẩu mã hóa AES (Tùy chọn):", font=("Segoe UI", 9, "bold")).grid(
-            row=3, column=0, sticky=tk.W, pady=6
-        )
-        self.pass_var = tk.StringVar(value="")
-        self.pass_entry = ttk.Entry(form_frame, textvariable=self.pass_var, show="•", width=32)
-        self.pass_entry.grid(row=3, column=1, sticky=tk.EW, pady=6, padx=(10, 0))
-
-        # Checkbox hiển thị mật khẩu
-        self.show_pass_var = tk.BooleanVar(value=False)
-        show_pass_chk = ttk.Checkbutton(
+        # 4. Thông báo chế độ bảo mật tự động (không cần nhập mật khẩu phòng)
+        security_badge = ttk.Label(
             form_frame,
-            text="Hiển thị mật khẩu phòng",
-            variable=self.show_pass_var,
-            command=self._toggle_pass_visibility,
+            text="🔒 Bảo mật tự động: AES (Fernet) + P2P X25519 đang bật",
+            font=("Segoe UI", 8, "italic"),
+            foreground="#2E7D32",
         )
-        show_pass_chk.grid(row=4, column=1, sticky=tk.W, pady=2, padx=(10, 0))
+        security_badge.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
 
         # Nhãn hiển thị trạng thái / báo lỗi
         self.status_lbl = ttk.Label(
@@ -117,24 +108,16 @@ class LoginView(ttk.Frame):
 
         # Bắt sự kiện phím Enter
         self.user_entry.bind("<Return>", lambda e: self._on_submit())
-        self.pass_entry.bind("<Return>", lambda e: self._on_submit())
         self.host_entry.bind("<Return>", lambda e: self._on_submit())
         self.port_entry.bind("<Return>", lambda e: self._on_submit())
 
         # Focus mặc định vào Username
         self.user_entry.focus_set()
 
-    def _toggle_pass_visibility(self) -> None:
-        if self.show_pass_var.get():
-            self.pass_entry.config(show="")
-        else:
-            self.pass_entry.config(show="•")
-
     def _on_submit(self) -> None:
         host = self.host_var.get().strip()
         port_str = self.port_var.get().strip()
         username = self.user_var.get().strip()
-        passphrase = self.pass_var.get().strip() or None
 
         if not host:
             self.set_error("Vui lòng nhập địa chỉ IP của Server.")
@@ -165,7 +148,7 @@ class LoginView(ttk.Frame):
         self.connect_btn.config(state=tk.DISABLED)
 
         # Gọi callback
-        self.on_connect_callback(host, port, username, passphrase)
+        self.on_connect_callback(host, port, username)
 
     def set_status(self, text: str, color: str = "#2E7D32") -> None:
         """Cập nhật thông báo trạng thái."""

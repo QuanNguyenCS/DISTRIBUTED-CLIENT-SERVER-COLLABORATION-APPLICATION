@@ -1,31 +1,30 @@
 """
-Unit & Integration Tests cho Giai đoạn 8: Lớp Bảo mật & Mã hóa Dữ liệu (Security Layer - AES/Fernet)
-Kiểm tra toàn diện:
-  1. Sinh khóa & dẫn xuất khóa chuẩn PBKDF2HMAC (Derive Key).
-  2. Mã hóa & giải mã chuỗi bytes / chuỗi ký tự bằng AES.
-  3. Kiểm tra tính toàn vẹn (HMAC-SHA256): Dữ liệu bị can thiệp/sửa đổi trên đường truyền sẽ bị ném lỗi.
-  4. Đóng gói Packet có cờ FLAG_ENCRYPTED: Payload trong luồng raw socket hoàn toàn bị mã hóa.
-  5. Truyền thông mã hóa đầu-cuối giữa 2 Client qua Server.
+Unit & Integration Tests cho Lớp Bảo mật Tự động:
+  1. Khóa AES-Fernet dùng chung toàn hệ thống nạp từ biến môi trường COLLAB_AES_KEY (có mặc định sẵn).
+  2. Bảo vệ toàn diện Control + Data Plane trên kênh Server <-> Client (AUTH, Tracker, Chat, CHAT_ACK).
+  3. Chống hạ cấp gói tin bản rõ (Anti-Downgrade: ENCRYPTION_REQUIRED).
+  4. Trao đổi khóa bất đối xứng X25519 tạm thời (Ephemeral ECDH) cho mỗi phiên P2P File Transfer:
+     PEER_HELLO/ACK bọc khóa chung; FILE_OFFER/FILE_CHUNK/FILE_ACK dùng khóa phiên tạm riêng (Forward Secrecy).
 """
 
 import socket
 import threading
 import time
 import pytest
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 
 from common.crypto_utils import (
+    ENV_AES_KEY_VAR,
     decrypt_payload,
     derive_key,
+    derive_p2p_session_key,
     encrypt_payload,
+    generate_ephemeral_x25519_keypair,
     generate_random_key,
+    get_shared_app_key,
 )
 from common.message_types import MessageType
-from common.protocol import (
-    FLAG_ENCRYPTED,
-    create_packet,
-    recv_packet,
-)
+from common.protocol import PROTOCOL_VERSION, create_packet, recv_packet
 from server.server_core import ServerCore
 from client.client_core import ClientCore
 
@@ -38,76 +37,90 @@ def get_free_port() -> int:
 
 
 class TestCryptoUnit:
-    """Kiểm thử đơn vị các hàm mật mã học."""
+    """Kiểm thử đơn vị các hàm mật mã học dùng chung và X25519 P2P."""
 
     def test_key_derivation_deterministic(self):
         """Cùng một mật khẩu và salt luôn sinh ra cùng một khóa AES 32-bytes."""
         key1 = derive_key("MySecretPassword123")
         key2 = derive_key("MySecretPassword123")
         assert key1 == key2
-        assert len(key1) == 44  # Base64 encoding of 32 bytes = 44 chars
+        assert len(key1) == 44
 
         key_diff = derive_key("DifferentPassword456")
         assert key1 != key_diff
 
+    def test_shared_app_key_from_env_and_fallback(self, monkeypatch):
+        """Biến môi trường COLLAB_AES_KEY hỗ trợ cả chuỗi bất kỳ lẫn Fernet key sẵn; rỗng sẽ dùng khóa mặc định."""
+        monkeypatch.delenv(ENV_AES_KEY_VAR, raising=False)
+        default_k = get_shared_app_key()
+        assert len(default_k) == 44
+
+        monkeypatch.setenv(ENV_AES_KEY_VAR, "CustomTeamEnvSecret")
+        env_derived = get_shared_app_key()
+        assert env_derived != default_k
+        assert env_derived == derive_key("CustomTeamEnvSecret")
+
+        raw_fernet = Fernet.generate_key().decode("ascii")
+        monkeypatch.setenv(ENV_AES_KEY_VAR, raw_fernet)
+        assert get_shared_app_key() == raw_fernet.encode("ascii")
+
+    def test_ephemeral_x25519_session_key_exchange(self):
+        """Hai peer tạo cặp khóa X25519 ngẫu nhiên sẽ tính ra cùng 1 khóa phiên và khác nhau ở mỗi lần chạy."""
+        priv_a, pub_a = generate_ephemeral_x25519_keypair()
+        priv_b, pub_b = generate_ephemeral_x25519_keypair()
+
+        sess_a = derive_p2p_session_key(priv_a, pub_b)
+        sess_b = derive_p2p_session_key(priv_b, pub_a)
+        assert sess_a == sess_b
+        assert len(sess_a) == 44
+
+        # Phiên mới sinh khóa hoàn toàn khác (Forward Secrecy)
+        priv_c, _ = generate_ephemeral_x25519_keypair()
+        priv_d, pub_d = generate_ephemeral_x25519_keypair()
+        assert derive_p2p_session_key(priv_c, pub_d) != sess_a
+
+        with pytest.raises(Exception):
+            derive_p2p_session_key(priv_a, "invalid-base64!")
+
     def test_encrypt_and_decrypt_payload(self):
-        """Mã hóa và giải mã chuỗi văn bản và nhị phân."""
+        """Mã hóa và giải mã chuỗi văn bản bằng Fernet."""
         key = generate_random_key()
         original_text = "Tin nhắn tuyệt mật: Tọa độ 10.7769N, 106.7009E"
-
         cipher = encrypt_payload(original_text, key)
-        # Kiểm tra ciphertext không chứa nội dung gốc
         assert original_text.encode("utf-8") not in cipher
-
-        # Giải mã
-        decrypted = decrypt_payload(cipher, key)
-        assert decrypted.decode("utf-8") == original_text
+        assert decrypt_payload(cipher, key).decode("utf-8") == original_text
 
     def test_tampered_ciphertext_fails_integrity(self):
-        """Dữ liệu bị sửa đổi trên đường truyền (Man-in-the-Middle) sẽ bị phát hiện và từ chối."""
+        """Dữ liệu bị sửa đổi trên đường truyền (HMAC) sẽ ném InvalidToken."""
         key = generate_random_key()
         cipher = bytearray(encrypt_payload("Dữ liệu an toàn", key))
-
-        # Giả lập kẻ xấu sửa đổi 1 byte trong ciphertext
         cipher[15] ^= 0xFF
-
         with pytest.raises(InvalidToken):
             decrypt_payload(bytes(cipher), key)
 
     def test_packet_creation_with_encryption(self):
-        """Gói tin tạo ra có cờ FLAG_ENCRYPTED và payload được mã hóa."""
-        key = derive_key("RoomKey2026")
+        """Gói tin tạo ra mang FLAG_ENCRYPTED và che giấu hoàn toàn bản rõ trên socket."""
+        key = get_shared_app_key()
         secret_message = "Hello Confidential World"
-
-        packet_bytes = create_packet(
-            MessageType.CHAT_BROADCAST,
-            secret_message,
-            encrypt_key=key,
-        )
-
-        # Đảm bảo không tìm thấy chuỗi gốc trong raw packet bytes
+        packet_bytes = create_packet(MessageType.CHAT_BROADCAST, secret_message, encrypt_key=key)
         assert secret_message.encode("utf-8") not in packet_bytes
 
-        # Đọc gói tin qua memory/socket
         s1, s2 = socket.socketpair()
         s1.sendall(packet_bytes)
         pkt = recv_packet(s2)
         assert pkt.is_encrypted is True
-
-        # Giải mã
         decrypted_pkt = pkt.get_decrypted_packet(key)
         assert decrypted_pkt.is_encrypted is False
         assert decrypted_pkt.to_text() == secret_message
-
         s1.close()
         s2.close()
 
 
 class TestCryptoIntegration:
-    """Kiểm thử tích hợp mã hóa đầu-cuối giữa 2 Client."""
+    """Kiểm thử tích hợp cơ chế mã hóa tự động toàn hệ thống và X25519 P2P."""
 
-    def test_encrypted_communication_between_clients(self):
-        """Alice và Bob bật mã hóa với cùng khóa bí mật, trao đổi tin nhắn thành công."""
+    def test_auto_encryption_enabled_out_of_the_box(self, tmp_path):
+        """Không cần nhập passphrase: ServerCore() và ClientCore() tự mã hóa toàn bộ Chat, Direct & P2P File."""
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -116,266 +129,133 @@ class TestCryptoIntegration:
 
         alice = ClientCore(server_host="127.0.0.1", server_port=port)
         bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        bob.download_dir = str(tmp_path / "downloads")
 
-        # Cả Server và Client cùng bật mã hóa phòng chat với mật khẩu chung
-        shared_pass = "ProjectCollabPassphrase2026"
-        server.enable_encryption(shared_pass)
-        alice.enable_encryption(shared_pass)
-        bob.enable_encryption(shared_pass)
+        try:
+            assert alice.connect() and alice.authenticate("AliceAuto")[0]
+            assert bob.connect() and bob.authenticate("BobAuto")[0]
+            assert alice.server_encryption_enabled is True
+            assert bob.server_encryption_enabled is True
 
-        assert alice.connect() and alice.authenticate("AliceSecure")[0]
-        assert bob.connect() and bob.authenticate("BobSecure")[0]
+            bc_msgs, dm_msgs, acks = [], [], []
+            bc_ev, dm_ev, ack_ev = threading.Event(), threading.Event(), threading.Event()
+            bob.register_callback(MessageType.CHAT_BROADCAST, lambda p: (bc_msgs.append(p.to_json()), bc_ev.set()))
+            bob.register_callback(MessageType.CHAT_DIRECT, lambda p: (dm_msgs.append(p.to_json()), dm_ev.set()))
+            alice.register_callback(MessageType.CHAT_ACK, lambda p: (acks.append(p.to_json()), ack_ev.set()))
 
-        bob_received_direct = []
-        bob.register_callback(
-            MessageType.CHAT_DIRECT,
-            lambda pkt: bob_received_direct.append(pkt.to_json()),
-        )
+            assert alice.send_broadcast("Xin chao ma hoa tu dong") is True
+            assert bc_ev.wait(timeout=2.0)
+            assert bc_msgs[0]["content"] == "Xin chao ma hoa tu dong"
 
-        secret_text = "Nội dung này được bảo vệ bởi AES-256!"
-        assert alice.send_direct_message(recipient="BobSecure", content=secret_text) is True
+            assert alice.send_direct_message("BobAuto", "Tin rieng khong can nhap pass") is True
+            assert dm_ev.wait(timeout=2.0) and ack_ev.wait(timeout=2.0)
+            assert dm_msgs[0]["content"] == "Tin rieng khong can nhap pass"
+            assert "content" not in acks[0]
 
-        time.sleep(0.5)
+            sample_file = tmp_path / "auto_secret.bin"
+            raw = b"AUTO_P2P_X25519_PAYLOAD_" * 500
+            sample_file.write_bytes(raw)
+            ok, msg = alice.send_file("BobAuto", str(sample_file), timeout=5.0)
+            assert ok is True, msg
+            assert (tmp_path / "downloads" / "auto_secret.bin").read_bytes() == raw
+        finally:
+            alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
 
-        assert len(bob_received_direct) == 1
-        assert bob_received_direct[0]["content"] == secret_text
-        assert bob_received_direct[0]["sender"] == "AliceSecure"
-
-        alice.disconnect()
-        bob.disconnect()
-        server.stop()
-        sthread.join(timeout=2.0)
-
-    def test_encrypted_broadcast_communication(self):
-        """Alice phát tin nhắn chung mã hóa, Bob giải mã thành công."""
+    def test_env_var_aes_key_override_between_server_and_clients(self, monkeypatch):
+        """Thay đổi COLLAB_AES_KEY trên env áp dụng tức thì; Client khác khóa env sẽ bị DECRYPTION_FAILED."""
+        monkeypatch.setenv(ENV_AES_KEY_VAR, "EnvRoomKey_2026_Prod")
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
-        shared_pass = "SecureRoomPass123"
-        server.enable_encryption(shared_pass)
-
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
         sthread.start()
         time.sleep(0.3)
 
-        alice = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob = ClientCore(server_host="127.0.0.1", server_port=port)
-        alice.enable_encryption(shared_pass)
-        bob.enable_encryption(shared_pass)
+        good_client = ClientCore(server_host="127.0.0.1", server_port=port)
+        wrong_client = ClientCore(server_host="127.0.0.1", server_port=port)
+        wrong_client.enable_encryption("DifferentWrongEnvKey")
 
-        assert alice.connect() and alice.authenticate("AliceBC")[0]
-        assert bob.connect() and bob.authenticate("BobBC")[0]
+        try:
+            assert good_client.connect() and good_client.authenticate("EnvMatchUser")[0]
+            assert wrong_client.connect()
 
-        bob_received = []
-        bob.register_callback(
-            MessageType.CHAT_BROADCAST,
-            lambda pkt: bob_received.append(pkt.to_json()),
-        )
-
-        broadcast_text = "Chào toàn thể anh em trong phòng chat bảo mật!"
-        assert alice.send_broadcast(broadcast_text) is True
-
-        time.sleep(0.5)
-
-        assert len(bob_received) == 1
-        assert bob_received[0]["content"] == broadcast_text
-        assert bob_received[0]["sender"] == "AliceBC"
-
-        alice.disconnect()
-        bob.disconnect()
-        server.stop()
-        sthread.join(timeout=2.0)
+            wrong_errors = []
+            err_ev = threading.Event()
+            wrong_client.register_callback(
+                MessageType.ERROR_NOTICE,
+                lambda p: (wrong_errors.append(p.to_json()), err_ev.set()),
+            )
+            # wrong_client gửi AUTH_REQ mã hóa bằng khóa sai -> Server báo DECRYPTION_FAILED ngay
+            ok_wrong, _ = wrong_client.authenticate("WrongEnvUser", timeout=1.5)
+            assert ok_wrong is False
+            assert err_ev.wait(timeout=2.0) is True
+            assert wrong_errors[-1]["code"] == "DECRYPTION_FAILED"
+        finally:
+            good_client.disconnect()
+            wrong_client.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
 
     def test_eavesdropper_without_key_cannot_read_payload(self):
-        """Kẻ nghe lén (Sniffer) không có key bí mật chỉ nhận được cờ FLAG_ENCRYPTED và byte rác."""
-        key = derive_key("TopSecretKey999")
+        """Kẻ nghe lén bắt được raw socket bytes không thể đọc bản rõ hoặc giải mã bằng khóa sai."""
+        key = get_shared_app_key()
         plain = "Thông điệp cơ mật không thể xem trộm"
         pkt_bytes = create_packet(MessageType.CHAT_BROADCAST, plain, encrypt_key=key)
 
         s1, s2 = socket.socketpair()
         s1.sendall(pkt_bytes)
-        # Sniffer đọc gói tin mà KHÔNG có key
         sniffed_pkt = recv_packet(s2)
 
         assert sniffed_pkt.is_encrypted is True
-        # Sniffer cố ép đọc JSON hoặc text sẽ nhận byte mã hóa Fernet không đọc được bản rõ
         assert plain.encode("utf-8") not in sniffed_pkt.payload
-        # Giải mã bằng key sai sẽ ném ngoại lệ
-        wrong_key = derive_key("WrongPassword000")
         with pytest.raises(InvalidToken):
-            sniffed_pkt.get_decrypted_packet(wrong_key)
+            sniffed_pkt.get_decrypted_packet(derive_key("AttackerWrongKey"))
 
         s1.close()
         s2.close()
 
-    def test_e2ee_chat_without_server_encryption(self):
-        """Server chạy chế độ thường (không --passphrase), 2 Client bật AES vẫn chat chung & riêng bình thường."""
+    def test_server_blocks_plaintext_downgrade_on_auth_and_chat(self):
+        """Client tắt mã hóa cố gửi bản rõ AUTH_REQ / CHAT_BROADCAST phải bị chặn với ENCRYPTION_REQUIRED."""
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
-
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
         sthread.start()
         time.sleep(0.3)
 
-        alice = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob = ClientCore(server_host="127.0.0.1", server_port=port)
-        alice.enable_encryption("RoomE2EEPass123")
-        bob.enable_encryption("RoomE2EEPass123")
+        enc_alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        plain_attacker = ClientCore(server_host="127.0.0.1", server_port=port, auto_encrypt=False)
 
         try:
-            assert alice.connect() and alice.authenticate("AliceE2EE")[0]
-            assert bob.connect() and bob.authenticate("BobE2EE")[0]
-            assert alice.server_encryption_enabled is False
-            assert bob.server_encryption_enabled is False
+            assert enc_alice.connect() and enc_alice.authenticate("AliceStrict")[0]
+            assert plain_attacker.connect()
 
-            bc_event = threading.Event()
-            dm_event = threading.Event()
-            bob_broadcasts = []
-            bob_directs = []
-
-            bob.register_callback(
-                MessageType.CHAT_BROADCAST,
-                lambda pkt: (bob_broadcasts.append(pkt.to_json()), bc_event.set()),
-            )
-            bob.register_callback(
-                MessageType.CHAT_DIRECT,
-                lambda pkt: (bob_directs.append(pkt.to_json()), dm_event.set()),
-            )
-
-            assert alice.send_broadcast("Tin nhắn chung E2EE không cần key server") is True
-            assert bc_event.wait(timeout=2.0)
-            assert bob_broadcasts[0]["content"] == "Tin nhắn chung E2EE không cần key server"
-            assert bob_broadcasts[0]["sender"] == "AliceE2EE"
-
-            assert alice.send_direct_message("BobE2EE", "Tin nhắn riêng E2EE bí mật") is True
-            assert dm_event.wait(timeout=2.0)
-            assert bob_directs[0]["content"] == "Tin nhắn riêng E2EE bí mật"
-            assert bob_directs[0]["sender"] == "AliceE2EE"
-            assert bob_directs[0]["recipient"] == "BobE2EE"
-        finally:
-            alice.disconnect()
-            bob.disconnect()
-            server.stop()
-            sthread.join(timeout=2.0)
-
-    def test_e2ee_file_transfer_without_server_encryption(self, tmp_path):
-        """Server chạy chế độ thường, 2 Client bật AES vẫn gửi file nhị phân & file 0-byte toàn vẹn SHA-256."""
-        port = get_free_port()
-        server = ServerCore(host="127.0.0.1", port=port)
-
-        sthread = threading.Thread(target=server.serve_forever, daemon=True)
-        sthread.start()
-        time.sleep(0.3)
-
-        alice = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob.download_dir = str(tmp_path / "downloads")
-        alice.enable_encryption("FileE2EEPass456")
-        bob.enable_encryption("FileE2EEPass456")
-
-        try:
-            assert alice.connect() and alice.authenticate("AliceFileE2EE")[0]
-            assert bob.connect() and bob.authenticate("BobFileE2EE")[0]
-
-            received = []
-            recv_event = threading.Event()
-
-            def on_recv(sender, file_name, save_path):
-                received.append((sender, file_name, save_path))
-                recv_event.set()
-
-            bob.on_file_received = on_recv
-
-            raw_data = bytes(range(256)) * 300  # 76,800 bytes (3 chunks)
-            src_file = tmp_path / "photo.jpg"
-            src_file.write_bytes(raw_data)
-
-            ok, msg = alice.send_file("BobFileE2EE", str(src_file), timeout=5.0)
-            assert ok is True, msg
-            assert recv_event.wait(timeout=2.0)
-            assert received[0][0] == "AliceFileE2EE"
-            assert received[0][1] == "photo.jpg"
-            assert (tmp_path / "downloads" / "photo.jpg").read_bytes() == raw_data
-
-            # Kiểm tra gửi file rỗng 0-byte qua kênh E2EE
-            recv_event.clear()
-            empty_file = tmp_path / "empty.txt"
-            empty_file.write_bytes(b"")
-            ok_empty, msg_empty = alice.send_file("BobFileE2EE", str(empty_file), timeout=5.0)
-            assert ok_empty is True, msg_empty
-            assert recv_event.wait(timeout=2.0)
-            assert (tmp_path / "downloads" / "empty.txt").read_bytes() == b""
-        finally:
-            alice.disconnect()
-            bob.disconnect()
-            server.stop()
-            sthread.join(timeout=2.0)
-
-    def test_mismatched_key_e2ee_negative_cases(self, tmp_path):
-        """Hai Client khác mật khẩu AES: không văng chuỗi mã hóa vào chat, không crash luồng nhận, báo lỗi rõ ràng."""
-        port = get_free_port()
-        server = ServerCore(host="127.0.0.1", port=port)
-
-        sthread = threading.Thread(target=server.serve_forever, daemon=True)
-        sthread.start()
-        time.sleep(0.3)
-
-        alice = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob = ClientCore(server_host="127.0.0.1", server_port=port)
-        bob.download_dir = str(tmp_path / "downloads")
-        alice.enable_encryption("PasswordOne")
-        bob.enable_encryption("PasswordTwoMismatch")
-
-        try:
-            assert alice.connect() and alice.authenticate("AliceMismatch")[0]
-            assert bob.connect() and bob.authenticate("BobMismatch")[0]
-
-            err_event = threading.Event()
-            err_notices = []
-            bc_msgs = []
-            dm_msgs = []
-            file_errors = []
-            file_ok_calls = []
-
-            bob.register_callback(
+            atk_errors = []
+            err_ev = threading.Event()
+            plain_attacker.register_callback(
                 MessageType.ERROR_NOTICE,
-                lambda pkt: (err_notices.append(pkt.to_json()), err_event.set()),
+                lambda p: (atk_errors.append(p.to_json()), err_ev.set()),
             )
-            bob.register_callback(MessageType.CHAT_BROADCAST, lambda pkt: bc_msgs.append(pkt.to_json()))
-            bob.register_callback(MessageType.CHAT_DIRECT, lambda pkt: dm_msgs.append(pkt.to_json()))
-            bob.on_file_error = lambda sender, fname, reason: file_errors.append((sender, fname, reason))
-            bob.on_file_received = lambda sender, fname, path: file_ok_calls.append((sender, fname, path))
 
-            # 1. Broadcast sai key
-            assert alice.send_broadcast("Bi mat 1") is True
-            assert err_event.wait(timeout=2.0)
-            assert err_notices[-1]["code"] == "DECRYPTION_FAILED"
-            assert len(bc_msgs) == 0
-            assert bob.is_connected is True
-
-            # 2. Direct sai key
-            err_event.clear()
-            assert alice.send_direct_message("BobMismatch", "Bi mat 2") is True
-            assert err_event.wait(timeout=2.0)
-            assert err_notices[-1]["code"] == "DECRYPTION_FAILED"
-            assert len(dm_msgs) == 0
-            assert bob.is_connected is True
-
-            # 3. File transfer sai key
-            secret_file = tmp_path / "secret.bin"
-            secret_file.write_bytes(b"SecretBinaryContent" * 20)
-            ok, msg = alice.send_file("BobMismatch", str(secret_file), timeout=5.0)
-            assert ok is False
-            assert len(file_errors) >= 1
-            assert len(file_ok_calls) == 0
-            assert bob.is_connected is True
+            ok_plain, _ = plain_attacker.authenticate("PlainAttacker", timeout=1.5)
+            assert ok_plain is False
+            assert err_ev.wait(timeout=2.0)
+            assert atk_errors[-1]["code"] == "ENCRYPTION_REQUIRED"
         finally:
-            alice.disconnect()
-            bob.disconnect()
+            enc_alice.disconnect()
+            plain_attacker.disconnect()
             server.stop()
             sthread.join(timeout=2.0)
 
-    def test_p2p_encrypted_file_missing_key_and_wire_security(self, tmp_path):
-        """Gửi file P2P bật AES: bên nhận chưa nhập key phải báo lỗi rõ & gói P2P trên wire mang FLAG_ENCRYPTED."""
+    def test_p2p_ephemeral_x25519_wire_forward_secrecy(self, tmp_path):
+        """
+        Kiểm chứng Wire Forward Secrecy cho P2P File Transfer:
+          - PEER_HELLO / PEER_HELLO_ACK mang x25519_pub và được bọc bằng khóa AES chung.
+          - FILE_OFFER_REQ / FILE_CHUNK / FILE_ACK dùng khóa AES tạm X25519: ngay cả dùng khóa AES chung
+            của ứng dụng cũng KHÔNG giải mã được FILE_OFFER hay FILE_CHUNK (InvalidToken), và 2 lần gửi
+            tạo khóa/ciphertext khác nhau!
+        """
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -385,77 +265,114 @@ class TestCryptoIntegration:
         alice = ClientCore(server_host="127.0.0.1", server_port=port)
         bob = ClientCore(server_host="127.0.0.1", server_port=port)
         bob.download_dir = str(tmp_path / "downloads")
-        alice.enable_encryption("P2PSecretKey")
 
-        # Kiểm tra wire packet từ Alice tới fake P2P sniffer mang FLAG_ENCRYPTED, không lộ plaintext
-        sniffed_packets = []
-        sniffer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sniffer_sock.bind(("127.0.0.1", 0))
-        sniffer_sock.listen(4)
-        sniff_port = sniffer_sock.getsockname()[1]
-
-        def run_sniffer():
-            conn, _ = sniffer_sock.accept()
-            with conn:
-                pkt1 = recv_packet(conn)
-                sniffed_packets.append(pkt1)
-                conn.sendall(
-                    create_packet(MessageType.PEER_HELLO_ACK, {"status": "OK", "username": "Sniffer", "protocol_version": 1})
-                )
-                pkt2 = recv_packet(conn)
-                sniffed_packets.append(pkt2)
-                offer = pkt2.to_json()
-                conn.sendall(
-                    create_packet(
-                        MessageType.FILE_OFFER_RESP,
-                        {"file_id": offer["file_id"], "sender": "Alice", "recipient": "Sniffer", "status": "ACCEPTED"},
-                    )
-                )
-                pkt3 = recv_packet(conn)
-                sniffed_packets.append(pkt3)
-                conn.sendall(
-                    create_packet(
-                        MessageType.FILE_ACK,
-                        {"file_id": offer["file_id"], "sender": "Alice", "recipient": "Sniffer", "status": "SUCCESS", "reason": "OK"},
-                    )
-                )
+        captured_c2s = []
+        captured_s2c = []
 
         try:
-            assert alice.connect() and alice.authenticate("AliceSecP2P")[0]
-            assert bob.connect() and bob.authenticate("BobNoKeyP2P")[0]
+            assert alice.connect() and alice.authenticate("AliceFS")[0]
+            assert bob.connect() and bob.authenticate("BobFS")[0]
 
-            file_errors = []
-            bob.on_file_error = lambda sender, fname, reason: file_errors.append((sender, fname, reason))
+            # Tạo TCP sniffer proxy đứng giữa Alice và Bob P2P Listener
+            proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            proxy_sock.bind(("127.0.0.1", 0))
+            proxy_sock.listen(4)
+            proxy_port = proxy_sock.getsockname()[1]
 
-            secret_file = tmp_path / "secret_p2p.txt"
-            secret_text = b"TOP_SECRET_P2P_BINARY_PAYLOAD_DO_NOT_LEAK"
-            secret_file.write_bytes(secret_text)
+            def run_mitm_sniffer():
+                in_conn, _ = proxy_sock.accept()
+                out_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                out_conn.connect(("127.0.0.1", bob.p2p_port))
 
-            # Bob chưa nhập key -> reject ngay tại FILE_OFFER_REQ
-            ok, reason = alice.send_file("BobNoKeyP2P", str(secret_file), timeout=5.0)
-            assert ok is False
-            assert "mật khẩu phòng" in reason
-            assert len(file_errors) == 1
-            assert not (tmp_path / "downloads" / "secret_p2p.txt").exists()
+                def pipe(src, dst, bucket):
+                    try:
+                        while True:
+                            pkt = recv_packet(src)
+                            bucket.append(pkt)
+                            # Forward nguyên trạng header + payload
+                            dst.sendall(
+                                create_packet(pkt.msg_type, pkt.payload, flags=pkt.flags, version=pkt.version)
+                            )
+                    except Exception:
+                        pass
 
-            # Xác minh packet FILE_CHUNK gửi trên P2P TCP bị mã hóa hoàn toàn
-            sniff_thread = threading.Thread(target=run_sniffer, daemon=True)
-            sniff_thread.start()
+                t_a = threading.Thread(target=pipe, args=(in_conn, out_conn, captured_c2s), daemon=True)
+                t_b = threading.Thread(target=pipe, args=(out_conn, in_conn, captured_s2c), daemon=True)
+                t_a.start()
+                t_b.start()
+                t_a.join(timeout=4.0)
+                t_b.join(timeout=4.0)
+                in_conn.close()
+                out_conn.close()
 
-            # Đăng ký endpoint trỏ sang sniffer trên Tracker
-            server.session_mgr.register_user("WireSniffer", object(), ("127.0.0.1", 55555), p2p_port=sniff_port)
-            ok_wire, _ = alice.send_file("WireSniffer", str(secret_file), timeout=5.0)
-            sniff_thread.join(timeout=2.0)
+            proxy_thread = threading.Thread(target=run_mitm_sniffer, daemon=True)
+            proxy_thread.start()
 
-            assert ok_wire is True
-            chunk_pkt = sniffed_packets[-1]
-            assert chunk_pkt.msg_type == MessageType.FILE_CHUNK
-            assert chunk_pkt.is_encrypted is True
-            assert secret_text not in chunk_pkt.payload
+            # Trỏ Tracker của ProxyBob sang cổng proxy sniffer
+            server.session_mgr.register_user("ProxyBob", bob, ("127.0.0.1", 59999), p2p_port=proxy_port)
+
+            secret_file = tmp_path / "forward_secret.txt"
+            secret_bytes = b"TOP_SECRET_FORWARD_SECRECY_DATA_2026"
+            secret_file.write_bytes(secret_bytes)
+
+            ok, msg = alice.send_file("ProxyBob", str(secret_file), timeout=5.0)
+            proxy_thread.join(timeout=3.0)
+            proxy_sock.close()
+            server.session_mgr.unregister_user("ProxyBob")
+
+            assert ok is True, msg
+            assert (tmp_path / "downloads" / "forward_secret.txt").read_bytes() == secret_bytes
+
+            # 1. PEER_HELLO & PEER_HELLO_ACK mã hóa bằng khóa chung và chứa x25519_pub
+            app_key = get_shared_app_key()
+            hello_pkt = captured_c2s[0]
+            hello_ack_pkt = captured_s2c[0]
+            assert hello_pkt.msg_type == MessageType.PEER_HELLO and hello_pkt.is_encrypted
+            assert hello_ack_pkt.msg_type == MessageType.PEER_HELLO_ACK and hello_ack_pkt.is_encrypted
+            assert "x25519_pub" in hello_pkt.get_decrypted_packet(app_key).to_json()
+            assert "x25519_pub" in hello_ack_pkt.get_decrypted_packet(app_key).to_json()
+
+            # 2. FILE_OFFER_REQ, FILE_CHUNK, FILE_ACK phải dùng khóa tạm X25519:
+            # Ngay cả khóa AES chung của hệ thống cũng KHÔNG giải mã được!
+            offer_pkt = next(p for p in captured_c2s if p.msg_type == MessageType.FILE_OFFER_REQ)
+            chunk_pkt = next(p for p in captured_c2s if p.msg_type == MessageType.FILE_CHUNK)
+            ack_pkt = next(p for p in captured_s2c if p.msg_type == MessageType.FILE_ACK)
+
+            for ephemeral_pkt in (offer_pkt, chunk_pkt, ack_pkt):
+                assert ephemeral_pkt.is_encrypted is True
+                with pytest.raises(InvalidToken):
+                    ephemeral_pkt.get_decrypted_packet(app_key)
+            assert secret_bytes not in chunk_pkt.payload
         finally:
-            sniffer_sock.close()
-            server.session_mgr.unregister_user("WireSniffer")
             alice.disconnect()
+            bob.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_p2p_plaintext_downgrade_rejected(self):
+        """Gửi PEER_HELLO bản rõ tới P2P Listener khi AES đang bật phải bị từ chối REJECTED."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        try:
+            assert bob.connect() and bob.authenticate("BobP2PGuard")[0]
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_sock:
+                raw_sock.settimeout(3.0)
+                raw_sock.connect(("127.0.0.1", bob.p2p_port))
+                raw_sock.sendall(
+                    create_packet(
+                        MessageType.PEER_HELLO,
+                        {"sender": "Rogue", "protocol_version": PROTOCOL_VERSION},
+                    )
+                )
+                resp = recv_packet(raw_sock)
+                assert resp.msg_type == MessageType.PEER_HELLO_ACK
+                assert resp.to_json()["status"] == "REJECTED"
+        finally:
             bob.disconnect()
             server.stop()
             sthread.join(timeout=2.0)

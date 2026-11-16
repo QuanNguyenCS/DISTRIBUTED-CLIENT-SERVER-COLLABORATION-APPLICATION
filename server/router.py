@@ -63,10 +63,11 @@ class MessageRouter:
 
         logger.info("📢 [Broadcast] %s: %s", sender_username, content)
 
-        # Phát tán cho tất cả các client đang online
+        # Phát tán cho tất cả các client đã xác thực đang online
         success_count = self.server.broadcast_packet(
             MessageType.CHAT_BROADCAST,
             broadcast_payload,
+            only_authenticated=True,
         )
 
         return True, success_count
@@ -168,12 +169,11 @@ class MessageRouter:
 
         logger.info("🔒 [Direct] %s ➔ %s: %s", sender_username, session.username, content)
 
-        # 4. Gửi xác nhận CHAT_ACK về cho người gửi để hiển thị đã gửi thành công
+        # 4. Gửi xác nhận CHAT_ACK (chỉ metadata tối thiểu, không lặp lại bản rõ content)
         if sender_handler:
             ack_payload = {
                 "status": "DELIVERED",
                 "recipient": session.username,
-                "content": content,
                 "timestamp": ts,
             }
             sender_handler.send_packet(MessageType.CHAT_ACK, ack_payload)

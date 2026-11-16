@@ -57,30 +57,34 @@ Mỗi gói tin truyền trên đường truyền bao gồm 2 phần liên tiếp
 
 ## 3. DANH SÁCH MÃ THÔNG ĐIỆP (MESSAGE TYPES REGISTRY)
 
-Các mã thông điệp được phân chia theo từng dải số chức năng:
+Các mã thông điệp được phân chia theo từng dải số chức năng (khớp chính xác với `common/message_types.py`):
 
 | Nhóm | Mã (Code) | Tên Enum | Chiều truyền | Ý nghĩa & Dữ liệu Payload |
 | :--- | :---: | :--- | :---: | :--- |
-| **Handshake & Auth** | `101` | `HELLO_HANDSHAKE` | Client -> Server | Khởi tạo bắt tay ứng dụng, thông báo version client. |
-| | `102` | `HANDSHAKE_ACK` | Server -> Client | Đồng ý bắt tay, trả về server id và banner chào mừng. |
-| | `103` | `HANDSHAKE_REJECT` | Server -> Client | Từ chối kết nối do không tương thích phiên bản. |
-| | `104` | `AUTH_REQ` | Client -> Server | Yêu cầu đăng nhập: `{"username": "alice"}`. |
-| | `105` | `AUTH_RESP_SUCCESS` | Server -> Client | Đăng nhập thành công: `{"status": "ok", "user": "alice"}`. |
-| | `106` | `AUTH_RESP_FAIL` | Server -> Client | Đăng nhập thất bại: `{"reason": "Tên đã tồn tại"}`. |
-| **User Presence** | `201` | `USER_LIST_REQ` | Client -> Server | Yêu cầu lấy danh sách người dùng đang online. |
-| | `202` | `USER_LIST_RESP` | Server -> Client | Trả về danh sách: `{"users": ["alice", "bob"]}`. |
-| | `203` | `USER_STATUS_BROADCAST` | Server -> Client | Thông báo có user mới hoặc user rời mạng: `{"status": "JOINED", "username": "bob"}`. |
-| **Chat Messaging** | `301` | `CHAT_BROADCAST` | Hai chiều | Tin nhắn gửi toàn phòng: `{"sender": "alice", "content": "Hello", "timestamp": 1710000000}`. |
-| | `302` | `CHAT_DIRECT` | Hai chiều | Tin nhắn riêng tư 1-1: `{"sender": "alice", "recipient": "bob", "content": "Hi", "timestamp": ...}`. |
-| | `303` | `CHAT_ACK` | Hai chiều | Xác nhận đã nhận tin nhắn: `{"msg_id": "...", "status": "DELIVERED"}`. |
-| **File Transfer** | `401` | `FILE_OFFER_REQ` | Client -> Server | Đề xuất gửi file: `{"file_id": "...", "filename": "doc.pdf", "filesize": 10240, "sha256": "..."}`. |
-| | `402` | `FILE_OFFER_RESP` | Server -> Client | Chấp thuận/từ chối nhận file: `{"file_id": "...", "action": "ACCEPT"}`. |
-| | `403` | `FILE_CHUNK` | Hai chiều | Mảnh dữ liệu file nhị phân: Header JSON ngắn + Raw binary bytes. |
-| | `404` | `FILE_ACK` | Hai chiều | Xác nhận đã nhận được mảnh file hoặc hoàn tất xác minh SHA-256. |
-| **Heartbeat** | `501` | `HEARTBEAT_PING` | Hai chiều | Gói tin nhịp tim kiểm tra liveness: Payload rỗng hoặc timestamp. |
-| | `502` | `HEARTBEAT_PONG` | Hai chiều | Gói tin phản hồi nhịp tim. |
-| **Connection** | `601` | `DISCONNECT_NOTICE` | Hai chiều | Thông báo chủ động ngắt kết nối an toàn (Graceful Disconnect). |
-| | `602` | `ERROR_NOTICE` | Server -> Client | Thông báo lỗi hệ thống hoặc vi phạm giao thức. |
+| **Handshake & Auth** | `101` | `HELLO_HANDSHAKE` | Client -> Server | Khởi tạo bắt tay ứng dụng: `{"client_name": "...", "client_version": 1}`. |
+| | `102` | `HANDSHAKE_ACK` | Server -> Client | Đồng ý bắt tay, trả về `status="OK"`, `server_id`, `version`, `encryption_enabled`. |
+| | `103` | `HANDSHAKE_REJECT` | Server -> Client | Từ chối kết nối do không tương thích phiên bản hoặc payload sai chuẩn. |
+| | `104` | `AUTH_REQ` | Client -> Server | Yêu cầu đăng nhập: `{"username": "alice", "p2p_port": 51234}`. |
+| | `105` | `AUTH_RESP_SUCCESS` | Server -> Client | Đăng nhập thành công: `{"status": "SUCCESS", "username": "alice", "online_users": [...], "peers": {...}}`. |
+| | `106` | `AUTH_RESP_FAIL` | Server -> Client | Đăng nhập thất bại: `{"status": "FAIL", "reason": "..."}`. |
+| **User Presence & Tracker** | `201` | `USER_LIST_REQ` | Client -> Server | Yêu cầu lấy danh sách người dùng đang online kèm danh bạ P2P. |
+| | `202` | `USER_LIST_RESP` | Server -> Client | Trả về danh sách `users` và `peers` (`username`, `ip`, `p2p_port`). |
+| | `203` | `USER_STATUS_BROADCAST` | Server -> Client | Thông báo có user `JOINED` hoặc `LEFT` kèm `online_users`, `peers` và `online_count`. |
+| | `204` | `PEER_LOOKUP_REQ` | Client -> Server | Hỏi Tracker địa chỉ P2P: `{"username": "bob"}`. |
+| | `205` | `PEER_LOOKUP_RESP` | Server -> Client | Tracker trả về `{"found": true, "username": "bob", "ip": "...", "p2p_port": ...}`. |
+| **Chat Messaging** | `301` | `CHAT_BROADCAST` | Client <-> Server | Tin nhắn phòng chung (Server giữ thứ tự phát thanh): `{"sender", "content", "timestamp"}`. |
+| | `302` | `CHAT_DIRECT` | Client <-> Server | Tin nhắn riêng 1-1 (`{"sender", "recipient", "content" | "e2ee"+"ciphertext", "timestamp"}`). |
+| | `303` | `CHAT_ACK` | Server -> Client | Xác nhận đã chuyển tin nhắn (`{"status": "DELIVERED", "recipient", "timestamp"}`, không lặp bản rõ `content`). |
+| **File Transfer (P2P Direct)** | `401` | `FILE_OFFER_REQ` | Peer -> Peer | Đề xuất gửi file trực tiếp (mã hóa bằng khóa phiên tạm X25519): `{"file_id", "sender", "recipient", "file_name", "file_size", "total_chunks", "sha256", "encrypted"}`. |
+| | `402` | `FILE_OFFER_RESP` | Peer -> Peer | Chấp thuận (`ACCEPTED`) hoặc từ chối (`REJECTED`) nhận file (mã hóa khóa phiên X25519). |
+| | `403` | `FILE_CHUNK` | Peer -> Peer | Mảnh dữ liệu file nhị phân (32 KB): Header JSON (`!I` + JSON) + Raw bytes (mã hóa toàn packet bằng khóa phiên X25519 tạm thời). |
+| | `404` | `FILE_ACK` | Peer -> Peer | Xác nhận hoàn tất nhận file & kiểm tra SHA-256 (`SUCCESS` hoặc `FAILED`), xóa khóa phiên ngay sau khi đóng kênh. |
+| | `405` | `PEER_HELLO` | Peer -> Peer | Bắt tay trực tiếp P2P (bọc bằng khóa chung AES): `{"sender", "protocol_version", "x25519_pub"}`. |
+| | `406` | `PEER_HELLO_ACK` | Peer -> Peer | Peer phản hồi `OK`/`REJECTED` kèm `x25519_pub` để hai bên tự dẫn xuất khóa AES phiên tạm (HKDF-SHA256). |
+| **Heartbeat** | `501` | `HEARTBEAT_PING` | Client -> Server | Gói tin nhịp tim kiểm tra liveness (chu kỳ 4.0s). |
+| | `502` | `HEARTBEAT_PONG` | Server -> Client | Gói tin phản hồi nhịp tim (`{"status": "ALIVE"}`). |
+| **Connection** | `601` | `DISCONNECT_NOTICE` | Client -> Server | Thông báo chủ động ngắt kết nối an toàn (Graceful Disconnect). |
+| | `602` | `ERROR_NOTICE` | Server -> Client | Thông báo lỗi hệ thống hoặc vi phạm giao thức (ví dụ `FILE_P2P_ONLY`). |
 
 ---
 
@@ -91,23 +95,23 @@ stateDiagram-v2
     [*] --> DISCONNECTED
     DISCONNECTED --> CONNECTING : Gọi connect(IP, Port)
     CONNECTING --> HANDSHAKING : TCP 3-Way Handshake OK
-    HANDSHAKING --> AUTHENTICATING : Gửi HELLO_HANDSHAKE / Nhận HANDSHAKE_ACK
-    HANDSHAKING --> DISCONNECTED : Nhận HANDSHAKE_REJECT hoặc Timeout
-    AUTHENTICATING --> ONLINE : Gửi AUTH_REQ / Nhận AUTH_RESP_SUCCESS
+    HANDSHAKING --> AUTHENTICATING : HELLO_HANDSHAKE / HANDSHAKE_ACK + Start P2P Listener
+    HANDSHAKING --> DISCONNECTED : HANDSHAKE_REJECT hoặc Timeout (10s Server / 5s Client)
+    AUTHENTICATING --> ONLINE : AUTH_REQ(username, p2p_port) / AUTH_RESP_SUCCESS
     AUTHENTICATING --> AUTHENTICATING : Nhận AUTH_RESP_FAIL (Nhập lại tên)
     AUTHENTICATING --> DISCONNECTED : Đóng kết nối
-    
+
     state ONLINE {
         [*] --> IDLE
-        IDLE --> CHATTING : Gửi/Nhận CHAT_BROADCAST / CHAT_DIRECT
+        IDLE --> CHATTING : Gửi/Nhận CHAT_BROADCAST / CHAT_DIRECT (qua Server)
         CHATTING --> IDLE
-        IDLE --> TRANSFERRING_FILE : Gửi/Nhận FILE_CHUNK
-        TRANSFERRING_FILE --> IDLE : Hoàn tất kiểm tra SHA-256
+        IDLE --> TRANSFERRING_FILE_P2P : PEER_LOOKUP_REQ -> TCP P2P (PEER_HELLO -> FILE_CHUNK -> FILE_ACK)
+        TRANSFERRING_FILE_P2P --> IDLE : Hoàn tất kiểm tra SHA-256 (hoặc báo lỗi nếu P2P thất bại)
     }
 
     ONLINE --> DISCONNECTING : Gửi DISCONNECT_NOTICE
-    DISCONNECTING --> DISCONNECTED : Đóng Socket TCP
-    ONLINE --> DISCONNECTED : Mất kết nối đột ngột (Broken Pipe / Timeout)
+    DISCONNECTING --> DISCONNECTED : Đóng Socket Server & Stop P2P Listener
+    ONLINE --> DISCONNECTED : Mất kết nối đột ngột (Broken Pipe / Zombie Timeout 15s)
 ```
 
 ---

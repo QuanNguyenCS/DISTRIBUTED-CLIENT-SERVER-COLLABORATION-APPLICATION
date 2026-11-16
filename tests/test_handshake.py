@@ -156,3 +156,110 @@ class TestClientServerHandshake:
         # Gọi stop lần nữa không gây lỗi
         server.stop()
         assert server.is_running is False
+
+    def test_server_rejects_corrupted_magic_bytes_during_handshake(self):
+        """Nếu client kết nối TCP rồi gửi byte rác không đúng chuẩn Magic Bytes, Server tự đóng kết nối an toàn."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        server.start()
+
+        result = {}
+
+        def server_worker():
+            sock, addr = server.accept_one()
+            result["sock"] = sock
+            result["addr"] = addr
+
+        sthread = threading.Thread(target=server_worker, daemon=True)
+        sthread.start()
+
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.connect(("127.0.0.1", port))
+        raw_sock.sendall(b"GARBAGE_BYTES_NOT_CA_PROTOCOL_HEADER")
+        raw_sock.close()
+
+        sthread.join(timeout=2.0)
+        server.stop()
+        assert result.get("sock") is None
+
+    def test_hello_non_dict_json_does_not_crash_server(self):
+        """F1: HELLO_HANDSHAKE chứa JSON hợp lệ không phải dict ([], null, 123) không làm sập Server."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        try:
+            for bad_payload in ([], b"null", b"12345", b"\xff\xfe\xfd"):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw_sock:
+                    raw_sock.settimeout(2.0)
+                    raw_sock.connect(("127.0.0.1", port))
+                    raw_sock.sendall(create_packet(MessageType.HELLO_HANDSHAKE, bad_payload))
+                    resp = recv_packet(raw_sock)
+                    assert resp.msg_type == MessageType.HANDSHAKE_REJECT
+
+            # Server vẫn còn sống và phục vụ Client bình thường ngay sau đó
+            assert server.is_running is True
+            assert sthread.is_alive() is True
+            client = ClientCore(server_host="127.0.0.1", server_port=port)
+            assert client.connect(timeout=2.0) is True
+            client.disconnect()
+        finally:
+            server.stop()
+            sthread.join(timeout=2.0)
+
+    def test_start_on_occupied_port_raises_without_deadlock(self):
+        """F2: ServerCore.start() trên cổng đã bị chiếm phải ném OSError ngay, không tự deadlock."""
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        occupied_port = blocker.getsockname()[1]
+
+        outcome = {}
+        done = threading.Event()
+
+        def try_start():
+            srv = ServerCore(host="127.0.0.1", port=occupied_port)
+            try:
+                srv.start()
+            except OSError as exc:
+                outcome["exc"] = exc
+            finally:
+                done.set()
+
+        try:
+            t = threading.Thread(target=try_start, daemon=True)
+            t.start()
+            assert done.wait(timeout=2.0) is True, "ServerCore.start() bị deadlock khi cổng đã bị chiếm!"
+            assert isinstance(outcome.get("exc"), OSError)
+        finally:
+            blocker.close()
+
+    def test_slow_handshake_does_not_block_next_client(self):
+        """F4: Một Client nối TCP rồi im lặng (hoặc gửi nhỏ giọt) không được chặn Client kế tiếp kết nối."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        server.HANDSHAKE_TIMEOUT = 3.0
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        slow_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        good_client = ClientCore(server_host="127.0.0.1", server_port=port)
+        try:
+            slow_sock.connect(("127.0.0.1", port))
+            # Gửi 4 byte lửng rồi im bặt
+            slow_sock.sendall(b"CA\x01\x00")
+
+            start_t = time.monotonic()
+            assert good_client.connect(timeout=1.5) is True
+            assert good_client.authenticate("FastClient", timeout=1.5)[0] is True
+            elapsed = time.monotonic() - start_t
+            assert elapsed < 1.5
+        finally:
+            slow_sock.close()
+            good_client.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+

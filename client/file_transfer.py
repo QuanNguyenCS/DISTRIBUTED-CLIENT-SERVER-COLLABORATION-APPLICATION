@@ -12,11 +12,12 @@ import hashlib
 import json
 import os
 import struct
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Generator, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Generator, Optional, Tuple
 
 from common.logger import get_logger
 
@@ -24,6 +25,29 @@ logger = get_logger("client.file")
 
 # Kích thước chuẩn mỗi chunk: 32 KB (32768 bytes)
 DEFAULT_CHUNK_SIZE: int = 32 * 1024
+# Giới hạn kích thước file P2P tối đa mặc định (2 GB)
+MAX_TRANSFER_FILE_SIZE: int = 2 * 1024 * 1024 * 1024
+# Khóa bảo vệ khi chọn tên file duy nhất để tránh ghi đè file tốt đang tồn tại
+_SAVE_PATH_LOCK = threading.Lock()
+
+
+def resolve_unique_save_path(save_path: str) -> str:
+    """
+    Trả về đường dẫn đích không ghi đè file tốt đang có sẵn trong thư mục tải về.
+    Ví dụ nếu 'report.pdf' đã tồn tại -> 'report (1).pdf'.
+    """
+    if not os.path.exists(save_path):
+        return save_path
+
+    parent = os.path.dirname(save_path)
+    base = os.path.basename(save_path)
+    stem, ext = os.path.splitext(base)
+    counter = 1
+    while True:
+        candidate = os.path.join(parent, f"{stem} ({counter}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
 
 
 def calculate_file_hash(file_path: str | Path) -> str:
@@ -96,7 +120,10 @@ def unpack_chunk_payload(payload: bytes) -> Tuple[Dict[str, any], bytes]:
 
 @dataclass
 class IncomingFileTransfer:
-    """Theo dõi tiến trình nhận một file từ người gửi."""
+    """
+    Theo dõi tiến trình nhận một file từ người gửi theo kiểu streaming thẳng xuống file tạm .part
+    để tiêu thụ RAM cố định O(1) và xác thực nghiêm ngặt index/size/SHA-256.
+    """
     file_id: str
     sender: str
     file_name: str
@@ -104,50 +131,114 @@ class IncomingFileTransfer:
     total_chunks: int
     expected_sha256: str
     save_path: str
-    received_chunks: Dict[int, bytes] = field(default_factory=dict)
+    received_chunks_count: int = 0
+    received_bytes: int = 0
     start_time: float = field(default_factory=time.time)
+    _temp_part_path: str = field(init=False)
+    _part_handle: Optional[BinaryIO] = field(default=None, init=False, repr=False)
+    _hasher: Any = field(default_factory=hashlib.sha256, init=False, repr=False)
+    _completed: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        if self.file_size < 0 or self.file_size > MAX_TRANSFER_FILE_SIZE:
+            raise ValueError(f"Kích thước file không hợp lệ: {self.file_size}")
+        if self.total_chunks < 1:
+            raise ValueError(f"Số lượng chunk không hợp lệ: {self.total_chunks}")
+        if self.file_size == 0 and self.total_chunks != 1:
+            raise ValueError("File 0-byte chỉ được phép có 1 chunk.")
+        if self.file_size > 0 and self.total_chunks > self.file_size:
+            raise ValueError("total_chunks vượt quá tổng số byte của file.")
+        if not isinstance(self.expected_sha256, str) or len(self.expected_sha256.strip()) != 64:
+            raise ValueError("Mã băm SHA-256 kỳ vọng không hợp lệ.")
+        try:
+            int(self.expected_sha256.strip(), 16)
+        except ValueError as exc:
+            raise ValueError("Mã băm SHA-256 không đúng định dạng hex.") from exc
+
+        self._temp_part_path = f"{self.save_path}.{self.file_id}.part"
 
     @property
     def progress_percentage(self) -> float:
         """Phần trăm hoàn thành từ 0.0 đến 100.0."""
         if self.total_chunks == 0:
             return 100.0
-        return (len(self.received_chunks) / self.total_chunks) * 100.0
+        return (self.received_chunks_count / self.total_chunks) * 100.0
+
+    def _close_handle(self) -> None:
+        if self._part_handle is not None:
+            try:
+                self._part_handle.close()
+            except OSError:
+                pass
+            finally:
+                self._part_handle = None
+
+    def cleanup(self) -> None:
+        """Đóng file handle tạm và xóa file .part còn sót lại nếu transfer chưa hoàn tất."""
+        self._close_handle()
+        if not self._completed:
+            try:
+                if os.path.exists(self._temp_part_path):
+                    os.remove(self._temp_part_path)
+            except OSError:
+                pass
 
     def add_chunk(self, chunk_index: int, chunk_data: bytes) -> bool:
-        """Lưu một mảnh chunk nhận được."""
-        self.received_chunks[chunk_index] = chunk_data
-        return len(self.received_chunks) == self.total_chunks
+        """Kiểm tra biên chunk_index/size và ghi streaming chunk trực tiếp xuống đĩa (.part)."""
+        if chunk_index < 0 or chunk_index >= self.total_chunks:
+            raise ValueError(f"chunk_index={chunk_index} nằm ngoài phạm vi [0, {self.total_chunks}).")
+        if chunk_index != self.received_chunks_count:
+            raise ValueError(
+                f"Chunk đến sai thứ tự hoặc bị trùng lặp: kỳ vọng {self.received_chunks_count}, nhận {chunk_index}."
+            )
+        if self.received_bytes + len(chunk_data) > self.file_size:
+            raise ValueError(
+                f"Tổng dung lượng chunk nhận ({self.received_bytes + len(chunk_data)}) vượt quá file_size ({self.file_size})."
+            )
+
+        if self._part_handle is None:
+            os.makedirs(os.path.dirname(os.path.abspath(self.save_path)), exist_ok=True)
+            self._part_handle = open(self._temp_part_path, "wb")
+
+        self._part_handle.write(chunk_data)
+        self._hasher.update(chunk_data)
+        self.received_chunks_count += 1
+        self.received_bytes += len(chunk_data)
+        return self.received_chunks_count == self.total_chunks
 
     def assemble_and_verify(self) -> Tuple[bool, str]:
         """
-        Ghép tất cả các chunk lại thành file hoàn chỉnh và kiểm tra mã băm SHA-256.
-        
-        Returns:
-            Tuple[bool, str]: (Thành công hay không, Thông báo kết quả / Lý do).
+        Đóng file tạm .part, kiểm tra đủ chunk/size/SHA-256 và đổi tên an toàn (không ghi đè file tốt).
         """
-        if len(self.received_chunks) != self.total_chunks:
-            return False, f"Chưa nhận đủ chunk: {len(self.received_chunks)}/{self.total_chunks}"
+        self._close_handle()
+        if self.received_chunks_count != self.total_chunks:
+            self.cleanup()
+            return False, f"Chưa nhận đủ chunk: {self.received_chunks_count}/{self.total_chunks}"
+        if self.received_bytes != self.file_size:
+            self.cleanup()
+            return False, f"Tổng dung lượng thực tế ({self.received_bytes}) không khớp file_size ({self.file_size})."
 
-        # Đảm bảo thư mục lưu file tồn tại
-        os.makedirs(os.path.dirname(os.path.abspath(self.save_path)), exist_ok=True)
-
-        # Ghi các chunk theo đúng thứ tự 0 -> total_chunks - 1
-        with open(self.save_path, "wb") as f:
-            for i in range(self.total_chunks):
-                chunk = self.received_chunks.get(i)
-                if chunk is None:
-                    return False, f"Thiếu mảnh chunk số {i}"
-                f.write(chunk)
-
-        # Tính lại SHA-256 để đối chiếu bit-by-bit
-        actual_sha256 = calculate_file_hash(self.save_path)
+        actual_sha256 = self._hasher.hexdigest()
         if actual_sha256.lower() != self.expected_sha256.lower():
-            return False, f"Mã băm SHA-256 không trùng khớp! Kỳ vọng {self.expected_sha256}, Thực tế {actual_sha256}."
+            self.cleanup()
+            return (
+                False,
+                f"Mã băm SHA-256 không trùng khớp! Kỳ vọng {self.expected_sha256}, Thực tế {actual_sha256}.",
+            )
+
+        try:
+            with _SAVE_PATH_LOCK:
+                final_path = resolve_unique_save_path(self.save_path)
+                os.replace(self._temp_part_path, final_path)
+                self.save_path = final_path
+                self._completed = True
+        except OSError as err:
+            self.cleanup()
+            return False, f"Không thể lưu file hoàn chỉnh xuống đĩa: {err}"
 
         logger.info(
-            "✅ File '%s' đã được ghép và xác thực SHA-256 thành công (%s bytes).",
-            self.file_name,
+            "✅ File '%s' đã được ghi và xác thực SHA-256 thành công (%s bytes).",
+            os.path.basename(self.save_path),
             self.file_size,
         )
         return True, "File toàn vẹn 100%."

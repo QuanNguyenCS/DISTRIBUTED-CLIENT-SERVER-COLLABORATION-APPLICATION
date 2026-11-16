@@ -24,16 +24,19 @@ class TestGuiComponents(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            cls.root = tk.Tk()
-            cls.root.withdraw()  # Ẩn cửa sổ khi chạy test
+            cls.app = CollabChatApp()
+            cls.app.withdraw()  # Ẩn cửa sổ khi chạy test
+            cls.root = cls.app
         except tk.TclError:
             # Môi trường không có DISPLAY / headless
+            cls.app = None
             cls.root = None
 
     @classmethod
     def tearDownClass(cls):
-        if cls.root:
-            cls.root.destroy()
+        if cls.app:
+            cls.app.destroy()
+            cls.app = None
             cls.root = None
         gc.collect()
 
@@ -66,7 +69,7 @@ class TestGuiComponents(unittest.TestCase):
         # Nhập username hợp lệ và submit
         login_view.user_var.set("TestUser")
         login_view._on_submit()
-        cb_mock.assert_called_once_with("127.0.0.1", 9000, "TestUser", None)
+        cb_mock.assert_called_once_with("127.0.0.1", 9000, "TestUser")
         login_view.destroy()
 
     def test_chat_view_tabs_and_messages(self):
@@ -163,9 +166,61 @@ class TestGuiComponents(unittest.TestCase):
 
     def test_collab_chat_app_initialization(self):
         """Khởi tạo App root window."""
-        app = CollabChatApp()
+        self.app._show_login_view()
+        self.app.update_idletasks()
+        self.assertIsNotNone(self.app.login_view)
+
+    def test_gui_queue_event_dispatching(self):
+        """Kiểm tra cơ chế Producer-Consumer Queue (_process_gui_queue & _dispatch_gui_event) xử lý sự kiện mạng an toàn."""
+        app = self.app
+        app.current_username = "Alice"
+        app.gui_queue.put(("login_success", "Alice"))
+        app._process_gui_queue()
         app.update_idletasks()
-        self.assertIsNotNone(app.login_view)
-        app.destroy()
-        del app
-        gc.collect()
+        self.assertIsNotNone(app.chat_view)
+
+        # 1. Nhận tin nhắn Broadcast qua gui_queue
+        app.gui_queue.put(
+            ("chat_broadcast", {"sender": "Bob", "content": "Hello qua Queue!", "timestamp": 1710000000.0})
+        )
+        # 2. Nhận tin nhắn Direct 1-1 qua gui_queue -> tự tạo tab user_bob
+        app.gui_queue.put(
+            ("chat_direct", {"sender": "Bob", "recipient": "Alice", "content": "Tin riêng qua Queue", "timestamp": 1710000005.0})
+        )
+        # 3. Nhận thông báo file lỗi (P2P fail) qua gui_queue -> hiện cảnh báo trong tab user_bob
+        app.gui_queue.put(
+            ("file_send_finished", ("fid01", False, "Không thể kết nối P2P", "Bob", "report.pdf"))
+        )
+        # 4. Nhận sự kiện user_status (JOINED rồi LEFT) -> Listbox tự động cập nhật không cần bấm Làm mới
+        app.gui_queue.put(
+            ("user_status", {"event": "JOINED", "username": "Bob", "online_users": ["Alice", "Bob"]})
+        )
+        app._process_gui_queue()
+        app.update_idletasks()
+        self.assertEqual(app.chat_view.online_users_list, ["Alice", "Bob"])
+
+        app.gui_queue.put(
+            ("user_status", {"event": "LEFT", "username": "Bob", "online_users": ["Alice"]})
+        )
+        app._process_gui_queue()
+        app.update_idletasks()
+        self.assertEqual(app.chat_view.online_users_list, ["Alice"])
+
+        global_text = app.chat_view.chat_tabs["global"].get("1.0", tk.END)
+        self.assertIn("Hello qua Queue!", global_text)
+
+        self.assertIn("user_bob", app.chat_view.chat_tabs)
+        bob_tab_text = app.chat_view.chat_tabs["user_bob"].get("1.0", tk.END)
+        self.assertIn("Tin riêng qua Queue", bob_tab_text)
+        self.assertIn("report.pdf", bob_tab_text)
+        self.assertIn("thất bại", bob_tab_text)
+
+        # F13: Đăng xuất -> reset chat_view = None; các gói tin đến muộn qua queue không làm văng TclError
+        app._on_logout()
+        self.assertIsNone(app.chat_view)
+        app.gui_queue.put(("chat_broadcast", {"sender": "LateUser", "content": "Late msg"}))
+        app.gui_queue.put(("user_status", {"event": "LEFT", "username": "Bob", "online_users": []}))
+        app._process_gui_queue()
+        app.update_idletasks()
+
+

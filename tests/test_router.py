@@ -125,10 +125,11 @@ class TestMessageRoutingIntegration:
         assert charlie_directs[0]["recipient"] == "Charlie"
         assert charlie_directs[0]["content"] == secret_text
 
-        # 2. Bob nhận được CHAT_ACK xác nhận tin nhắn đã tới tay Charlie
+        # 2. Bob nhận được CHAT_ACK xác nhận tin nhắn đã tới tay Charlie (F5: không lặp bản rõ content)
         assert len(bob_acks) == 1
         assert bob_acks[0]["status"] == "DELIVERED"
         assert bob_acks[0]["recipient"] == "Charlie"
+        assert "content" not in bob_acks[0]
 
         # 3. Alice KHÔNG HỀ nhận được bất kỳ tin nhắn riêng nào
         assert len(alice_directs) == 0
@@ -197,3 +198,38 @@ class TestMessageRoutingIntegration:
         client.disconnect()
         server.stop()
         sthread.join(timeout=2.0)
+
+    def test_direct_message_case_insensitive_recipient(self):
+        """Gửi tin nhắn riêng tới tên viết hoa/thường bất kỳ ('cHaRlIe') vẫn định tuyến chính xác tới 'Charlie'."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        bob = ClientCore(server_host="127.0.0.1", server_port=port)
+        charlie = ClientCore(server_host="127.0.0.1", server_port=port)
+
+        try:
+            assert bob.connect() and bob.authenticate("BobSender")[0]
+            assert charlie.connect() and charlie.authenticate("CharlieTarget")[0]
+
+            received_event = threading.Event()
+            charlie_msgs = []
+            charlie.register_callback(
+                MessageType.CHAT_DIRECT,
+                lambda pkt: (charlie_msgs.append(pkt.to_json()), received_event.set()),
+            )
+
+            assert bob.send_direct_message(recipient="charlietarget", content="Khong phan biet hoa thuong") is True
+            assert received_event.wait(timeout=2.0) is True
+            assert len(charlie_msgs) == 1
+            assert charlie_msgs[0]["sender"] == "BobSender"
+            assert charlie_msgs[0]["recipient"] == "CharlieTarget"
+            assert charlie_msgs[0]["content"] == "Khong phan biet hoa thuong"
+        finally:
+            bob.disconnect()
+            charlie.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+

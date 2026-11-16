@@ -80,7 +80,7 @@ class ChatView(ttk.Frame):
         )
         user_badge.pack(anchor=tk.W)
 
-        enc_text = "🔒 Bảo mật AES-256" if self.is_encrypted else "🔓 Không mã hóa"
+        enc_text = "🔒 AES + P2P X25519 tự động" if self.is_encrypted else "🔓 Không mã hóa"
         enc_color = "#2E7D32" if self.is_encrypted else "#757575"
         self.enc_lbl = ttk.Label(
             my_card,

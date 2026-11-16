@@ -53,6 +53,8 @@ class CollabChatApp(tk.Tk):
 
         # Quản lý các hộp thoại tiến trình file: file_id -> FileProgressDialog
         self.file_dialogs: Dict[str, FileProgressDialog] = {}
+        self.download_dialogs_by_key: Dict[tuple, FileProgressDialog] = {}
+        self._session_generation: int = 0
 
         # Hiển thị màn hình đăng nhập đầu tiên
         self._show_login_view()
@@ -79,8 +81,18 @@ class CollabChatApp(tk.Tk):
 
     def _show_login_view(self) -> None:
         """Hiển thị khung giao diện đăng nhập."""
+        for dlg in list(self.file_dialogs.values()):
+            try:
+                if dlg.winfo_exists():
+                    dlg.destroy()
+            except Exception:
+                pass
+        self.file_dialogs.clear()
+        self.download_dialogs_by_key.clear()
+
         if self.current_view:
             self.current_view.destroy()
+        self.chat_view = None
 
         self.login_view = LoginView(self, on_connect=self._handle_login_request)
         self.login_view.pack(fill=tk.BOTH, expand=True)
@@ -90,6 +102,7 @@ class CollabChatApp(tk.Tk):
         """Chuyển sang khung giao diện phòng chat sau khi xác thực thành công."""
         if self.current_view:
             self.current_view.destroy()
+        self.login_view = None
 
         self.chat_view = ChatView(
             self,
@@ -116,7 +129,6 @@ class CollabChatApp(tk.Tk):
         host: str,
         port: int,
         username: str,
-        passphrase: Optional[str] = None,
     ) -> None:
         """Chạy việc kết nối và xác thực trên background thread để không đơ UI."""
         def worker():
@@ -126,12 +138,7 @@ class CollabChatApp(tk.Tk):
                     server_port=port,
                     client_name=username,
                 )
-
-                if passphrase:
-                    client.enable_encryption(passphrase)
-                    self.is_encrypted = True
-                else:
-                    self.is_encrypted = False
+                self.is_encrypted = client.crypto_key is not None
 
                 # Đăng ký các callback để đẩy gói tin vào gui_queue
                 self._bind_client_callbacks(client)
@@ -191,6 +198,12 @@ class CollabChatApp(tk.Tk):
         client.register_callback(MessageType.ERROR_NOTICE, on_error)
 
         # Hook nhận file và thông báo lỗi / mất kết nối
+        def on_file_incoming_start(file_id: str, sender: str, file_name: str, file_size: int, total_chunks: int):
+            self.gui_queue.put(("incoming_file_start", (file_id, sender, file_name, file_size, total_chunks)))
+
+        def on_file_progress(file_id: str, received: int, total: int, pct: float):
+            self.gui_queue.put(("file_progress_update", (file_id, received, total, pct)))
+
         def on_file_received_done(sender: str, file_name: str, save_path: str):
             self.gui_queue.put(("incoming_file_done", (sender, file_name, save_path)))
 
@@ -200,6 +213,8 @@ class CollabChatApp(tk.Tk):
         def on_disconnected(reason: str):
             self.gui_queue.put(("disconnected", reason))
 
+        client.on_file_incoming_start = on_file_incoming_start
+        client.on_file_progress = on_file_progress
         client.on_file_received = on_file_received_done
         client.on_file_error = on_file_error
         client.on_disconnected = on_disconnected
@@ -269,10 +284,12 @@ class CollabChatApp(tk.Tk):
         elif event_type == "user_status":
             event_name = data.get("event")
             username = data.get("username")
-            online_users = data.get("online_users", [])
+            online_users = data.get("online_users")
+            if online_users is None and self.client is not None:
+                online_users = list(self.client.online_users)
 
             if self.chat_view:
-                if online_users:
+                if isinstance(online_users, list):
                     self.chat_view.update_online_users(online_users)
 
                 msg = (
@@ -304,6 +321,20 @@ class CollabChatApp(tk.Tk):
             else:
                 messagebox.showerror("Thông báo lỗi", msg)
 
+        elif event_type == "incoming_file_start":
+            file_id, sender, file_name, file_size, total_chunks = data
+            if self.chat_view and self.chat_view.winfo_exists():
+                dlg = FileProgressDialog(
+                    parent=self,
+                    title=f"Nhận tập tin từ @{sender}",
+                    file_name=file_name,
+                    file_size=file_size,
+                    total_chunks=total_chunks,
+                    direction="download",
+                )
+                self.file_dialogs[file_id] = dlg
+                self.download_dialogs_by_key[(sender, file_name)] = dlg
+
         elif event_type == "file_progress_update":
             file_id, sent, total, pct = data
             dlg = self.file_dialogs.get(file_id)
@@ -315,7 +346,7 @@ class CollabChatApp(tk.Tk):
             dlg = self.file_dialogs.pop(file_id, None)
             if dlg and dlg.winfo_exists():
                 dlg.set_completed(success, message)
-            if self.chat_view:
+            if self.chat_view and self.chat_view.winfo_exists():
                 tab_id = f"user_{target_user.lower()}"
                 self.chat_view.get_or_create_direct_tab(target_user)
                 if success:
@@ -336,7 +367,10 @@ class CollabChatApp(tk.Tk):
 
         elif event_type == "incoming_file_done":
             sender, file_name, save_path = data
-            if self.chat_view:
+            dlg = self.download_dialogs_by_key.pop((sender, file_name), None)
+            if dlg and dlg.winfo_exists():
+                dlg.set_completed(True, f"Đã lưu tại: {save_path}")
+            if self.chat_view and self.chat_view.winfo_exists():
                 tab_id = f"user_{sender.lower()}"
                 self.chat_view.get_or_create_direct_tab(sender)
                 self.chat_view.append_message(
@@ -354,8 +388,11 @@ class CollabChatApp(tk.Tk):
 
         elif event_type == "file_error":
             sender, file_name, reason = data
+            dlg = self.download_dialogs_by_key.pop((sender, file_name), None)
+            if dlg and dlg.winfo_exists():
+                dlg.set_completed(False, reason)
             err_msg = f"Nhận file '{file_name}' từ @{sender} thất bại: {reason}"
-            if self.chat_view:
+            if self.chat_view and self.chat_view.winfo_exists():
                 tab_id = f"user_{sender.lower()}"
                 self.chat_view.get_or_create_direct_tab(sender)
                 self.chat_view.append_message(
@@ -375,7 +412,7 @@ class CollabChatApp(tk.Tk):
 
         elif event_type == "disconnected":
             reason = data or "Kết nối tới Server đã bị ngắt."
-            if self.chat_view:
+            if self.chat_view and self.chat_view.winfo_exists():
                 self.chat_view.append_message(
                     tab_id="global",
                     sender="Cảnh báo",
@@ -419,7 +456,9 @@ class CollabChatApp(tk.Tk):
         total_chunks = max(1, (file_size + chunk_size - 1) // chunk_size)
         file_id = f"{self.current_username}_{int(time.time() * 1000)}"
 
-        # Mở hộp thoại popup tiến trình
+        cancel_event = threading.Event()
+
+        # Mở hộp thoại popup tiến trình có hỗ trợ nút Hủy truyền thật sự
         dlg = FileProgressDialog(
             parent=self,
             title=f"Gửi tập tin tới @{recipient}",
@@ -427,6 +466,7 @@ class CollabChatApp(tk.Tk):
             file_size=file_size,
             total_chunks=total_chunks,
             direction="upload",
+            on_cancel=cancel_event.set,
         )
         self.file_dialogs[file_id] = dlg
 
@@ -440,6 +480,7 @@ class CollabChatApp(tk.Tk):
                     file_path=file_path,
                     progress_callback=progress_cb,
                     timeout=60.0,
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 ok, msg = False, f"Lỗi khi gửi file: {exc}"
@@ -457,10 +498,12 @@ class CollabChatApp(tk.Tk):
             ).start()
 
     def _on_logout(self) -> None:
-        if self.client:
-            self.client.disconnect()
-            self.client = None
+        old_client = self.client
+        self.client = None
+        self.current_username = ""
         self._show_login_view()
+        if old_client:
+            threading.Thread(target=old_client.disconnect, daemon=True).start()
 
     def _on_window_close(self) -> None:
         """Đóng ứng dụng an toàn khi người dùng bấm nút [X]."""

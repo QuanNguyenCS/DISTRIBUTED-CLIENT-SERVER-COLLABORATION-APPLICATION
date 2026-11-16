@@ -64,9 +64,12 @@ def handle_incoming_packet(packet: Packet) -> None:
         try:
             data = packet.to_json()
             recipient = data.get("recipient", "")
-            content = data.get("content", "")
+            content = data.get("content")
             ts_str = format_ts(data.get("timestamp"))
-            print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: {content}\n> ", end="", flush=True)
+            if content:
+                print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: {content}\n> ", end="", flush=True)
+            else:
+                print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: Đã chuyển tới người nhận.\n> ", end="", flush=True)
         except Exception:
             pass
 
@@ -121,12 +124,6 @@ def main() -> None:
         help="Tên đăng nhập của người dùng (3-20 ký tự, không dấu cách)",
     )
     parser.add_argument(
-        "--passphrase",
-        type=str,
-        default=None,
-        help="Mật khẩu mã hóa AES phòng chat (nếu có)",
-    )
-    parser.add_argument(
         "--p2p-port",
         type=int,
         default=0,
@@ -145,8 +142,7 @@ def main() -> None:
         client_name=args.username or "Guest-Client",
         p2p_port=args.p2p_port,
     )
-    if args.passphrase:
-        client.enable_encryption(args.passphrase)
+    logger.info("🔒 Mã hóa tự động AES (Server) + X25519 tạm thời (P2P File) đang bật.")
 
     # Đăng ký callbacks xử lý các sự kiện đến từ Server
     client.register_callback(MessageType.CHAT_BROADCAST, handle_incoming_packet)

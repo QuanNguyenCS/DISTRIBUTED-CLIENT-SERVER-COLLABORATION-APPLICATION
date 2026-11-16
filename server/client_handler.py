@@ -57,10 +57,15 @@ class ClientHandler(threading.Thread):
         self.client_sock = client_sock
         self.client_addr = client_addr
         self.server = server
-        self.client_info = client_info or {}
-        self.client_name: str = self.client_info.get("client_name", f"User@{client_addr[1]}")
+        self.client_info = client_info if isinstance(client_info, dict) else {}
+        raw_name = self.client_info.get("client_name")
+        self.client_name: str = (
+            raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else f"User@{client_addr[1]}"
+        )
         self.is_running: bool = False
         self._send_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closed: bool = False
 
         # Quản lý xác thực và danh tính người dùng
         self.is_authenticated: bool = False
@@ -86,16 +91,25 @@ class ClientHandler(threading.Thread):
             while self.is_running:
                 # Đọc gói tin hoàn chỉnh theo chuẩn Application Layer Framing
                 packet = recv_packet(self.client_sock)
+                was_encrypted = packet.is_encrypted
                 if packet.is_encrypted and self.server.crypto_key is not None:
                     try:
                         packet = packet.get_decrypted_packet(self.server.crypto_key)
                     except InvalidToken:
                         logger.warning(
-                            "⚠️ [%s:%d] Không thể giải mã gói tin bằng khóa Server (Client dùng khóa E2EE riêng?).",
+                            "⚠️ [%s:%d] Không thể giải mã gói tin bằng khóa Server (sai mật khẩu phòng).",
                             self.client_addr[0],
                             self.client_addr[1],
                         )
-                self._dispatch_packet(packet)
+                        self.send_packet(
+                            MessageType.ERROR_NOTICE,
+                            {
+                                "code": "DECRYPTION_FAILED",
+                                "message": "Không thể giải mã gói tin: Mật khẩu phòng (AES) không khớp với Server.",
+                            },
+                        )
+                        continue
+                self._dispatch_packet(packet, was_encrypted=was_encrypted)
 
         except ConnectionClosedError:
             logger.info(
@@ -131,7 +145,7 @@ class ClientHandler(threading.Thread):
         finally:
             self.close()
 
-    def _dispatch_packet(self, packet: Packet) -> None:
+    def _dispatch_packet(self, packet: Packet, was_encrypted: bool = False) -> None:
         """
         Phân loại và điều hướng xử lý gói tin nhận được.
         """
@@ -145,6 +159,55 @@ class ClientHandler(threading.Thread):
             msg_type,
             len(packet.payload),
         )
+
+        # Auth Gate (F3): Chỉ cho phép AUTH_REQ, HEARTBEAT và DISCONNECT_NOTICE khi chưa đăng nhập
+        if not self.is_authenticated and msg_type not in (
+            MessageType.AUTH_REQ,
+            MessageType.HEARTBEAT_PING,
+            MessageType.HEARTBEAT_PONG,
+            MessageType.DISCONNECT_NOTICE,
+        ):
+            logger.warning(
+                "⛔ [%s:%d] Từ chối gói tin %s vì Client chưa xác thực (AUTH_REQ).",
+                self.client_addr[0],
+                self.client_addr[1],
+                msg_type,
+            )
+            self.send_packet(
+                MessageType.ERROR_NOTICE,
+                {
+                    "code": "AUTH_REQUIRED",
+                    "message": "Vui lòng đăng nhập (AUTH_REQ) trước khi thực hiện thao tác này.",
+                },
+            )
+            return
+
+        # Anti-Downgrade Gate (F6 + Cách 1): Khi Server bật AES, chặn mọi gói nghiệp vụ gửi bản rõ
+        if (
+            self.server.crypto_key is not None
+            and not was_encrypted
+            and msg_type in (
+                MessageType.AUTH_REQ,
+                MessageType.USER_LIST_REQ,
+                MessageType.PEER_LOOKUP_REQ,
+                MessageType.CHAT_BROADCAST,
+                MessageType.CHAT_DIRECT,
+            )
+        ):
+            logger.warning(
+                "🔒⛔ [%s:%d] Từ chối gói tin %s dạng bản rõ vì Server đang bắt buộc mã hóa AES.",
+                self.client_addr[0],
+                self.client_addr[1],
+                msg_type,
+            )
+            self.send_packet(
+                MessageType.ERROR_NOTICE,
+                {
+                    "code": "ENCRYPTION_REQUIRED",
+                    "message": "Server đang bật mã hóa AES phòng chat: gói tin bắt buộc phải được mã hóa.",
+                },
+            )
+            return
 
         if msg_type == MessageType.DISCONNECT_NOTICE:
             logger.info(
@@ -204,19 +267,11 @@ class ClientHandler(threading.Thread):
                 }
                 self.send_packet(MessageType.AUTH_RESP_SUCCESS, success_payload)
 
-                # Phát thông báo cho tất cả client khác biết có người vừa tham gia
-                join_broadcast: Dict[str, Any] = {
-                    "event": "JOINED",
-                    "username": self.username,
-                    "online_count": self.server.session_mgr.get_user_count(),
-                    "timestamp": time.time(),
-                }
-                if session.p2p_port is not None:
-                    join_broadcast["peer"] = session.to_peer_dict()
-                self.server.broadcast_packet(
-                    MessageType.USER_STATUS_BROADCAST,
-                    join_broadcast,
-                    exclude_addr=self.client_addr,
+                # Phát thông báo cho tất cả client khác biết có người vừa tham gia kèm danh sách online
+                self._broadcast_user_status(
+                    event="JOINED",
+                    username=self.username,
+                    peer=session.to_peer_dict() if session.p2p_port is not None else None,
                 )
 
         elif msg_type == MessageType.USER_LIST_REQ:
@@ -311,6 +366,7 @@ class ClientHandler(threading.Thread):
                 self.server.broadcast_packet(
                     MessageType.CHAT_BROADCAST,
                     packet.payload,
+                    only_authenticated=True,
                     flags=packet.flags,
                 )
                 return
@@ -424,8 +480,14 @@ class ClientHandler(threading.Thread):
                 self.server.crypto_key is not None
                 and not (flags & FLAG_ENCRYPTED)
                 and int(msg_type) in (
+                    MessageType.AUTH_RESP_SUCCESS,
+                    MessageType.AUTH_RESP_FAIL,
+                    MessageType.USER_LIST_RESP,
+                    MessageType.USER_STATUS_BROADCAST,
+                    MessageType.PEER_LOOKUP_RESP,
                     MessageType.CHAT_BROADCAST,
                     MessageType.CHAT_DIRECT,
+                    MessageType.CHAT_ACK,
                 )
             )
             packet_bytes = create_packet(
@@ -448,10 +510,43 @@ class ClientHandler(threading.Thread):
             self.is_running = False
             return False
 
+    def _broadcast_user_status(
+        self,
+        event: str,
+        username: str,
+        peer: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Phát thanh sự kiện JOINED/LEFT kèm danh sách online và danh bạ P2P mới nhất
+        tới toàn bộ các client khác đang kết nối.
+        """
+        online_users = self.server.session_mgr.get_all_users()
+        payload: Dict[str, Any] = {
+            "event": event,
+            "username": username,
+            "online_users": online_users,
+            "peers": self.server.session_mgr.get_all_peer_endpoints(),
+            "online_count": len(online_users),
+            "timestamp": time.time(),
+        }
+        if peer is not None:
+            payload["peer"] = peer
+        self.server.broadcast_packet(
+            MessageType.USER_STATUS_BROADCAST,
+            payload,
+            exclude_addr=self.client_addr,
+            only_authenticated=True,
+        )
+
     def close(self) -> None:
         """
-        Đóng socket và hủy đăng ký khỏi ServerCore và SessionManager.
+        Đóng socket và hủy đăng ký khỏi ServerCore và SessionManager (Idempotent & Thread-Safe).
         """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+
         self.is_running = False
         if self.client_sock:
             try:
@@ -461,39 +556,19 @@ class ClientHandler(threading.Thread):
             finally:
                 self.client_sock = None
 
-        # 1. Hủy đăng ký phiên người dùng nếu đã đăng nhập và phát thanh thông báo LEFT
+        # 1. Hủy đăng ký phiên người dùng nếu đã đăng nhập và phát thanh thông báo LEFT (tránh trùng lặp)
         if self.is_authenticated and self.username:
             username_left = self.username
-            self.server.session_mgr.unregister_user(username_left)
             self.is_authenticated = False
             self.username = None
-
-            left_broadcast = {
-                "event": "LEFT",
-                "username": username_left,
-                "online_count": self.server.session_mgr.get_user_count(),
-                "timestamp": time.time(),
-            }
-            self.server.broadcast_packet(
-                MessageType.USER_STATUS_BROADCAST,
-                left_broadcast,
-                exclude_addr=self.client_addr,
-            )
+            removed = self.server.session_mgr.unregister_user(username_left)
+            if removed:
+                self._broadcast_user_status(event="LEFT", username=removed.username)
         else:
             # Dự phòng: Hủy theo handler nếu có
             removed_session = self.server.session_mgr.unregister_by_handler(self)
             if removed_session:
-                left_broadcast = {
-                    "event": "LEFT",
-                    "username": removed_session.username,
-                    "online_count": self.server.session_mgr.get_user_count(),
-                    "timestamp": time.time(),
-                }
-                self.server.broadcast_packet(
-                    MessageType.USER_STATUS_BROADCAST,
-                    left_broadcast,
-                    exclude_addr=self.client_addr,
-                )
+                self._broadcast_user_status(event="LEFT", username=removed_session.username)
 
         # 2. Báo cho Server dọn dẹp handler này khỏi danh sách quản lý
         self.server.unregister_handler(self.client_addr)

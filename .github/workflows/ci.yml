@@ -41,7 +41,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt "pytest>=8.0.0"
 
       - name: Run tests on Linux (with virtual display Xvfb)
         if: runner.os == 'Linux'

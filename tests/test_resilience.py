@@ -66,19 +66,41 @@ class TestNetworkResilience:
         time.sleep(0.3)
 
         client = ClientCore(server_host="127.0.0.1", server_port=port)
+        observer = ClientCore(server_host="127.0.0.1", server_port=port)
+        observer.heartbeat_interval = 0.3
 
-        # Tắt heartbeat để mô phỏng client bị đóng băng hoặc ngắt card mạng ngầm
+        # Observer bật heartbeat để sống, còn ZombieClient tắt heartbeat để mô phỏng đứt mạng ngầm
+        assert observer.connect(start_heartbeat=True) is True
+        assert observer.authenticate("ObserverPeer")[0] is True
+
+        left_events = []
+        left_event_signal = threading.Event()
+
+        def on_status(pkt):
+            data = pkt.to_json()
+            if data.get("event") == "LEFT" and data.get("username") == "ZombieClient":
+                left_events.append(data)
+                left_event_signal.set()
+
+        observer.register_callback(MessageType.USER_STATUS_BROADCAST, on_status)
+
         assert client.connect(start_heartbeat=False) is True
         assert client.authenticate("ZombieClient")[0] is True
         assert server.session_mgr.is_online("ZombieClient") is True
 
-        # Chờ 2 giây (vượt quá zombie_timeout 1.0s)
-        time.sleep(2.0)
+        # Chờ ZombieCleaner quét và phát thông báo LEFT cho ObserverPeer
+        assert left_event_signal.wait(timeout=2.5) is True
 
-        # ZombieCleanerThread phải tự động đóng socket và xóa khỏi danh sách online
+        # ZombieCleanerThread phải tự động đóng socket, xóa khỏi danh sách online và gửi danh sách mới cho các peer còn lại
         assert server.session_mgr.is_online("ZombieClient") is False
-        assert server.get_active_client_count() == 0
+        assert server.get_active_client_count() == 1
+        assert len(left_events) == 1
+        assert left_events[0]["online_users"] == ["ObserverPeer"]
+        assert "ZombieClient" not in left_events[0].get("peers", {})
+        assert observer.online_users == ["ObserverPeer"]
+        assert "ZombieClient" not in observer.peer_directory
 
+        observer.disconnect()
         client.disconnect()
         server.stop()
         sthread.join(timeout=2.0)
@@ -115,3 +137,38 @@ class TestNetworkResilience:
         alice.disconnect()
         server.stop()
         sthread.join(timeout=2.0)
+
+    def test_received_queue_disabled_by_default_and_disconnect_resets_state(self):
+        """F10 & F12: received_queue không tích lũy RAM mặc định; khi Server sập client dọn sạch state & đánh thức waiter."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        alice = ClientCore(server_host="127.0.0.1", server_port=port)
+        disc_event = threading.Event()
+        disc_reasons = []
+        alice.on_disconnected = lambda r: (disc_reasons.append(r), disc_event.set())
+
+        try:
+            assert alice.connect() and alice.authenticate("AliceReset")[0]
+            alice.send_broadcast("Msg 1")
+            alice.send_broadcast("Msg 2")
+            time.sleep(0.2)
+            # F10: Mặc định callbacks đã chạy mà received_queue không phình bộ nhớ
+            assert alice.received_queue.qsize() == 0
+
+            # F12: Tắt Server đột ngột -> Client tự động reset trạng thái sạch sẽ và kích hoạt on_disconnected
+            server.stop()
+            sthread.join(timeout=2.0)
+            assert disc_event.wait(timeout=2.0) is True
+            assert len(disc_reasons) == 1
+            assert alice.is_connected is False
+            assert alice.is_authenticated is False
+            assert alice.username is None
+            assert alice.online_users == []
+            assert alice.p2p_port is None
+        finally:
+            alice.disconnect()
+            server.stop()

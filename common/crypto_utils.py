@@ -8,31 +8,94 @@ ngăn chặn kẻ xấu nghe lén gói tin trên mạng (Packet Sniffing / Wires
 from __future__ import annotations
 
 import base64
+from functools import lru_cache
 import os
-from typing import Union
+from typing import Optional, Tuple, Union
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Khóa bí mật mặc định dùng chung cho ứng dụng (Pre-Shared Key)
+# Biến môi trường cấu hình khóa AES dùng chung toàn hệ thống (Server <-> Clients)
+ENV_AES_KEY_VAR: str = "COLLAB_AES_KEY"
 DEFAULT_SHARED_SECRET: str = "CollabSecretKey2026@SecureNetworkApplication"
 DEFAULT_SALT: bytes = b"collab_distributed_app_salt_2026"
+_P2P_HKDF_INFO: bytes = b"collab-p2p-file-session-v1"
 
 
-def derive_key(passphrase: str = DEFAULT_SHARED_SECRET, salt: bytes = DEFAULT_SALT) -> bytes:
-    """
-    Sinh khóa bảo mật 32-bytes chuẩn URL-safe Base64 từ mật khẩu văn bản
-    bằng thuật toán KDF (PBKDF2HMAC với 100,000 vòng lặp băm SHA-256).
-    """
+@lru_cache(maxsize=32)
+def _derive_key_cached(passphrase: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
         iterations=100_000,
     )
-    key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
-    return key
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+def derive_key(passphrase: str = DEFAULT_SHARED_SECRET, salt: bytes = DEFAULT_SALT) -> bytes:
+    """
+    Sinh khóa bảo mật 32-bytes chuẩn URL-safe Base64 từ chuỗi mật khẩu
+    bằng thuật toán KDF (PBKDF2HMAC với 100,000 vòng lặp băm SHA-256).
+    """
+    return _derive_key_cached(passphrase, salt)
+
+
+def get_shared_app_key(secret_or_key: Optional[str] = None) -> bytes:
+    """
+    Lấy khóa AES-Fernet dùng chung toàn hệ thống theo thứ tự ưu tiên:
+      1. Tham số truyền trực tiếp (nếu có)
+      2. Biến môi trường COLLAB_AES_KEY
+      3. Khóa mặc định sẵn có của ứng dụng (zero-config trên LAN)
+    Hỗ trợ cả chuỗi Fernet key 44 ký tự sẵn lẫn chuỗi bí mật bất kỳ (tự dẫn xuất qua PBKDF2).
+    """
+    raw_value = (secret_or_key if secret_or_key is not None else os.environ.get(ENV_AES_KEY_VAR, "")).strip()
+    if not raw_value:
+        return derive_key(DEFAULT_SHARED_SECRET)
+
+    try:
+        candidate = raw_value.encode("ascii")
+        Fernet(candidate)
+        return candidate
+    except Exception:
+        return derive_key(raw_value)
+
+
+def generate_ephemeral_x25519_keypair() -> Tuple[x25519.X25519PrivateKey, str]:
+    """
+    Sinh cặp khóa bất đối xứng X25519 tạm thời (ephemeral) cho mỗi phiên truyền file P2P.
+    Returns:
+        Tuple[X25519PrivateKey, str]: (private_key giữ trong RAM, public_key base64 gửi qua mạng).
+    """
+    priv_key = x25519.X25519PrivateKey.generate()
+    pub_bytes = priv_key.public_key().public_bytes_raw()
+    pub_b64 = base64.b64encode(pub_bytes).decode("ascii")
+    return priv_key, pub_b64
+
+
+def derive_p2p_session_key(
+    private_key: x25519.X25519PrivateKey,
+    peer_public_b64: str,
+) -> bytes:
+    """
+    Tính toán khóa phiên AES-Fernet tạm thời (chỉ dùng cho 1 phiên P2P duy nhất)
+    từ khóa bí mật X25519 cục bộ và khóa công khai X25519 của đối phương qua HKDF-SHA256.
+    """
+    peer_pub_raw = base64.b64decode(peer_public_b64.encode("ascii"), validate=True)
+    if len(peer_pub_raw) != 32:
+        raise ValueError("Khóa công khai X25519 phải có độ dài chính xác 32 bytes.")
+    peer_pub = x25519.X25519PublicKey.from_public_bytes(peer_pub_raw)
+    shared_secret = private_key.exchange(peer_pub)
+    derived = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=_P2P_HKDF_INFO,
+    ).derive(shared_secret)
+    return base64.urlsafe_b64encode(derived)
 
 
 def generate_random_key() -> bytes:

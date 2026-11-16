@@ -1,299 +1,754 @@
-# BÁO CÁO KỸ THUẬT: HỆ THỐNG CỘNG TÁC PHÂN TÁN CLIENT-SERVER (RAW SOCKETS)
-## TECHNICAL REPORT: DISTRIBUTED CLIENT-SERVER COLLABORATION SYSTEM
+# Technical Report — Assignment 1: Distributed Client–Server Collaboration Application
+
+> **Course:** Network Application Development  
+> **Project Title:** Distributed Client–Server Collaboration Application (Hybrid Client–Server + Direct P2P File Transfer)  
+> **Student Name(s) / Team:** `[Student Name(s) / Team]`  
+> **Student ID(s):** `[Student ID(s)]`  
+> **Instructor:** `[Instructor Name]`  
+> **Submission Date:** `[Submission Date]` *(Assignment Reference Deadline: Sunday, November 17, 2026)*  
+> **Repository:** <https://github.com/QuanNguyenCS/DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION>  
+> **Verified CI Run:** GitHub Actions `#43700487784` (`ubuntu-latest`, `windows-latest`, `macos-latest` — Passing)
 
 ---
 
-> **Môn học:** Lập trình Ứng dụng Mạng (Network Application Development)  
-> **Đề tài:** Xây dựng Ứng dụng Cộng tác Phân tán Client-Server bằng Raw Sockets  
-> **Ngôn ngữ & Thư viện:** Python 3.10+, Standard Library `socket`, `threading`, `cryptography`  
-> **Tuân thủ quy chuẩn:** Không sử dụng thư viện mạng bậc cao (Flask, FastAPI, WebSockets). 100% Raw TCP Sockets.
+## Table of Contents
+1. [Introduction & Project Context](#1-introduction--project-context)
+2. [Features & Technical Requirements](#2-features--technical-requirements)
+3. [Hybrid System Architecture](#3-hybrid-system-architecture)
+4. [Application-Layer Protocol Specification](#4-application-layer-protocol-specification)
+5. [Project Structure & 10-Step Implementation Breakdown](#5-project-structure--10-step-implementation-breakdown)
+6. [Engineering Challenges & Solutions](#6-engineering-challenges--solutions)
+7. [Testing, Stress Benchmarks & Cross-Platform CI](#7-testing-stress-benchmarks--cross-platform-ci)
+8. [Installation & Running Guide](#8-installation--running-guide)
+9. [Conclusion](#9-conclusion)
 
 ---
 
-## 1. TỔNG QUAN HỆ THỐNG (EXECUTIVE SUMMARY)
+## 1. Introduction & Project Context
 
-Hệ thống Cộng tác Phân tán Client-Server được thiết kế và hiện thực nhằm giải quyết bài toán giao tiếp thời gian thực tin cậy, truyền dữ liệu tập tin dung lượng lớn, và bảo mật thông tin liên lạc trong môi trường mạng nội bộ (LAN / Localhost).
+### 1.1 Background & Motivation
+In modern team environments—such as university labs, office networks, and engineering workspaces—users on the same Local Area Network (LAN) frequently need to exchange messages and share files reliably without relying on cloud servers or heavy web frameworks. Building such a system directly on top of **operating-system sockets** teaches core networking concepts: stream framing, concurrency, state tracking, failure detection, and encryption.
 
-Toàn bộ hệ thống được xây dựng từ số 0 trên nền tảng **Raw TCP Sockets** kết hợp kiến trúc **Đa luồng (Multi-threading)** và **Giao thức Ứng dụng Tự thiết kế (Custom Binary Framing Protocol)**. Hệ thống giải quyết trọn vẹn 5 thách thức cốt lõi của lập trình mạng:
-1. **Xác thực danh tính & Phát hiện người dùng:** Quản lý phiên thread-safe, cập nhật danh sách online tức thời.
-2. **Trò chuyện phân tán:** Hỗ trợ phát thanh toàn phòng (Broadcast) và nhắn tin riêng tư 1-1 (Unicast Tabbed Interface).
-3. **Truyền file tin cậy:** Phân mảnh dữ liệu thành các chunk 32 KB, định tuyến Zero-Copy, và xác thực toàn vẹn bằng mã băm SHA-256.
-4. **Khả năng chịu lỗi cao:** Cơ chế Heartbeat PING-PONG và Thread dọn dẹp kết nối Zombie (Half-Open Sockets).
-5. **Bảo mật đa lớp:** Mã hóa đối xứng AES-256 (Fernet) kết hợp xác thực toàn vẹn HMAC-SHA256 trên tầng ứng dụng.
+### 1.2 Problem Statement
+Raw TCP sockets behave as a **continuous stream of bytes**, not discrete messages. Without a custom framing protocol, rapid sends cause **packet concatenation** (two messages read together) or **packet fragmentation** (one message split across reads). In addition, a naive single-threaded server blocks when one slow client stalls, while relaying large binary files through a central server creates unnecessary memory, CPU, and bandwidth bottlenecks.
+
+### 1.3 Project Goal
+Our goal is to design and build a complete, cross-platform collaboration application from scratch using Python's low-level `socket` module (without HTTP frameworks, WebSockets, or RPC libraries). The system supports **10–20+ concurrent clients**, provides both a **Tkinter GUI** and a **CLI**, encrypts payloads on demand, recovers cleanly from dropped connections, and transfers files **directly peer-to-peer (P2P)** with SHA-256 integrity checks.
+
+### 1.4 Target Users
+- Small engineering or classroom teams collaborating over a shared LAN or localhost.
+- Students and instructors evaluating raw-socket protocol engineering across Windows, macOS, and Linux.
 
 ---
 
-## 2. KIẾN TRÚC HỆ THỐNG (SYSTEM ARCHITECTURE)
+## 2. Features & Technical Requirements
 
-Hệ thống tuân thủ mô hình Client-Server tập trung kết hợp các luồng xử lý độc lập nhằm tối ưu hóa thông lượng và ngăn ngừa nghẽn cổ chai:
+### 2.1 Core Features Implemented
+1. **Application Handshake & Version Checking:** Validates protocol magic bytes (`b"CA"`) and version (`1`) before any session begins.
+2. **User Authentication & Live Presence:** Enforces unique, regex-validated usernames (`^[a-zA-Z0-9_\-]{3,20}$`), maintains an online user directory with peer P2P endpoints, and broadcasts `JOINED`/`LEFT` updates.
+3. **Real-Time Text Messaging:** Supports ordered **Broadcast** messages to the shared room and **Direct 1-on-1 (Unicast)** messages, all automatically encrypted using the shared `COLLAB_AES_KEY`.
+4. **Reliable Direct P2P File Transfer:** Uses the server strictly as a Tracker (`PEER_LOOKUP_REQ` / `PEER_LOOKUP_RESP`) to discover the receiver's `(IP, P2P_Port)`, then streams 32 KB file chunks over a direct peer-to-peer TCP connection and verifies **SHA-256** integrity. Server-side file relaying is explicitly disabled (`FILE_P2P_ONLY`).
+5. **Network Resilience & Fault Tolerance:** Runs periodic client heartbeats (`4.0s`) and a server background `ZombieCleaner` (`15.0s` timeout) to reap half-open or dead sockets automatically.
+6. **Encryption Layer:** Derives a cryptographic key using **PBKDF2-HMAC-SHA256** (`100,000` iterations) and secures payloads with **Fernet** (`AES-128-CBC + HMAC-SHA256`).
+7. **Dual Interfaces (GUI & CLI):** Provides a non-blocking Tkinter tabbed interface (with live file progress dialog) and a feature-complete terminal client.
+
+### 2.2 Compliance with Technical Constraints
+| Constraint | Requirement in Assignment | Implementation in This Project | Status |
+| :--- | :--- | :--- | :---: |
+| **Low-level Transport** | Raw TCP/UDP sockets only; no Flask, Django, FastAPI, WebSockets, or RPC | Built solely on Python `socket` (`AF_INET`, `SOCK_STREAM`) and `struct` | Compliant |
+| **Custom Protocol** | Custom framing, header, payload, message codes, state machine | 16-byte fixed header (`!2sBHBHQ`) + 24 `MessageType` codes (`101..602`) | Compliant |
+| **Concurrency** | Handle 10–20 concurrent clients without blocking | Multi-threaded server (`ClientHandler` per client) + thread-safe locks | Compliant |
+| **Cross-Platform** | Run cleanly on Windows, macOS, and Linux | Tested on Windows 11, WSL2 Ubuntu, and GitHub Actions 3-OS matrix | Compliant |
+
+---
+
+## 3. Hybrid System Architecture
+
+### 3.1 Why Hybrid Client–Server + Direct P2P?
+A pure client–server design works well for **lightweight control messages** and **ordered room chat**, because every client keeps one stable TCP socket to the server and sees broadcast messages in a single consistent order. However, routing large file transfers through that same server wastes central bandwidth.
+
+Conversely, a pure serverless P2P design makes username uniqueness, room-wide message ordering, and presence tracking difficult on dynamic LANs. Therefore, we separate responsibilities cleanly:
+
+- **Control Plane & Messaging -> Central Server (`ServerCore`):**
+  - Application handshake (`HELLO_HANDSHAKE` / `HANDSHAKE_ACK`)
+  - Authentication & P2P endpoint registration (`AUTH_REQ`, `p2p_port`)
+  - Live presence & peer directory (`USER_LIST_*`, `USER_STATUS_BROADCAST`, `PEER_LOOKUP_*`)
+  - Ordered room broadcast (`CHAT_BROADCAST`) and 1-on-1 message routing (`CHAT_DIRECT`)
+  - Heartbeat monitoring & zombie socket cleanup (`HEARTBEAT_PING/PONG`, `ZombieCleaner`)
+- **Bulk File Transfer -> Direct P2P TCP (`ClientCore` P2P Listener & Workers):**
+  - Each client binds a local P2P TCP listener (`0.0.0.0:p2p_port`, OS-assigned when `0`) before logging in.
+  - To send a file, the sender asks the Tracker for the receiver's `(ip, p2p_port)`, opens a direct TCP socket to that peer, completes `PEER_HELLO` / `PEER_HELLO_ACK`, sends `FILE_OFFER_REQ`, streams 32 KB `FILE_CHUNK` packets, and waits for a direct `FILE_ACK`.
+  - If a client tries to send `FILE_*` packets through the central server, the server rejects them with `ERROR_NOTICE (code="FILE_P2P_ONLY")`.
+
+### 3.2 High-Level Architecture Diagram
 
 ```mermaid
-flowchart TD
-    subgraph Clients ["Lớp Client (GUI / Core)"]
-        C1["Client Alice<br/>- Tkinter Main GUI Thread<br/>- Receiver Thread<br/>- Heartbeat Sender Thread"]
-        C2["Client Bob<br/>- Tkinter Main GUI Thread<br/>- Receiver Thread<br/>- Heartbeat Sender Thread"]
-        CN["Client Charlie / Bot N..."]
+flowchart TB
+    subgraph ServerHost["Central Server (Control Plane Tracker & Chat Router) — 0.0.0.0:9000"]
+        SC["ServerCore<br/>Accept Loop & Lifecycle"]
+        SM["SessionManager<br/>Thread-Safe User & IP:P2P_Port Registry"]
+        MR["MessageRouter<br/>Broadcast & Direct Unicast (No File Relay)"]
+        ZC["ZombieCleaner Thread<br/>Sweeps Dead Sockets > 15s"]
+        CH1["ClientHandler Thread #1"]
+        CH2["ClientHandler Thread #2"]
+        SC --> CH1
+        SC --> CH2
+        CH1 <--> SM
+        CH2 <--> SM
+        CH1 --> MR
+        CH2 --> MR
+        MR --> SM
+        ZC --> SM
     end
 
-    subgraph Network ["Tầng Truyền Tải (TCP Raw Socket)"]
-        TCP_STREAM["Kênh TCP Stream Song Công (Full-Duplex)<br/>16-byte Binary Header + Payload"]
+    subgraph ClientA["Client A (Sender) — Core + GUI/CLI"]
+        CA_UI["Main / Tkinter UI Thread<br/>(50ms queue.Queue poll)"]
+        CA_RX["Receiver Thread<br/>Server Socket Reader"]
+        CA_HB["HeartbeatSender Thread<br/>PING every 4.0s"]
+        CA_P2P["P2P Listener Thread<br/>0.0.0.0:p2p_port_A"]
+        CA_UI --- CA_RX
+        CA_UI --- CA_HB
+        CA_UI --- CA_P2P
     end
 
-    subgraph Server ["Lớp Server (ServerCore Multi-Threaded Engine)"]
-        Listener["Main Listener Socket<br/>(bind 0.0.0.0:9000, listen, backlog=20)"]
-        ZombieCleaner["Zombie Connection Cleaner<br/>(Quét mỗi 3.0s, Timeout 15.0s)"]
-        SessionMgr["SessionManager<br/>(Thread-Safe Registry, Lock)"]
-        Router["MessageRouter<br/>(Broadcast, Unicast, File Relay)"]
-        H1["ClientHandler Thread 1"]
-        H2["ClientHandler Thread 2"]
-        HN["ClientHandler Thread N"]
+    subgraph ClientB["Client B (Receiver) — Core + GUI/CLI"]
+        CB_UI["Main / Tkinter UI Thread<br/>(50ms queue.Queue poll)"]
+        CB_RX["Receiver Thread<br/>Server Socket Reader"]
+        CB_HB["HeartbeatSender Thread<br/>PING every 4.0s"]
+        CB_P2P["P2P Listener & Worker<br/>0.0.0.0:p2p_port_B"]
+        CB_UI --- CB_RX
+        CB_UI --- CB_HB
+        CB_UI --- CB_P2P
     end
 
-    C1 <--> TCP_STREAM
-    C2 <--> TCP_STREAM
-    CN <--> TCP_STREAM
-    TCP_STREAM <--> Listener
-    Listener --> H1
-    Listener --> H2
-    Listener --> HN
-    H1 <--> Router
-    H2 <--> Router
-    HN <--> Router
-    Router <--> SessionMgr
-    ZombieCleaner -.-> SessionMgr
-    ZombieCleaner -.-> H1
+    ClientA <-->|"TCP Port 9000: Auth, Peer Lookup, Chat, Heartbeat"| CH1
+    ClientB <-->|"TCP Port 9000: Auth, Peer Lookup, Chat, Heartbeat"| CH2
+    ClientA <==>|"Direct TCP P2P (Peer IP : p2p_port_B)<br/>PEER_HELLO, FILE_OFFER, 32KB FILE_CHUNK, FILE_ACK"| CB_P2P
 ```
 
-### 2.1. Phân bổ Luồng (Threading Architecture)
-- **Phía Server (Thread-per-Client Model):**
-  - **Main Thread (Listener):** Chỉ thực hiện gọi `server_sock.accept()`. Ngay khi có kết nối TCP mới, đóng gói socket vào `ClientHandler` và giao cho một luồng Worker riêng chạy ở chế độ `daemon=True`.
-  - **ClientHandler Worker Threads:** Mỗi client trực tuyến được phục vụ bởi 1 luồng độc lập, liên tục chạy vòng lặp `recv_packet()`.
-  - **ZombieCleaner Thread:** Luồng chạy ngầm quét định kỳ danh sách handler, phát hiện các kết nối không còn tín hiệu heartbeat để đóng socket và giải phóng bộ nhớ.
-- **Phía Client (Queue-Worker Pattern):**
-  - **Main GUI Thread (Tkinter):** Quản lý giao diện, không bao giờ thực hiện các lệnh socket blocking để tránh hiện tượng treo màn hình (Zero UI Freeze).
-  - **Receiver Thread:** Luồng độc lập đọc socket từ Server và đẩy gói tin vào `queue.Queue()`.
-  - **Heartbeat Thread:** Định kỳ gửi `HEARTBEAT_PING` để duy trì kết nối.
-  - **Background Worker Threads:** Thực hiện các tác vụ tốn thời gian như chia nhỏ và gửi file 50 MB mà không làm gián đoạn việc chat.
+### 3.3 Threading & Concurrency Model
+| Component | Thread Role | Synchronization Mechanism | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Server** | Main / Accept Thread | `ServerCore._running` flag | Accepts incoming TCP connections (`backlog=20`) and spawns `ClientHandler`. |
+| **Server** | `ClientHandler` (1 per client) | `SessionManager._lock`, per-handler `_send_lock` | Runs handshake (`10.0s` timeout), decodes packets, dispatches chat & tracker lookups. |
+| **Server** | `ZombieCleaner` (daemon) | `SessionManager._lock` | Runs every `3.0s`; disconnects sessions silent for more than `15.0s`. |
+| **Client** | Main / Tkinter UI Thread | `queue.Queue` + `self.after(50, ...)` | Renders widgets, captures user actions, polls network events every 50 ms. |
+| **Client** | `ReceiverThread` (daemon) | `_send_lock`, `_auth_event`, `_lookup_events` | Reads Server packets continuously without blocking UI or CLI input. |
+| **Client** | `HeartbeatSender` (daemon) | `threading.Event.wait(4.0)` | Sends `HEARTBEAT_PING` every `4.0s` while connected. |
+| **Client** | `P2PListener` & Workers (daemons) | `_p2p_workers_lock`, `_incoming_files_lock` | Accepts direct incoming peer TCP connections (`30.0s` socket timeout) and receives chunks. |
 
 ---
 
-## 3. ĐẶC TẢ GIAO THỨC TẦNG ỨNG DỤNG (PROTOCOL SPECIFICATION)
+## 4. Application-Layer Protocol Specification
 
-### 3.1. Cấu trúc Binary Header cố định 16 Bytes
-Để khắc phục hiện tượng TCP Byte-Stream (không có ranh giới gói tin), giao thức quy định mỗi gói tin đều mở đầu bằng 16 bytes Header định dạng chuẩn mạng (Network Byte Order - Big Endian `!4sHHHIH`):
+### 4.1 Packet Framing Design (16-Byte Fixed Binary Header)
+To prevent TCP stream concatenation and fragmentation, every message sent over either the Server TCP socket or a Direct P2P TCP socket is wrapped inside a binary frame defined in `common/protocol.py`:
 
-$$\text{Packet Format} = \underbrace{\text{Header (16 Bytes)}}_{\text{Fixed Binary Metadata}} + \underbrace{\text{Payload (} N \text{ Bytes)}}_{\text{Variable Data / JSON / Raw Chunks}}$$
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|       Magic Bytes ("CA")      |  Version (1)  |  MsgType (H)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| MsgType cont. |   Flags (B)   |         Reserved (H)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                     Payload Length (uint64)                   +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Payload Data (0..N bytes)              |
+|            (JSON UTF-8, raw binary, or Fernet ciphertext)     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
 
-| Vị trí Byte | Tên trường | Định dạng Struct | Kích thước | Mô tả kỹ thuật |
-| :---: | :---: | :---: | :---: | :--- |
-| `00 - 03` | **Magic Bytes** | `4s` | 4 bytes | Chuỗi ASCII `COLL` (`0x43 0x4F 0x4C 0x4C`) xác nhận gói tin hợp lệ |
-| `04 - 05` | **Protocol Version** | `H` (uint16) | 2 bytes | Phiên bản giao thức (Hiện tại: `1`) |
-| `06 - 07` | **Message Type** | `H` (uint16) | 2 bytes | Mã định danh chức năng (Opcode) |
-| `08 - 09` | **Flags** | `H` (uint16) | 2 bytes | Cờ điều khiển: `0x01` (Nén), `0x02` (Mã hóa AES) |
-| `10 - 13` | **Payload Length** | `I` (uint32) | 4 bytes | Độ dài chính xác $N$ của dữ liệu Payload liền sau (tối đa 16 MB) |
-| `14 - 15` | **Reserved** | `H` (uint16) | 2 bytes | Trường dự phòng căn lề bộ nhớ 16-bit (Giá trị: `0`) |
+*Exact Python `struct` format string:* `"!2sBHBHQ"` (Network Byte Order / Big Endian, **16 bytes total**).
 
-### 3.2. Bảng Mã Định Danh Thông Điệp (Message Type Table)
-| Message Type | Giá trị Hex | Chiều truyền | Mục đích |
-| :--- | :---: | :---: | :--- |
-| `HELLO_HANDSHAKE` | `0x0001` | Client $\rightarrow$ Server | Bắt tay ứng dụng sau khi nối TCP |
-| `HELLO_ACK` | `0x0002` | Server $\rightarrow$ Client | Phản hồi thông tin Server ID, Version |
-| `AUTH_REQ` | `0x0003` | Client $\rightarrow$ Server | Yêu cầu đăng ký Username |
-| `AUTH_RESP_SUCCESS` | `0x0004` | Server $\rightarrow$ Client | Xác thực thành công |
-| `AUTH_RESP_FAIL` | `0x0005` | Server $\rightarrow$ Client | Trùng Username hoặc tên không hợp lệ |
-| `USER_LIST_REQ` | `0x0006` | Client $\rightarrow$ Server | Yêu cầu lấy danh sách người dùng online |
-| `USER_LIST_RESP` | `0x0007` | Server $\rightarrow$ Client | Trả về mảng danh sách người dùng online |
-| `USER_STATUS_BROADCAST` | `0x0008` | Server $\rightarrow$ Clients | Thông báo có user tham gia hoặc rời phòng |
-| `CHAT_BROADCAST` | `0x0010` | Client $\leftrightarrow$ Server | Tin nhắn phòng chung |
-| `CHAT_DIRECT` | `0x0011` | Client $\leftrightarrow$ Server | Tin nhắn riêng tư 1-1 (Unicast) |
-| `CHAT_ACK` | `0x0012` | Server $\rightarrow$ Client | Xác nhận tin nhắn đã được gửi tới người nhận |
-| `FILE_OFFER_REQ` | `0x0020` | Client $\rightarrow$ Server | Đề xuất gửi file (Tên, Kích thước, SHA-256) |
-| `FILE_OFFER_RESP` | `0x0021` | Client $\leftrightarrow$ Server | Phản hồi Đồng ý (ACCEPTED) hoặc Từ chối |
-| `FILE_CHUNK` | `0x0022` | Client $\leftrightarrow$ Server | Chứa dữ liệu nhị phân của từng chunk 32 KB |
-| `FILE_ACK` | `0x0023` | Client $\leftrightarrow$ Server | Xác nhận nhận thành công từng chunk |
-| `HEARTBEAT_PING` | `0x0030` | Client $\rightarrow$ Server | Gói tin giữ nhịp tim định kỳ |
-| `HEARTBEAT_PONG` | `0x0031` | Server $\rightarrow$ Client | Phản hồi trạng thái hoạt động |
-| `DISCONNECT_NOTICE` | `0x0040` | Client $\rightarrow$ Server | Thông báo ngắt kết nối an toàn (Graceful exit) |
-| `ERROR_NOTICE` | `0x00FF` | Server $\rightarrow$ Client | Thông báo lỗi nghiệp vụ |
+| Byte Offset | Field Name | Format | Size | Value & Purpose |
+| :---: | :--- | :---: | :---: | :--- |
+| `0 - 1` | **Magic Bytes** | `2s` | 2 B | Always `b"CA"` (`MAGIC_BYTES`). Immediately rejects invalid/corrupt traffic. |
+| `2` | **Version** | `B` | 1 B | Currently `1` (`PROTOCOL_VERSION`). Enables forward compatibility checks. |
+| `3 - 4` | **Message Type** | `H` | 2 B | Unsigned 16-bit integer mapped to `MessageType` (`101..602`). |
+| `5` | **Flags** | `B` | 1 B | Bitmask: `0x00` (`FLAG_NONE`), `0x01` (`FLAG_ENCRYPTED`), `0x02` (`FLAG_COMPRESSED`). |
+| `6 - 7` | **Reserved** | `H` | 2 B | Reserved for future headers; always `0`. |
+| `8 - 15` | **Payload Length** | `Q` | 8 B | Exact byte length of payload (`MAX_PAYLOAD_SIZE = 50 * 1024 * 1024`, i.e., 50 MB). |
 
----
+### 4.2 Message Type Registry (`common/message_types.py`)
 
-## 4. SƠ ĐỒ TUẦN TỰ HOẠT ĐỘNG (SEQUENCE DIAGRAMS)
+| Category | Code | Enum Name | Channel & Direction | Payload Purpose |
+| :--- | :---: | :--- | :--- | :--- |
+| **Handshake & Auth** | `101` | `HELLO_HANDSHAKE` | Client -> Server | Sends `client_version` (`1`) and `client_name`. |
+| | `102` | `HANDSHAKE_ACK` | Server -> Client | Confirms compatibility, returns `status="OK"`, `server_id`, `version`, `encryption_enabled`. |
+| | `103` | `HANDSHAKE_REJECT` | Server -> Client | Rejects incompatible protocol version. |
+| | `104` | `AUTH_REQ` | Client -> Server | Registers `{"username": "...", "p2p_port": <int>}`. |
+| | `105` | `AUTH_RESP_SUCCESS` | Server -> Client | Confirms login; returns `online_users` and peer directory `peers`. |
+| | `106` | `AUTH_RESP_FAIL` | Server -> Client | Rejects duplicate or invalid username with `reason`. |
+| **Presence & Tracker** | `201` | `USER_LIST_REQ` | Client -> Server | Requests current active users and P2P directory. |
+| | `202` | `USER_LIST_RESP` | Server -> Client | Returns list of usernames and `peers` (`username`, `ip`, `p2p_port`). |
+| | `203` | `USER_STATUS_BROADCAST` | Server -> Client | Pushes `JOINED` / `LEFT` events with `p2p_ip` and `p2p_port`. |
+| | `204` | `PEER_LOOKUP_REQ` | Client -> Server | Queries Tracker for target user's `{"username": "..."}`. |
+| | `205` | `PEER_LOOKUP_RESP` | Server -> Client | Returns `{"found": true/false, "ip": "...", "p2p_port": <int>}`. |
+| **Chat Routing** | `301` | `CHAT_BROADCAST` | Client <-> Server | Sends or relays room-wide chat text (`sender`, `content`, `timestamp`). |
+| | `302` | `CHAT_DIRECT` | Client <-> Server | Routes 1-on-1 message (`sender`, `recipient`, encrypted on wire via `COLLAB_AES_KEY`). |
+| | `303` | `CHAT_ACK` | Bidirectional | Optional message delivery acknowledgment. |
+| **P2P File Transfer** | `401` | `FILE_OFFER_REQ` | Peer -> Peer | Proposes file (`file_id`, `file_name`, `file_size`, `total_chunks`, `sha256`, `encrypted`). |
+| | `402` | `FILE_OFFER_RESP` | Peer -> Peer | Returns `ACCEPTED` or `REJECTED`. |
+| | `403` | `FILE_CHUNK` | Peer -> Peer | Transfers 4-byte metadata len (`!I`) + JSON metadata + up to 32 KB raw bytes. |
+| | `404` | `FILE_ACK` | Peer -> Peer | Reports final SHA-256 verification status (`SUCCESS` or `FAILED`). |
+| | `405` | `PEER_HELLO` | Peer -> Peer | Initiates direct P2P handshake (`sender`, `protocol_version`). |
+| | `406` | `PEER_HELLO_ACK` | Peer -> Peer | Confirms (`OK`) or rejects (`REJECTED`) direct P2P transfer session. |
+| **Heartbeat** | `501` | `HEARTBEAT_PING` | Bidirectional | Keepalive check (sent every `4.0s` by client). |
+| | `502` | `HEARTBEAT_PONG` | Bidirectional | Liveness response (`{"status": "ALIVE"}`). |
+| **Connection** | `601` | `DISCONNECT_NOTICE` | Bidirectional | Signals graceful shutdown prior to closing socket. |
+| | `602` | `ERROR_NOTICE` | Server -> Client | Reports protocol errors (e.g., `FILE_P2P_ONLY`, `E2EE_ROUTING_REQUIRED`). |
 
-### 4.1. Vòng đời Bắt tay & Xác thực (Handshake & Authentication)
+### 4.3 Client Finite State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> DISCONNECTED
+    DISCONNECTED --> CONNECTING : connect(host, port)
+    CONNECTING --> HANDSHAKING : TCP 3-Way Handshake OK
+    HANDSHAKING --> AUTHENTICATING : HELLO_HANDSHAKE -> HANDSHAKE_ACK + Start P2P Listener
+    HANDSHAKING --> DISCONNECTED : HANDSHAKE_REJECT or Timeout (5s)
+    AUTHENTICATING --> ONLINE : AUTH_REQ(username, p2p_port) -> AUTH_RESP_SUCCESS
+    AUTHENTICATING --> AUTHENTICATING : AUTH_RESP_FAIL (Retry username)
+    AUTHENTICATING --> DISCONNECTED : Disconnect
+
+    state ONLINE {
+        [*] --> IDLE
+        IDLE --> CHATTING : CHAT_BROADCAST / CHAT_DIRECT (via Server)
+        CHATTING --> IDLE
+        IDLE --> TRANSFERRING_FILE_P2P : PEER_LOOKUP -> Direct P2P TCP Transfer
+        TRANSFERRING_FILE_P2P --> IDLE : FILE_ACK (SHA-256 Verified or Error Reported)
+    }
+
+    ONLINE --> DISCONNECTING : Send DISCONNECT_NOTICE
+    DISCONNECTING --> DISCONNECTED : Close Server Socket & Stop P2P Listener
+    ONLINE --> DISCONNECTED : Broken Pipe / Zombie Timeout (15s)
+```
+
+### 4.4 Protocol Sequence Diagrams
+
+#### Sequence A: Connection, Authentication, Tracker Discovery & Chat Messaging
+
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Client (Alice)
-    participant Server as ServerCore / Listener
-    participant Handler as ClientHandler Thread
-    participant Session as SessionManager
+    participant Alice as Client A (Alice)
+    participant Server as ServerCore (Tracker & Chat Router)
+    participant Bob as Client B (Bob)
 
-    Alice->>Server: TCP SYN
-    Server-->>Alice: TCP SYN-ACK
-    Alice->>Server: TCP ACK (TCP 3-Way Handshake hoàn tất)
+    Note over Alice,Server: Phase 1 — Handshake & P2P Port Registration
+    Alice->>Server: TCP Connect + HELLO_HANDSHAKE (ver=1)
+    Server-->>Alice: HANDSHAKE_ACK (server_id, encryption_enabled)
+    Alice->>Alice: start_p2p_listener(0.0.0.0:p2p_port_A)
+    Alice->>Server: AUTH_REQ {"username": "Alice", "p2p_port": p2p_port_A}
+    Server-->>Alice: AUTH_RESP_SUCCESS {"users": [...], "peers": [...]}
+    Server-->>Bob: USER_STATUS_BROADCAST {"status": "JOINED", "username": "Alice"}
 
-    Alice->>Server: HELLO_HANDSHAKE {client: "Alice", version: 1}
-    Server->>Server: Kiểm tra Magic Bytes & Version
-    Server-->>Alice: HELLO_ACK {server_id: "CollabServer", status: "OK"}
-    Server->>Handler: Khởi tạo luồng ClientHandler riêng cho Alice
+    Note over Alice,Bob: Phase 2 — Real-Time Messaging
+    Alice->>Server: CHAT_BROADCAST {"sender": "Alice", "content": "Hello all!"}
+    Server-->>Alice: CHAT_BROADCAST (ordered delivery)
+    Server-->>Bob: CHAT_BROADCAST (ordered delivery)
 
-    Alice->>Handler: AUTH_REQ {username: "Alice"}
-    Handler->>Session: register_user("Alice", handler)
-    Session-->>Handler: (True, "Đăng nhập thành công", session)
-    Handler-->>Alice: AUTH_RESP_SUCCESS {username: "Alice"}
-    Handler->>Server: Broadcast USER_STATUS_BROADCAST {event: "JOINED", user: "Alice"}
+    Alice->>Server: CHAT_DIRECT {"recipient": "Bob", "e2ee": true, "ciphertext": "..."}
+    Server-->>Bob: CHAT_DIRECT (forwarded ciphertext)
 ```
 
-### 4.2. Trò chuyện Thời gian thực (Broadcast & Direct 1-1 Message)
+#### Sequence B: Direct Peer-to-Peer File Transfer (Zero Server Relay)
+
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Alice as Alice
-    participant Srv as Server Router
-    actor Bob as Bob
+    participant Alice as Sender (Alice)
+    participant Tracker as Tracker Server
+    participant BobP2P as Receiver P2P Listener (Bob)
 
-    Note over Alice,Bob: Kịch bản 1: Chat phòng chung (Broadcast)
-    Alice->>Srv: CHAT_BROADCAST {content: "Chào cả nhóm!"}
-    Srv->>Alice: Phản hồi hoặc echo
-    Srv->>Bob: CHAT_BROADCAST {sender: "Alice", content: "Chào cả nhóm!"}
+    Alice->>Tracker: PEER_LOOKUP_REQ {"username": "Bob"}
+    Tracker-->>Alice: PEER_LOOKUP_RESP {"found": true, "ip": "192.168.1.25", "p2p_port": 51422}
 
-    Note over Alice,Bob: Kịch bản 2: Chat riêng tư 1-1 (Unicast)
-    Alice->>Srv: CHAT_DIRECT {recipient: "Bob", content: "Mật khẩu dự án là 123456"}
-    Srv->>Srv: Tra cứu session Bob trong SessionManager
-    Srv->>Bob: CHAT_DIRECT {sender: "Alice", recipient: "Bob", content: "Mật khẩu..."}
-    Srv-->>Alice: CHAT_ACK {status: "DELIVERED", recipient: "Bob"}
-```
+    Alice->>BobP2P: Direct TCP Connect (192.168.1.25:51422)
+    Alice->>BobP2P: PEER_HELLO {"sender": "Alice", "protocol_version": 1}
+    BobP2P-->>Alice: PEER_HELLO_ACK {"status": "OK", "username": "Bob"}
 
-### 4.3. Quy trình Truyền File Tin Cậy (Chunking, Relay & SHA-256 Checksum)
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Alice as Sender (Alice)
-    participant Router as Server Router
-    actor Bob as Receiver (Bob)
+    Alice->>BobP2P: FILE_OFFER_REQ {"file_id", "file_name", "file_size", "total_chunks", "sha256", "encrypted"}
+    BobP2P-->>Alice: FILE_OFFER_RESP {"status": "ACCEPTED"}
 
-    Alice->>Alice: Đọc file, chia chunk 32 KB, tính SHA-256 toàn file
-    Alice->>Router: FILE_OFFER_REQ {file_id, file_name, file_size, chunks, sha256}
-    Router->>Bob: Chuyển tiếp FILE_OFFER_REQ
-    Bob-->>Router: FILE_OFFER_RESP {file_id, status: "ACCEPTED"}
-    Router-->>Alice: Chuyển tiếp FILE_OFFER_RESP
-
-    loop Gửi từng Chunk (1 to Total)
-        Alice->>Router: FILE_CHUNK {file_id, chunk_index, data_bytes}
-        Router->>Bob: Zero-Copy Relay FILE_CHUNK
-        Bob-->>Router: FILE_ACK {file_id, chunk_index, status: "OK"}
-        Router-->>Alice: Chuyển tiếp FILE_ACK (Cập nhật GUI Progress Bar %)
+    loop For each 32 KB chunk (0 .. N-1)
+        Alice->>BobP2P: FILE_CHUNK [4B meta_len | JSON | raw/encrypted bytes]
     end
 
-    Bob->>Bob: Ghép toàn bộ chunks, tính lại SHA-256
-    Bob->>Bob: So khớp SHA-256 tính được == SHA-256 kỳ vọng
-    Note over Bob: ✅ File nguyên vẹn 100%! Lưu vào thư mục Downloads
+    BobP2P->>BobP2P: Reassemble file & verify SHA-256 checksum
+    alt SHA-256 matches
+        BobP2P-->>Alice: FILE_ACK {"status": "SUCCESS"}
+    else Corrupted chunk or wrong encryption key
+        BobP2P-->>Alice: FILE_ACK {"status": "FAILED", "reason": "..."}
+    end
 ```
 
 ---
 
-## 5. THÁCH THỨC KỸ THUẬT & GIẢI PHÁP THỰC TẾ (CHALLENGES & SOLUTIONS)
+## 5. Project Structure & 10-Step Implementation Breakdown
 
-### 5.1. Thách thức 1: Hiện tượng Dính gói & Xé gói trong TCP Stream (Concatenation & Fragmentation)
-- **Bản chất vấn đề:** TCP là giao thức hướng luồng byte (Byte-Stream Protocol), không có khái niệm "biên giới gói tin". Do cơ chế Nagle và bộ đệm tầng vận chuyển (MTU/MSS), lệnh `send(A)` và `send(B)` của client có thể bị gộp lại và nhận trong cùng một lệnh `recv()` ở phía Server (Dính gói). Ngược lại, một payload 100 KB có thể bị xé thành nhiều mảnh nhỏ truyền đến ở các thời điểm khác nhau (Xé gói).
-- **Giải pháp hiện thực:**
-  - Áp dụng cấu trúc **Binary Header cố định 16 bytes**.
-  - Xây dựng hàm đọc socket an toàn `recv_exact(sock, n)` với vòng lặp `while len(buf) < n`: Bên nhận luôn đọc đúng 16 bytes Header $\rightarrow$ giải mã ra `payload_length` $\rightarrow$ lặp đọc socket cho đến khi thu thập đủ đúng $N$ bytes Payload.
+### 5.0 Project Folder Tree & Module Responsibilities
+Before walking through the 10 development steps, the repository layout below summarizes the role of every package and file in the system:
 
-### 5.2. Thách thức 2: Hiện tượng Treo Giao diện Đồ họa (GUI Freeze)
-- **Bản chất vấn đề:** Thư viện Tkinter vận hành trên một Main Thread duy nhất thông qua vòng lặp sự kiện `mainloop()`. Nếu thực hiện các lệnh đọc/ghi socket chặn (blocking socket I/O) hoặc đọc file lớn ngay trên luồng này, toàn bộ giao diện sẽ bị đơ ("Not Responding"), không thể bấm nút hay kéo cuộn.
-- **Giải pháp hiện thực:**
-  - Áp dụng mô hình **Queue Pattern**: Toàn bộ socket I/O chạy trên luồng nền (`Receiver Thread`, `Heartbeat Thread`, `FileTransfer Thread`).
-  - Các sự kiện nhận được từ mạng được đẩy vào hàng đợi an toàn đa luồng `queue.Queue()`.
-  - Main Thread dùng hàm `root.after(50, process_queue)` để rút sự kiện từ queue và cập nhật các widget giao diện mượt mà 60 fps.
+```text
+DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
+├── run_server.py                 # Server CLI entrypoint (binds 0.0.0.0:9000, auto AES encryption)
+├── run_client.py                 # Interactive Terminal CLI client (/msg, @user, /file, /ping, /quit)
+├── run_gui.py                    # Desktop GUI launcher initializing CollabChatApp
+├── requirements.txt              # Minimal external dependencies: cryptography & pytest
+├── README.md                     # Project overview, feature list, architecture summary, and run commands
+├── DEVELOPMENT_PLAN.md           # Original 10-step implementation roadmap and checklist
+│
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # GitHub Actions CI matrix testing Ubuntu (xvfb), Windows, and macOS
+│
+├── common/                       # Shared transport, protocol, security, and logging primitives
+│   ├── __init__.py               # Package marker exposing common helpers
+│   ├── protocol.py               # 16B binary framing (!2sBHBHQ), Packet dataclass, recv_exact/recv_packet, DoS cap
+│   ├── message_types.py          # MessageType(IntEnum) registry defining 24 protocol opcodes (101..602)
+│   ├── crypto_utils.py           # PBKDF2-HMAC-SHA256 (100k iter) key derivation & Fernet encrypt/decrypt
+│   └── logger.py                 # Cross-platform UTF-8 safe structured logging utility
+│
+├── server/                       # Central Control Plane Tracker & Ordered Chat Router
+│   ├── __init__.py               # Server package marker
+│   ├── server_core.py            # TCP accept loop, application handshake, broadcast helper, ZombieCleaner
+│   ├── client_handler.py         # Per-client daemon thread, packet dispatch, _send_lock, FILE_P2P_ONLY guard
+│   ├── session_manager.py        # Thread-safe active user registry, regex check, effective LAN IP & p2p_port store
+│   └── router.py                 # MessageRouter for ordered CHAT_BROADCAST and 1-on-1 CHAT_DIRECT delivery
+│
+├── client/                       # Client Engine, P2P File Transfer, Keepalive & Supporting UI
+│   ├── __init__.py               # Client package marker
+│   ├── client_core.py            # State management, server receiver thread, tracker lookup, P2P listener & workers
+│   ├── file_transfer.py          # 32 KB chunk slicing, binary FILE_CHUNK pack/unpack, .part + SHA-256 verification
+│   ├── heartbeat.py              # Background HeartbeatSender thread emitting HEARTBEAT_PING every 4.0s
+│   └── gui/                      # Thin Tkinter presentation layer decoupled via queue.Queue
+│       ├── __init__.py           # GUI package marker
+│       ├── app.py                # Main Tk controller polling gui_queue every 50ms on the UI main thread
+│       ├── login_view.py         # Server IP/Port, Username, and optional Passphrase connection panel
+│       ├── chat_view.py          # Shared room tab, per-user private tabs, online list & file picker
+│       └── file_progress.py      # Non-blocking progress bar & transfer speed window for P2P file transfers
+│
+├── storage/                      # Local runtime folders created/used during execution
+│   ├── client_downloads/         # Default download directory for verified P2P received files
+│   └── server_cache/             # Reserved server storage folder (unused for files in pure P2P mode)
+│
+├── docs/                         # Protocol and academic documentation
+│   ├── protocol_specs.md         # Detailed wire format & state transition reference
+│   ├── technical_report.md       # This English technical report
+│   └── main.tex                  # Standalone LaTeX version with native TikZ diagrams
+│
+└── tests/                        # Automated Pytest verification suite (76 tests + stress benchmark)
+    ├── __init__.py               # Test package marker
+    ├── test_protocol.py          # 12 tests: 16B header, 1B fragmentation, EOF mid-payload, >50MB & version guards
+    ├── test_handshake.py         # 9 tests: HELLO acceptance, non-dict JSON DoS guard, RLock port bind, worker handshake
+    ├── test_concurrency.py       # 6 tests: auth gate, concurrent logins/exits & 6-client Barrier burst
+    ├── test_auth.py              # 8 tests: username rules, duplicate reject, 5-thread Barrier race condition, P2P port
+    ├── test_router.py            # 5 tests: room broadcast, 1-on-1 routing, case-insensitive user, offline & self guards
+    ├── test_file_transfer.py     # 12 tests: P2P stream, O(1) .part cleanup, non-overwrite, path traversal, concurrent P2P
+    ├── test_resilience.py        # 4 tests: heartbeat liveness, 15s zombie + LEFT list sync, drop cleanup & queue cap
+    ├── test_crypto.py            # 12 tests: auto COLLAB_AES_KEY, anti-downgrade, ephemeral P2P X25519 secrecy
+    ├── test_gui.py               # 7 tests: Tkinter views, safe logout & gui_queue Producer–Consumer dispatching
+    └── stress_test.py            # 15–20 client automated load test checking >=98% delivery ratio (also standalone)
+```
 
-### 5.3. Thách thức 3: Kết nối Chết ngầm (Half-Open Sockets / Zombie Connections)
-- **Bản chất vấn đề:** Khi một client bị rút dây mạng, mất nguồn đột ngột hoặc tắt máy mà không đóng ứng dụng, gói tin ngắt kết nối `TCP FIN` không được gửi đi. Phía Server vẫn giữ mở socket và coi client đó đang online, gây lãng phí bộ nhớ và lỗi khi người khác gửi tin nhắn tới.
-- **Giải pháp hiện thực:**
-  - **Phía Client:** Luồng `HeartbeatSender` định kỳ gửi `HEARTBEAT_PING` mỗi 4.0 giây.
-  - **Phía Server:** Mỗi khi nhận được bất kỳ gói tin nào từ client, ghi nhận `handler.last_seen = time.time()`.
-  - Luồng `ZombieCleanerThread` quét định kỳ mỗi 3.0 giây: Nếu $\text{now} - \text{last\_seen} > 15.0\text{s}$, Server chủ động đóng socket và thu hồi phiên người dùng an toàn.
+Every stage below directly maps to the 10-step assignment rubric (`1.0 pt` per step), combining architecture explanations, cross-references to the diagrams and tables in **Section 3** and **Section 4**, and real code excerpts from the repository.
 
-### 5.4. Thách thức 4: Xung đột Dữ liệu (Race Conditions) trong Đa luồng
-- **Bản chất vấn đề:** Khi 20 client cùng kết nối hoặc gửi tin nhắn đồng thời, nhiều thread `ClientHandler` cùng truy cập và sửa đổi danh bạ `SessionManager.active_users` hoặc cùng ghi dữ liệu vào cùng một socket có thể gây xung đột bộ nhớ và hỏng luồng TCP stream.
-- **Giải pháp hiện thực:**
-  - Sử dụng `threading.Lock()` bảo vệ mọi thao tác đọc/ghi trong `SessionManager`.
-  - Sử dụng `_send_lock = threading.Lock()` riêng cho từng kết nối để đảm bảo tại một thời điểm chỉ có duy nhất một gói tin được truyền qua socket.
+---
 
-### 5.5. Thách thức 5: Nguy cơ Nghe lén & Chỉnh sửa Gói tin (Sniffing & Tampering)
-- **Bản chất vấn đề:** Dữ liệu truyền dạng văn bản thô (Plain text) qua mạng LAN rất dễ bị đánh cắp bằng các công cụ bắt gói tin như Wireshark.
-- **Giải pháp hiện thực:**
-  - Tích hợp lớp mã hóa đối xứng **AES-256 (Fernet / CBC + HMAC-SHA256)**.
-  - Khóa mật mã được sinh bằng thuật toán **PBKDF2HMAC** từ mật khẩu phòng chung.
-  - Gắn cờ `FLAG_ENCRYPTED = 0x02` trong Header. Bất kỳ sự can thiệp làm sai lệch dữ liệu trên đường truyền đều bị phát hiện bởi chữ ký HMAC và ném lỗi `InvalidToken`.
+### Step 1: Setup & Protocol Design (`common/protocol.py`, `common/message_types.py`)
+Raw TCP sockets only transmit an unstructured stream of bytes. Without explicit boundaries, two adjacent JSON payloads merge into one `recv()` buffer (*packet concatenation*), or one large message arrives split across multiple `recv()` calls (*packet fragmentation*).
+
+As illustrated in the **16-Byte Binary Header Diagram (Section 4.1)** and **MessageType Registry Table (Section 4.2)**, we wrap every message in a fixed 16-byte Big-Endian binary header (`!2sBHBHQ`) followed by `payload_len` bytes, and classify all 24 protocol operations into numeric ranges (`100`–`699`):
+
+```python
+# common/protocol.py — 16B header definition & safe framing reader
+MAGIC_BYTES, PROTOCOL_VERSION = b"CA", 1
+HEADER_FORMAT = "!2sBHBHQ"                  # 16 bytes (Network Byte Order)
+MAX_PAYLOAD_SIZE = 50 * 1024 * 1024         # 50 MB upper bound against OOM/DoS
+
+def recv_packet(sock: socket.socket, decrypt_key: Optional[bytes] = None) -> Packet:
+    header_bytes = recv_exact(sock, HEADER_SIZE)
+    magic, version, raw_msg_type, flags, _res, payload_len = struct.unpack(HEADER_FORMAT, header_bytes)
+    if magic != MAGIC_BYTES:           raise InvalidMagicBytesError(...)
+    if version != PROTOCOL_VERSION:    raise UnsupportedVersionError(...)
+    if payload_len > MAX_PAYLOAD_SIZE: raise PayloadTooLargeError(...)
+    payload_bytes = recv_exact(sock, payload_len) if payload_len > 0 else b""
+```
+
+```python
+# common/message_types.py — Sample opcodes grouped by function (101..602)
+class MessageType(IntEnum):
+    HELLO_HANDSHAKE = 101; HANDSHAKE_ACK = 102; AUTH_REQ = 104
+    USER_LIST_REQ = 201;   USER_STATUS_BROADCAST = 203; PEER_LOOKUP_REQ = 204
+    CHAT_BROADCAST = 301;  CHAT_DIRECT = 302;   CHAT_ACK = 303
+    FILE_OFFER_REQ = 401;  FILE_CHUNK = 403;    FILE_ACK = 404; PEER_HELLO = 405
+    HEARTBEAT_PING = 501;  HEARTBEAT_PONG = 502; DISCONNECT_NOTICE = 601; ERROR_NOTICE = 602
+```
+
+Notice the engineering boundary guard in `recv_packet()`: inspecting `magic`, `version`, and `payload_len <= MAX_PAYLOAD_SIZE` *before* allocating the payload buffer prevents malformed traffic from crashing the server. *(Why `MAX_PAYLOAD_SIZE` is `50 MB` while file chunks are `32 KB` is straightforward: `50 MB` is a wire-level OOM ceiling on the 64-bit length header, whereas chunking keeps per-transfer RAM usage constant at $O(1)$.)*
 
 ---
 
-## 6. KẾT QUẢ ĐO ĐẠC KIỂM THỬ TẢI CAO (STRESS TEST EVALUATION)
+### Step 2: Basic Client–Server Handshake (`client/client_core.py`, `server/server_core.py`)
+Right after the OS completes the TCP 3-way handshake, both endpoints validate compatibility before entering the `AUTHENTICATING` state (see **Section 4.3 FSM** and **Sequence A, Phase 1 in Section 4.4**). The server sets a strict `10.0s` handshake timeout so idle half-connected sockets cannot tie up the accept flow:
 
-Script kiểm thử tải cao tự động (`tests/stress_test.py`) đã thực hiện đo đạc năng lực phục vụ của Server với kịch bản tải cực đoan:
-- **Số lượng Clients ảo:** 16 - 20 bots kết nối và gửi nhận đồng thời.
-- **Thời gian kết nối đồng loạt:** 16 clients hoàn tất TCP Handshake và xác thực danh tính chỉ trong **0.23 giây**.
-- **Tần suất tin nhắn:** Đạt trung bình **95.2 tin nhắn/giây** (Broadcast và Unicast hỗn hợp).
-- **Tổng số tin nhắn phân phối:** Hơn **5,000 lượt tin nhắn** được chuyển tiếp thành công mà không có bất kỳ hiện tượng nghẽn mạng, lỗi socket hay crash chương trình.
-- **Dọn dẹp tài nguyên:** 100% các kết nối và luồng được giải phóng sạch sẽ khi kết thúc phiên kiểm thử.
+```mermaid
+flowchart LR
+    C["Client.connect()"] -->|"HELLO_HANDSHAKE<br/>(client_version=1)"| S["Server.handle_handshake()<br/>timeout = 10.0s"]
+    S -->|"version == 1"| OK["HANDSHAKE_ACK<br/>(server_id, encryption_enabled)"]
+    S -->|"version != 1 or wrong type"| NO["HANDSHAKE_REJECT<br/>Close socket"]
+```
+
+```python
+# client/client_core.py — Client sends HELLO_HANDSHAKE right after TCP connect
+hello_payload = {"client_name": self.client_name, "client_version": protocol_version}
+self.sock.sendall(create_packet(MessageType.HELLO_HANDSHAKE, hello_payload, version=protocol_version))
+response = recv_packet(self.sock)
+if response.msg_type == MessageType.HANDSHAKE_ACK:
+    self.server_info = response.to_json()
+    return True
+```
+
+```python
+# server/server_core.py — Server validates protocol version within 10.0s timeout
+if client_version != PROTOCOL_VERSION:
+    client_sock.sendall(create_packet(MessageType.HANDSHAKE_REJECT, {"status": "REJECT"}))
+    return False, None
+client_sock.sendall(create_packet(MessageType.HANDSHAKE_ACK, {
+    "status": "OK", "server_id": self.server_id, "encryption_enabled": self.crypto_key is not None,
+}))
+```
+
+---
+
+### Step 3: Concurrency Implementation (`server/server_core.py`, `server/client_handler.py`)
+To serve 10–20+ clients smoothly without head-of-line blocking (see **Section 3.2 Architecture Diagram** & **Section 3.3 Threading Table**), `ServerCore` uses a **Thread-per-Client** architecture. Once handshake succeeds, `serve_forever()` immediately delegates the socket to a daemon `ClientHandler` thread. Because multiple threads (such as a room broadcast, direct message delivery, and a heartbeat `PONG`) can write to the *same* client socket concurrently, every `ClientHandler` guards `sendall()` with a dedicated `_send_lock` so packet bytes never interleave:
+
+```mermaid
+flowchart LR
+    Acc["Accept Thread<br/>ServerCore.serve_forever()"] -->|"spawn daemon"| H1["ClientHandler #1<br/>recv_packet() loop"]
+    Acc -->|"spawn daemon"| H2["ClientHandler #2<br/>recv_packet() loop"]
+    Broadcast["Broadcast / Router Thread"] -->|"acquire"| Lock["_send_lock (Mutex)"]
+    Pong["Handler Reply / PONG"] -->|"acquire"| Lock
+    Lock -->|"atomic sendall()"| Sock["Client TCP Socket"]
+```
+
+```python
+# server/server_core.py — Accept loop spawns a daemon ClientHandler per connection
+client_sock, client_addr = self.server_sock.accept()
+success, client_info = self.handle_handshake(client_sock, client_addr)
+if success:
+    handler = ClientHandler(client_sock, client_addr, server=self, client_info=client_info)
+    self.register_handler(handler)
+    handler.start()
+
+# server/client_handler.py — Per-socket mutex prevents concurrent byte interleaving
+with self._send_lock:
+    if self.client_sock:
+        self.client_sock.sendall(packet_bytes)
+```
 
 ---
 
-## 7. BỘ 10 CÂU HỎI VẤN ĐÁP CỐT LÕI & CÂU TRẢ LỜI CHUẨN MỰC (ORAL DEFENSE PREPARATION)
+### Step 4: Authentication & State Management (`server/session_manager.py`, `client/client_core.py`)
+Before logging in, the client starts its local P2P TCP listener (`start_p2p_listener()`) and declares `p2p_port` inside `AUTH_REQ` (see `MessageType 104` in **Section 4.2**). Inside `SessionManager`, a mutex (`self._lock`) ensures atomic check-and-insert so two simultaneous clients racing for the same username cannot overwrite each other. The server automatically records the socket-observed LAN IP as `UserSession.effective_ip` so Tracker lookups work across separate physical machines instead of returning an unreachable `127.0.0.1`:
 
-### Câu 1: Tại sao không thể dùng `sock.recv(1024)` đơn thuần để nhận toàn bộ tin nhắn?
-> **Trả lời:**  
-> TCP là giao thức hướng dòng byte (**Byte-Stream Protocol**), nó không hề bảo toàn ranh giới giữa các thông điệp của tầng ứng dụng. Khi một lệnh `send()` được gọi, dữ liệu được đưa vào buffer của hệ điều hành và chia thành các phân đoạn TCP Segment. Một lệnh `recv(1024)` có thể chỉ đọc được một phần thông điệp nếu mạng bị trễ (Xé gói - Fragmentation), hoặc đọc gộp cả hai thông điệp gửi liên tiếp vào làm một (Dính gói - Concatenation).  
-> Vì vậy, giải pháp công nghiệp chuẩn là dùng **Length-Prefixed Framing**: Gói tin bắt đầu bằng 16 bytes Header cố định chứa trường `Payload Length = N`. Phía nhận dùng vòng lặp `recv_exact` gom đủ 16 bytes Header, sau đó tiếp tục đọc lặp cho đến khi đủ đúng $N$ bytes Payload.
+```python
+# server/session_manager.py — Regex & Mutex-guarded P2P session registration
+USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-]{3,20}$")
+key = username.strip().lower()
+with self._lock:
+    if key in self._sessions:
+        return False, f"Username '{clean_username}' đã có người sử dụng...", None
+    self._sessions[key] = UserSession(
+        username=clean_username, handler=handler, address=address, p2p_port=valid_p2p_port
+    )
+```
 
-### Câu 2: Hệ thống xử lý thế nào khi 20 client kết nối cùng một lúc mà không bị đơ Server?
-> **Trả lời:**  
-> Hệ thống áp dụng mô hình **Thread-per-Client Architecture**:  
-> Luồng chính của Server chỉ lắng nghe tại cổng TCP bằng `server_sock.accept()`. Ngay khi có kết nối mới, Server lập tức khởi tạo một đối tượng `ClientHandler` chạy trên một luồng nền độc lập (`threading.Thread(daemon=True)`). Luồng này chịu trách nhiệm phục vụ riêng biệt cho client đó. Do đó, việc một client gửi nhận dữ liệu chậm không hề gây ảnh hưởng hay làm nghẽn các client còn lại.
-
-### Câu 3: Nếu một Client bị ngắt mạng đột ngột (rút dây mạng), Server có biết không?
-> **Trả lời:**  
-> Nếu client tắt ứng dụng bình thường, hệ điều hành sẽ gửi cờ `TCP FIN` để đóng kết nối (Graceful Shutdown). Nhưng nếu client bị mất điện hoặc rút dây LAN đột ngột, gói FIN sẽ không bao giờ được gửi tới Server (gọi là trạng thái **Half-Open Socket**).  
-> Hệ thống giải quyết vấn đề này bằng cơ chế **Heartbeat Keepalive**: Client định kỳ gửi `HEARTBEAT_PING` mỗi 4 giây. Server ghi nhận thời điểm cuối cùng nhận tin từ client (`last_seen`). Luồng ngầm `ZombieCleaner` quét định kỳ mỗi 3 giây; nếu một client không có bất kỳ tín hiệu nào sau 15 giây, Server sẽ chủ động đóng socket và gỡ bỏ phiên người dùng.
-
-### Câu 4: Tại sao lại chọn chia file thành các chunks 32 KB thay vì gửi một lần toàn bộ file?
-> **Trả lời:**  
-> 1. **Tiết kiệm bộ nhớ RAM:** Nếu gửi file 1 GB trong một lần, cả Client và Server phải nạp toàn bộ 1 GB vào bộ nhớ, dễ dẫn đến lỗi `MemoryError` hoặc tràn RAM. Với chunk 32 KB, bộ nhớ RAM sử dụng luôn ở mức tối thiểu và không đổi.  
-> 2. **Tránh độc chiếm đường truyền:** Việc chia nhỏ chunk giúp Server có thể định tuyến xen kẽ các gói tin văn bản chat giữa các chunk file, giúp người dùng vẫn chat bình thường trong khi đang truyền file.  
-> 3. **Hỗ trợ hiển thị thanh tiến độ (Progress Bar):** Mỗi chunk gửi/nhận thành công đều kích hoạt callback cập nhật % tiến trình và tốc độ truyền trên giao diện.
-
-### Câu 5: Cơ chế nào đảm bảo file tải về hoàn toàn không bị sai lệch dữ liệu (Data Corruption)?
-> **Trả lời:**  
-> Mặc dù TCP có cơ chế checksum ở tầng mạng, dữ liệu vẫn có thể bị hỏng ở tầng ứng dụng do lỗi bộ nhớ hoặc lỗi logic ghép file.  
-> Trước khi gửi file, Sender tính mã băm **SHA-256** của toàn bộ file gốc và gửi kèm trong gói tin `FILE_OFFER_REQ`. Phía Receiver sau khi nhận đủ các chunks và ghi ra đĩa sẽ tính toán lại mã băm SHA-256 của file vừa ghi. Nếu hai chuỗi hash trùng khớp 100%, file được xác nhận hợp lệ. Nếu không khớp, file sẽ bị hủy bỏ.
-
-### Câu 6: Mã hóa dữ liệu được thực hiện ở tầng nào trong mô hình OSI và tại sao?
-> **Trả lời:**  
-> Mã hóa được thực hiện tại **Tầng Ứng dụng (Application Layer)**.  
-> Lý do: Vì dự án lập trình trên Raw TCP Sockets mà không dùng các giao thức bảo mật tầng giao vận có sẵn như TLS/SSL, việc mã hóa Payload ngay tại tầng ứng dụng (dùng AES-256 Fernet) trước khi gọi `sock.sendall()` đảm bảo dữ liệu khi đi qua card mạng và dây cáp chỉ là các byte mã hóa ngẫu nhiên. Kẻ tấn công dùng Wireshark bắt gói tin trên cổng 9000 chỉ thấy các byte vô nghĩa và không thể trích xuất được nội dung.
-
-### Câu 7: Khóa `threading.Lock` trong Server được dùng ở đâu và để làm gì?
-> **Trả lời:**  
-> Khóa `Lock` được dùng ở hai nơi quan trọng:  
-> 1. Trong `SessionManager`: Bảo vệ từ điển `active_users`. Nếu không có Lock, khi hai client cùng đăng ký một username tại cùng một phần nghìn giây, hiện tượng tranh chấp (Race Condition) có thể xảy ra dẫn đến ghi đè hoặc trùng lặp dữ liệu.  
-> 2. Trong `ClientHandler._send_lock`: Đảm bảo tại một thời điểm chỉ có duy nhất một luồng được ghi vào socket của client đó, tránh việc các gói tin khác nhau bị ghi đan xen các byte vào cùng một stream.
-
-### Câu 8: Vai trò của 4 Magic Bytes (`COLL`) trong Header là gì?
-> **Trả lời:**  
-> Magic Bytes đóng vai trò nhận diện giao thức (**Protocol Identification / Protocol Guard**):  
-> Khi Server mở một cổng TCP công khai (ví dụ 9000), có thể có các ứng dụng khác kết nối nhầm (trình duyệt gửi HTTP GET, bot quét cổng, hoặc ứng dụng khác). Khi đọc 4 bytes đầu tiên, nếu không phải là chuỗi `COLL`, Server sẽ lập tức phát hiện gói tin không hợp lệ, đóng kết nối ngay và giải phóng tài nguyên mà không cần xử lý tiếp.
-
-### Câu 9: Tại sao giao diện Tkinter không bị đơ (freeze) khi đang tải file lớn?
-> **Trả lời:**  
-> Vì toàn bộ tiến trình đọc đĩa, chia nhỏ chunk và gửi qua socket chạy trên một luồng nền tách biệt (`threading.Thread(target=worker, daemon=True)`).  
-> Luồng nền này không bao giờ trực tiếp thao tác lên các widget của Tkinter (điều này vi phạm an toàn luồng của Tkinter). Thay vào đó, nó đẩy thông tin tiến độ `(sent, total, percent)` vào `queue.Queue()`. Tkinter Main Thread sử dụng `root.after(50, ...)` để định kỳ lấy dữ liệu từ hàng đợi và cập nhật thanh progress bar một cách an toàn và mượt mà.
-
-### Câu 10: Sự khác biệt bản chất giữa TCP và UDP trong bối cảnh ứng dụng này là gì?
-> **Trả lời:**  
-> - **TCP (Transmission Control Protocol):** Là giao thức hướng kết nối (Connection-oriented), có bắt tay 3 bước, đảm bảo truyền dữ liệu tin cậy 100%, tự động truyền lại gói tin mất và bảo đảm đúng thứ tự. Ứng dụng dùng TCP cho toàn bộ kênh dữ liệu: Bắt tay, Đăng nhập, Chat văn bản và Truyền file.  
-> - **UDP (User Datagram Protocol):** Là giao thức phi kết nối (Connectionless), không đảm bảo độ tin cậy, không truyền lại nhưng có độ trễ cực thấp và hỗ trợ phát tán (Broadcast / Multicast). UDP thích hợp để triển khai tính năng tự động khám phá Server trong mạng LAN (Server Discovery Beacon) mà không cần cấu hình IP thủ công.
+Upon success, the server returns `AUTH_RESP_SUCCESS` containing the live peer directory and pushes `USER_STATUS_BROADCAST (event="JOINED")` to all other clients.
 
 ---
-*Báo cáo được hoàn thiện và xác thực 100% dựa trên mã nguồn thực tế của dự án.*
+
+### Step 5: Real-Time Text Routing (`server/router.py`, `client/client_core.py`)
+`MessageRouter` handles both shared room broadcasts (`CHAT_BROADCAST`) and private 1-on-1 messages (`CHAT_DIRECT`), as depicted in **Sequence A (Phase 2) in Section 4.4**. Broadcast packets iterate over an active handler snapshot (`only_authenticated=True`) to deliver consistent ordering across the room, while `route_direct_message()` rejects self-messaging (`SELF_MESSAGE_NOT_ALLOWED`), looks up the recipient case-insensitively, notifies the sender if offline (`USER_NOT_FOUND`), and replies with minimal metadata `CHAT_ACK` (never echoing plaintext `content` on the wire):
+
+```python
+# server/router.py — Self-send check, direct lookup & secret-free CHAT_ACK
+if sender_username.strip().lower() == recipient_username.strip().lower():
+    sender_handler.send_packet(MessageType.ERROR_NOTICE, {"code": "SELF_MESSAGE_NOT_ALLOWED"})
+    return False, reason
+session = self.server.session_mgr.get_session(recipient_username)
+if session and session.handler:
+    session.handler.send_packet(MessageType.CHAT_DIRECT, direct_payload)
+    sender_handler.send_packet(MessageType.CHAT_ACK, {"status": "DELIVERED", "recipient": session.username, "timestamp": ts})
+```
+
+---
+
+### Step 6: Reliable Direct P2P File Transfer (`client/file_transfer.py`, `client/client_core.py`, `server/client_handler.py`)
+As shown in **Section 3.2 (Red P2P Link)** and **Sequence B (Section 4.4)**, bulk file bytes **never traverse the central server**. Instead, transferring a file executes a strict four-stage direct P2P pipeline:
+
+```mermaid
+flowchart LR
+    S1["1. Tracker Query<br/>PEER_LOOKUP_REQ/RESP"] --> S2["2. Direct TCP +<br/>PEER_HELLO / ACK"]
+    S2 --> S3["3. Negotiate & Stream<br/>FILE_OFFER + 32KB Chunks"]
+    S3 --> S4["4. Receiver Safe Commit<br/>Write .part -> Verify SHA-256<br/>os.replace() -> FILE_ACK"]
+```
+
+To keep RAM usage bounded regardless of file size, `pack_chunk_payload()` packs a compact `[4B !I metadata_len | JSON | <=32 KB raw bytes]` frame. On the receiving side, `IncomingFileTransfer.assemble_and_verify()` writes chunks to a `.part` staging file first and deletes it automatically if the final SHA-256 checksum fails:
+
+```python
+# client/file_transfer.py — Atomic .part assembly & SHA-256 verification
+DEFAULT_CHUNK_SIZE: int = 32 * 1024
+temp_part_path = f"{self.save_path}.{self.file_id}.part"
+try:
+    with open(temp_part_path, "wb") as f:
+        for i in range(self.total_chunks):
+            f.write(self.received_chunks[i])
+    if calculate_file_hash(temp_part_path).lower() != self.expected_sha256.lower():
+        raise ValueError("Mã băm SHA-256 không trùng khớp!")
+    os.replace(temp_part_path, self.save_path)
+except ValueError as err:
+    if os.path.exists(temp_part_path): os.remove(temp_part_path)
+    return False, str(err)
+```
+
+Meanwhile, `ClientHandler` explicitly blocks any attempt to relay file packets (`401..404`) through the server:
+
+```python
+# server/client_handler.py — Explicit server relay rejection
+elif msg_type in (MessageType.FILE_OFFER_REQ, MessageType.FILE_OFFER_RESP, MessageType.FILE_CHUNK, MessageType.FILE_ACK):
+    self.send_packet(MessageType.ERROR_NOTICE, {"code": "FILE_P2P_ONLY", "message": "..."})
+```
+
+---
+
+### Step 7: Network Resilience & Error Handling (`client/heartbeat.py`, `server/server_core.py`)
+When a laptop loses Wi-Fi or a client crashes without sending `DISCONNECT_NOTICE`, TCP sockets can stay open half-dead ("zombie sockets"), blocking usernames in `SessionManager`. Our keepalive loop solves this deterministically (see **Section 4.3 FSM**):
+
+```mermaid
+flowchart LR
+    HB["Client HeartbeatSender<br/>WAIT 4.0s -> HEARTBEAT_PING"] -->|"resets h.last_seen"| SRV["ClientHandler<br/>HEARTBEAT_PONG"]
+    ZC["Server ZombieCleaner<br/>scans every 3.0s"] -->|"now - last_seen > 15.0s"| KILL["h.close() + unregister()<br/>Broadcast LEFT to Peers"]
+```
+
+```python
+# client/heartbeat.py (lines 45-60) — Periodic 4.0s PING probe
+if self._stop_event.wait(timeout=self.interval):
+    break
+    self.client.send_packet(MessageType.HEARTBEAT_PING, {
+        "client": self.client.username or self.client.client_name, "timestamp": time.time(),
+    })
+
+# server/server_core.py (lines 390-405) — Zombie sweep every 3.0s
+for h in self.get_all_handlers():
+    if now - h.last_seen > self.zombie_timeout:  # > 15.0s idle
+        h.close()
+```
+
+---
+
+### Step 8: Security Layer (`common/crypto_utils.py`, `server/client_handler.py`, `client/client_core.py`)
+Traffic protection is **automatic and zero-config**—users do not enter any room password:
+1. **Shared System AES Key (`COLLAB_AES_KEY`):** Both `ServerCore` and `ClientCore` load `get_shared_app_key()` at startup (reading env var `COLLAB_AES_KEY` or falling back to `DEFAULT_SHARED_SECRET`), automatically encrypting `AUTH`, `User List`, `Tracker Lookup`, `CHAT_*`, `CHAT_ACK`, and `PEER_HELLO/ACK` with **Fernet** (`AES-128-CBC + HMAC-SHA256`), setting `FLAG_ENCRYPTED = 0x01`. Unencrypted downgrade attempts are rejected with `ENCRYPTION_REQUIRED`, and mismatched keys fail with `DECRYPTION_FAILED`.
+2. **Ephemeral P2P X25519 Forward Secrecy:** For each P2P file transfer, peers exchange ephemeral `X25519` public keys inside `PEER_HELLO` $\leftrightarrow$ `PEER_HELLO_ACK` (zero extra round-trips), derive a one-time AES session key via `HKDF-SHA256`, encrypt `FILE_OFFER_*`, `FILE_CHUNK`, and `FILE_ACK`, and erase the key in `finally:` upon completion:
+
+```python
+# common/crypto_utils.py — Ephemeral X25519 + HKDF-SHA256 P2P session key
+shared_secret = private_key.exchange(peer_pub)
+derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_P2P_HKDF_INFO).derive(shared_secret)
+return base64.urlsafe_b64encode(derived)
+
+# server/client_handler.py — Reject mismatched or missing AES tokens cleanly
+if packet.is_encrypted and self.server.crypto_key is not None:
+    try:
+        packet = packet.get_decrypted_packet(self.server.crypto_key)
+    except InvalidToken:
+        self.send_packet(MessageType.ERROR_NOTICE, {"code": "DECRYPTION_FAILED", "message": "..."})
+        continue
+```
+
+---
+
+### Step 9: Supporting UI & CLI Integration (`client/gui/app.py`, `run_client.py`)
+From a distributed systems perspective, the Tkinter UI (`client/gui/`) and CLI (`run_client.py`) are **thin presentation wrappers** built atop the single shared `ClientCore` engine. The critical engineering concern at this boundary is **thread safety**: calling Tkinter widget methods directly from `ReceiverThread` or a `P2PWorker` causes freezes or cross-thread GUI crashes. We solve this using a lock-free **Producer–Consumer `queue.Queue`** bridge polled every `50 ms` on the main GUI thread:
+
+```mermaid
+flowchart LR
+    NT["Background Network / P2P Threads<br/>(ReceiverThread, P2PWorker)"] -->|"gui_queue.put((event, data))"| Q[("queue.Queue")]
+    Q -->|"get_nowait() every 50ms"| UI["Tkinter Main Thread<br/>_process_gui_queue()"]
+```
+
+```python
+# Excerpt from client/gui/app.py (lines 172-186 & 210-222)
+def on_broadcast(pkt: Packet):
+    self.gui_queue.put(("chat_broadcast", _safe_json(pkt)))
+
+def on_direct(pkt: Packet):
+    self.gui_queue.put(("chat_direct", _safe_json(pkt)))
+
+def _process_gui_queue(self) -> None:
+    try:
+        while True:
+            event_type, data = self.gui_queue.get_nowait()
+            self._dispatch_gui_event(event_type, data)
+    except queue.Empty:
+        pass
+    finally:
+        self.after(50, self._process_gui_queue)
+```
+
+---
+
+### Step 10: Automated Testing, Stress Verification & Code Quality (`tests/`, `.github/workflows/ci.yml`)
+Beyond happy-path checks, our **76 Pytest tests** rigorously target edge-case failures: non-dict JSON `HELLO` payloads, occupied-port deadlocks, slow handshake isolation, auth gates, automatic `COLLAB_AES_KEY` & anti-downgrade (`ENCRYPTION_REQUIRED`), ephemeral X25519 P2P forward secrecy, 1-byte TCP fragmentation, `> 50 MB` headers, `threading.Barrier` race conditions, O(1) `.part` SHA-256 cleanup, non-overwriting downloads, path traversal, zombie departure snapshots, and a $\ge 98\%$ delivery stress harness. Every commit is verified across **Ubuntu, Windows, and macOS** via `.github/workflows/ci.yml`:
+
+```python
+# tests/test_auth.py (lines 250-264) — Simultaneous Barrier login race test
+def racer(idx: int):
+    barrier.wait(timeout=3.0)
+    ok, _ = clients[idx].authenticate("RaceWinner", timeout=3.0)
+    outcomes[idx] = ok
+# Asserts strictly 1 winner and 4 rejections:
+assert outcomes.count(True) == 1 and outcomes.count(False) == num_racers - 1
+```
+
+```yaml
+# .github/workflows/ci.yml — 3-OS automated Pytest matrix
+matrix:
+  os: [ubuntu-latest, windows-latest, macos-latest]
+run: xvfb-run -a pytest -v   # (or pytest -v on Windows / macOS)
+```
+
+---
+
+## 6. Engineering Challenges & Solutions
+
+*(Concise 1-page reflection on the hardest distributed systems issues resolved during development.)*
+
+1. **TCP Stream Concatenation & Partial Reads**
+   - *Challenge:* Sending back-to-back JSON messages or `FILE_CHUNK` streams caused `socket.recv()` to merge two packets or truncate mid-payload, breaking JSON decoding.
+   - *Solution:* Replaced naive `recv(4096)` calls with the 16-byte fixed binary header (`!2sBHBHQ`) and deterministic `recv_exact(sock, n)` loops that validate `b"CA"` magic bytes, protocol version, and payload upper bounds (`50 MB`). Tested explicitly under 1-byte fragmentation and concatenated bursts in `tests/test_protocol.py`.
+
+2. **Tkinter UI Freezes & Cross-Thread Exceptions**
+   - *Challenge:* Invoking `Text.insert()` or opening file progress bars directly from the `ReceiverThread` or `P2PWorker` threads caused Tkinter runtime crashes and UI freezes on Windows and Linux.
+   - *Solution:* Enforced strict single-thread UI ownership in `client/gui/app.py`. Network threads only call `self.gui_queue.put((event, data))`, while the Tkinter main loop polls `queue.get_nowait()` every `50 ms` using `self.after(...)`.
+
+3. **Half-Open ("Zombie") Sockets After Unplugged Cables or Process Kills**
+   - *Challenge:* When a client terminates abruptly without closing its TCP socket cleanly, TCP alone may take minutes to detect the dead peer, leaving stale usernames locked in `SessionManager`.
+   - *Solution:* Combined a 4.0-second client `HeartbeatSender` (`HEARTBEAT_PING`) with a server `ZombieCleaner` background thread scanning every 3.0s (`zombie_timeout = 15.0s`). Stale sessions are closed, evicted, and broadcast as `LEFT` automatically (verified in `tests/test_resilience.py`).
+
+4. **Server Bottleneck vs. Peer Discovery in Direct P2P File Transfer**
+   - *Challenge:* Initially, routing 32 KB file chunks through `MessageRouter` burdened the server with every file transfer. Switching to P2P introduced two new pitfalls: (a) how to find a peer's ephemeral port, and (b) clients accidentally registering `127.0.0.1` instead of their real LAN IP.
+   - *Solution:* Kept the server as a lightweight Tracker (`PEER_LOOKUP_REQ` -> `PEER_LOOKUP_RESP`) storing each client's `effective_ip` (derived by the server from the incoming TCP socket peer address) and client-supplied `p2p_port`. Removed fallback server relaying entirely (`FILE_P2P_ONLY`) so file failures fail loudly and clearly without hiding broken LAN/firewall configurations.
+
+5. **Cross-Platform Behavior & Headless Linux GUI Testing**
+   - *Challenge:* Emoji/UTF-8 console output on Windows triggered `cp1252` encoding errors, while headless Ubuntu runners lack an X display for Tkinter GUI tests (`tests/test_gui.py`).
+   - *Solution:* Standardized `PYTHONUTF8="1"` across runs and CI, used OS-independent `pathlib` / `os.path.basename` path sanitization, and configured GitHub Actions (`.github/workflows/ci.yml`) to execute `xvfb-run -a pytest -v` on `ubuntu-latest` alongside `windows-latest` and `macos-latest`.
+
+---
+
+## 7. Testing, Stress Benchmarks & Cross-Platform CI
+
+### 7.1 Automated Pytest Suite (76 Tests)
+| Test Module | Count | Verified Behavior |
+| :--- | :---: | :--- |
+| `tests/test_protocol.py` | 12 | 16-byte header packing, magic/version/oversized rejection, 1B fragmentation, mid-payload close, concatenated packets |
+| `tests/test_handshake.py` | 9 | Valid handshake, version mismatch, non-dict JSON DoS guard, `RLock` bind, non-blocking slow handshake |
+| `tests/test_concurrency.py` | 6 | Auth gate (`AUTH_REQUIRED`), concurrent logins/disconnects, simultaneous Barrier burst without interleaving |
+| `tests/test_auth.py` | 8 | Login success, duplicate rejection, 5-thread race (`Barrier`), regex rules, live `online_users`/`peers` sync |
+| `tests/test_router.py` | 5 | Room broadcast, private 1-on-1 routing, case-insensitive recipient, `CHAT_ACK` metadata without plaintext leak |
+| `tests/test_file_transfer.py` | 12 | Direct P2P transfer, O(1) `.part` streaming + SHA-256 cleanup, non-overwrite, index bounds, path traversal, `FILE_P2P_ONLY` |
+| `tests/test_resilience.py` | 4 | Heartbeat keepalive, graceful disconnect, zombie eviction + `LEFT` list sync, abrupt drop reset & queue cap |
+| `tests/test_crypto.py` | 12 | Auto `COLLAB_AES_KEY` & env override, anti-downgrade `ENCRYPTION_REQUIRED`, ephemeral X25519 P2P forward secrecy |
+| `tests/test_gui.py` | 7 | Login validation, auto `online_users` sync, safe logout state reset, `gui_queue` dispatching, progress dialog |
+| `tests/stress_test.py` | 1 | 15-client automated concurrency & $\ge 98\%$ delivery rate stress harness (also runnable standalone) |
+| **Total** | **76** | **76 Passed / 0 Failed / 0 Skipped** |
+
+### 7.2 Observed Multi-Environment Test Results
+- **Windows 11 Local (`.\venv\Scripts\pytest -v`):** **76 passed** (0 failed, 0 skipped).
+- **WSL2 Ubuntu Linux (`xvfb-run -a pytest -v`):** **All tests passed** (0 failed, 0 skipped).
+- **GitHub Actions CI (Python 3.12):**
+  - `Pytest on ubuntu-latest (Python 3.12)` -> `completed (success)`
+  - `Pytest on windows-latest (Python 3.12)` -> `completed (success)`
+  - `Pytest on macos-latest (Python 3.12)` -> `completed (success)`
+
+### 7.3 Concurrent Stress Test Benchmark (16 Clients)
+Command executed: `python tests/stress_test.py --clients 16 --duration 5.0`
+- **Clients Connected & Authenticated:** **16 / 16** in **0.07 seconds**
+- **Active Stress Duration:** **5.23 seconds**
+- **Total Messages Sent:** **482 messages** (**92.2 messages/sec**)
+- **Total Deliveries Received:** **5,282 deliveries** (broadcast fan-out across peers)
+- **Socket Errors / Resource Leaks:** **0**
+
+---
+
+## 8. Installation & Running Guide
+
+### 8.1 Prerequisites & Environment Setup (Windows, macOS, Linux)
+Requires **Python 3.10+** (tested on Python 3.12). On Linux desktops/servers running GUI tests, ensure Tkinter/Xvfb packages are installed (`sudo apt-get install -y python3-tk libtk8.6 xvfb`).
+
+```bash
+# 1. Clone repository
+git clone https://github.com/QuanNguyenCS/DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION.git
+cd DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION
+
+# 2. Create and activate virtual environment
+python -m venv venv
+# Windows PowerShell:
+.\venv\Scripts\activate
+# macOS / Linux:
+source venv/bin/activate
+
+# 3. Install dependencies (cryptography, pytest)
+pip install -r requirements.txt
+```
+
+### 8.2 Running the Server
+```bash
+# Default server on 0.0.0.0:9000 (automatic AES encryption active via COLLAB_AES_KEY / built-in default)
+python run_server.py --host 0.0.0.0 --port 9000
+```
+
+### 8.3 Running Clients (GUI or CLI)
+**Option A — Desktop GUI (`Tkinter`):**
+```bash
+python run_gui.py
+```
+Enter Server IP (`127.0.0.1` locally or the Server's LAN IP like `192.168.1.10`), Port (`9000`), Username, and optional Passphrase. Double-click any user in the online list to open a 1-on-1 chat tab, or click **Send File** to transmit via Direct P2P.
+
+**Option B — Terminal CLI:**
+```bash
+python run_client.py --host 127.0.0.1 --port 9000 --username Bob --p2p-port 0
+```
+| CLI Command | Action |
+| :--- | :--- |
+| `<message text>` | Send broadcast message to the shared room |
+| `@<user> <text>` or `/msg <user> <text>` | Send private 1-on-1 direct message |
+| `/file <user> <path>` or `/sendfile <user> <path>` | Send file directly P2P with SHA-256 check |
+| `/users` or `/who` | Display online users |
+| `/ping` | Send manual `HEARTBEAT_PING` |
+| `/quit` or `/exit` | Send `DISCONNECT_NOTICE` and close cleanly |
+
+### 8.4 Running on a Multi-Machine LAN
+- All machines must sit on the same LAN subnet (or VPN).
+- Clients on another PC **must** connect using the Server's real LAN IP (not `127.0.0.1`).
+- Allow TCP traffic on the Server port (`9000`) and each Client's P2P listener port (specify fixed ports via `--p2p-port 51001` in CLI if configuring strict firewall rules).
+
+### 8.5 Running Tests & Stress Benchmark
+```bash
+# Full automated suite (Linux headless needs: xvfb-run -a pytest -v)
+pytest -v
+
+# 16-client stress benchmark
+python tests/stress_test.py --clients 16 --duration 5.0
+```
+
+---
+
+## 9. Conclusion
+This project delivers a clean, well-tested, cross-platform distributed collaboration system built directly over raw TCP sockets. By keeping authentication, presence tracking, and ordered chat on a multi-threaded central server while offloading file streams onto direct peer-to-peer sockets protected by PBKDF2-derived Fernet encryption and SHA-256 verification, the application avoids central file bottlenecks without sacrificing chat ordering or state consistency. All 76 tests pass reliably across Windows, Linux, and macOS.

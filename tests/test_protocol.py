@@ -15,13 +15,16 @@ from common.message_types import MessageType
 from common.protocol import (
     FLAG_ENCRYPTED,
     FLAG_NONE,
+    HEADER_FORMAT,
     HEADER_SIZE,
     MAGIC_BYTES,
+    MAX_PAYLOAD_SIZE,
     PROTOCOL_VERSION,
     ConnectionClosedError,
     InvalidMagicBytesError,
     Packet,
     PayloadTooLargeError,
+    UnsupportedVersionError,
     create_packet,
     recv_exact,
     recv_packet,
@@ -169,3 +172,59 @@ class TestSocketPairTransmission:
 
         with pytest.raises(ConnectionClosedError):
             recv_packet(server_sock)
+
+    def test_connection_closed_mid_payload_raises_error(self, sock_pair):
+        """Khi gửi đủ 16 bytes header nhưng ngắt kết nối giữa chừng khi đang truyền payload."""
+        server_sock, client_sock = sock_pair
+
+        header = struct.pack(
+            HEADER_FORMAT,
+            MAGIC_BYTES,
+            PROTOCOL_VERSION,
+            int(MessageType.CHAT_BROADCAST),
+            FLAG_NONE,
+            0,
+            100,  # Khai báo payload 100 bytes
+        )
+        client_sock.sendall(header + b"short_payload_only_24b__")
+        client_sock.close()
+
+        with pytest.raises(ConnectionClosedError):
+            recv_packet(server_sock)
+
+    def test_unsupported_version_raises_error(self, sock_pair):
+        """Khi nhận gói tin có version khác PROTOCOL_VERSION, phải ném UnsupportedVersionError."""
+        server_sock, client_sock = sock_pair
+
+        bad_version_header = struct.pack(
+            HEADER_FORMAT,
+            MAGIC_BYTES,
+            99,  # Version không hỗ trợ
+            int(MessageType.HELLO_HANDSHAKE),
+            FLAG_NONE,
+            0,
+            0,
+        )
+        client_sock.sendall(bad_version_header)
+
+        with pytest.raises(UnsupportedVersionError):
+            recv_packet(server_sock)
+
+    def test_payload_too_large_raises_error_without_oom(self, sock_pair):
+        """Khi header khai báo payload vượt MAX_PAYLOAD_SIZE (50 MB), phải chặn ngay bằng PayloadTooLargeError."""
+        server_sock, client_sock = sock_pair
+
+        oversized_header = struct.pack(
+            HEADER_FORMAT,
+            MAGIC_BYTES,
+            PROTOCOL_VERSION,
+            int(MessageType.FILE_CHUNK),
+            FLAG_NONE,
+            0,
+            MAX_PAYLOAD_SIZE + 1024,
+        )
+        client_sock.sendall(oversized_header)
+
+        with pytest.raises(PayloadTooLargeError):
+            recv_packet(server_sock)
+

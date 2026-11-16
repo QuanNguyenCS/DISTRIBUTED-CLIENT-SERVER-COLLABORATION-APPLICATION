@@ -202,10 +202,12 @@ class TestAuthenticationIntegration:
         # Chờ gói tin phát thanh lan truyền tới Alice
         time.sleep(0.4)
 
-        # Alice phải nhận được thông báo Bob JOINED kèm P2P endpoint
+        # Alice phải nhận được thông báo Bob JOINED kèm danh sách online & P2P endpoint
         assert len(alice_events) >= 1
         assert alice_events[-1]["event"] == "JOINED"
         assert alice_events[-1]["username"] == "Bob"
+        assert set(alice_events[-1]["online_users"]) == {"Alice", "Bob"}
+        assert "Bob" in alice_events[-1].get("peers", {})
         assert alice_events[-1].get("peer", {}).get("p2p_port") == bob.p2p_port
         assert "Bob" in alice.online_users
         assert "Bob" in alice.peer_directory
@@ -220,12 +222,53 @@ class TestAuthenticationIntegration:
         bob.disconnect()
         time.sleep(0.4)
 
-        # Alice phải nhận được thông báo Bob LEFT và xóa khỏi peer directory
+        # Alice phải nhận được thông báo Bob LEFT kèm danh sách online đã loại bỏ Bob
         assert alice_events[-1]["event"] == "LEFT"
         assert alice_events[-1]["username"] == "Bob"
+        assert alice_events[-1]["online_users"] == ["Alice"]
+        assert "Bob" not in alice_events[-1].get("peers", {})
         assert "Bob" not in alice.online_users
         assert "Bob" not in alice.peer_directory
 
         alice.disconnect()
         server.stop()
         sthread.join(timeout=2.0)
+
+    def test_concurrent_same_username_race_condition(self):
+        """Khi 5 luồng cùng gửi yêu cầu đăng ký 1 tên 'RaceWinner' tại cùng 1 thời điểm, chỉ duy nhất 1 luồng thành công."""
+        port = get_free_port()
+        server = ServerCore(host="127.0.0.1", port=port)
+        sthread = threading.Thread(target=server.serve_forever, daemon=True)
+        sthread.start()
+        time.sleep(0.3)
+
+        num_racers = 5
+        clients = [ClientCore(server_host="127.0.0.1", server_port=port) for _ in range(num_racers)]
+        barrier = threading.Barrier(num_racers)
+        outcomes = [False] * num_racers
+
+        try:
+            for c in clients:
+                assert c.connect() is True
+
+            def racer(idx: int):
+                barrier.wait(timeout=3.0)
+                ok, _ = clients[idx].authenticate("RaceWinner", timeout=3.0)
+                outcomes[idx] = ok
+
+            threads = [threading.Thread(target=racer, args=(i,)) for i in range(num_racers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5.0)
+
+            # Phải có đúng 1 client đăng nhập thành công và 4 client bị từ chối
+            assert outcomes.count(True) == 1
+            assert outcomes.count(False) == num_racers - 1
+            assert server.session_mgr.get_user_count() == 1
+        finally:
+            for c in clients:
+                c.disconnect()
+            server.stop()
+            sthread.join(timeout=2.0)
+

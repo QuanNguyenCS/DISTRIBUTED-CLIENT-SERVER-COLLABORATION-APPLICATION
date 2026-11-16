@@ -1,7 +1,7 @@
 """
 Module: common.message_types
-Mô tả: Định nghĩa các mã thông điệp (Message Types) cho giao thức tầng ứng dụng.
-Mỗi loại thông điệp tương ứng với một hành vi/chức năng cụ thể trong hệ thống.
+Mô tả: Định nghĩa các mã thông điệp cho giao thức tầng ứng dụng.
+Mỗi loại thông điệp tương ứng với một hành vi hay chức năng cụ thể trong hệ thống.
 """
 
 from enum import IntEnum, unique
@@ -10,8 +10,8 @@ from enum import IntEnum, unique
 @unique
 class MessageType(IntEnum):
     """
-    Enum định nghĩa các mã loại thông điệp (Message Types).
-    Sử dụng IntEnum để dễ dàng pack/unpack thành số nguyên 2 bytes (unsigned short).
+    Enum định nghĩa các mã loại thông điệp.
+    Sử dụng IntEnum để dễ dàng pack hay unpack thành số nguyên 2 bytes (unsigned short).
     
     Phân nhóm mã theo dải số:
       - 100-199: Bắt tay & Xác thực (Handshake & Authentication)
