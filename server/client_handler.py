@@ -10,6 +10,8 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import queue
+from common.peer_auth import read_public_key
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from cryptography.fernet import InvalidToken
@@ -23,6 +25,7 @@ from common.protocol import (
     ProtocolError,
     create_packet,
     recv_packet,
+    MAX_CONTROL_PAYLOAD_SIZE,
 )
 
 if TYPE_CHECKING:
@@ -34,7 +37,7 @@ logger = get_logger("server.handler")
 class ClientHandler(threading.Thread):
     """
     Luồng độc lập chuyên trách một kết nối Client.
-    
+
     Vòng đời của ClientHandler:
       1. Khởi tạo với client_sock, client_addr và tham chiếu tới ServerCore.
       2. Chạy phương thức run() trên một Thread riêng biệt (Daemon Thread).
@@ -60,25 +63,31 @@ class ClientHandler(threading.Thread):
         self.client_info = client_info if isinstance(client_info, dict) else {}
         raw_name = self.client_info.get("client_name")
         self.client_name: str = (
-            raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else f"User@{client_addr[1]}"
+            raw_name.strip()
+            if isinstance(raw_name, str) and raw_name.strip()
+            else f"User@{client_addr[1]}"
         )
         self.is_running: bool = False
         self._send_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._closed: bool = False
+        self._outgoing = queue.Queue(maxsize=128)
+        self._writer_thread = None
 
         # Quản lý xác thực và danh tính người dùng
         self.is_authenticated: bool = False
         self.username: Optional[str] = None
 
         # Giám sát nhịp tim (Liveness / Heartbeat tracking)
-        self.last_seen: float = time.time()
+        self.last_seen: float = time.monotonic()
 
     def run(self) -> None:
         """
         Vòng lặp lắng nghe chính chạy trong luồng riêng.
         """
         self.is_running = True
+        self._writer_thread = threading.Thread(target=self._write_packets, daemon=True)
+        self._writer_thread.start()
         logger.info(
             "🧵 Luồng [%s] bắt đầu phục vụ client '%s' (%s:%d)",
             self.name,
@@ -90,7 +99,9 @@ class ClientHandler(threading.Thread):
         try:
             while self.is_running:
                 # Đọc gói tin hoàn chỉnh theo chuẩn Application Layer Framing
-                packet = recv_packet(self.client_sock)
+                packet = recv_packet(
+                    self.client_sock, max_payload_size=MAX_CONTROL_PAYLOAD_SIZE
+                )
                 was_encrypted = packet.is_encrypted
                 if packet.is_encrypted and self.server.crypto_key is not None:
                     try:
@@ -109,7 +120,13 @@ class ClientHandler(threading.Thread):
                             },
                         )
                         continue
-                self._dispatch_packet(packet, was_encrypted=was_encrypted)
+                try:
+                    self._dispatch_packet(packet, was_encrypted=was_encrypted)
+                except (ValueError, TypeError, AttributeError) as exc:
+                    self.send_packet(
+                        MessageType.ERROR_NOTICE,
+                        {"code": "INVALID_PAYLOAD", "message": str(exc)},
+                    )
 
         except ConnectionClosedError:
             logger.info(
@@ -142,6 +159,11 @@ class ClientHandler(threading.Thread):
                     self.client_name,
                     exc,
                 )
+        except (ValueError, TypeError, AttributeError) as exc:
+            self.send_packet(
+                MessageType.ERROR_NOTICE,
+                {"code": "INVALID_PAYLOAD", "message": str(exc)},
+            )
         finally:
             self.close()
 
@@ -150,7 +172,7 @@ class ClientHandler(threading.Thread):
         Phân loại và điều hướng xử lý gói tin nhận được.
         """
         # Cập nhật thời điểm nhận gói tin cuối cùng từ Client
-        self.last_seen = time.time()
+        self.last_seen = time.monotonic()
         msg_type = packet.msg_type
         logger.debug(
             "[%s:%d] Nhận gói tin mã %s (Payload: %d bytes)",
@@ -186,7 +208,8 @@ class ClientHandler(threading.Thread):
         if (
             self.server.crypto_key is not None
             and not was_encrypted
-            and msg_type in (
+            and msg_type
+            in (
                 MessageType.AUTH_REQ,
                 MessageType.USER_LIST_REQ,
                 MessageType.PEER_LOOKUP_REQ,
@@ -222,16 +245,28 @@ class ClientHandler(threading.Thread):
             # Xử lý yêu cầu xác thực / đăng nhập kèm đăng ký cổng P2P lên Tracker
             req_p2p_port: Optional[int] = None
             req_p2p_host: Optional[str] = None
+            identity_key = None
             try:
                 auth_payload = packet.to_json()
                 if isinstance(auth_payload, dict):
                     req_username = auth_payload.get("username", "")
                     req_p2p_port = auth_payload.get("p2p_port")
                     req_p2p_host = auth_payload.get("p2p_host")
+                    identity_key = auth_payload.get("identity_key")
                 else:
                     req_username = packet.to_text()
             except Exception:
                 req_username = packet.to_text()
+
+            if req_p2p_port is not None:
+                try:
+                    read_public_key(identity_key)
+                except (TypeError, ValueError):
+                    self.send_packet(
+                        MessageType.AUTH_RESP_FAIL,
+                        {"status": "FAIL", "reason": "Invalid P2P identity key."},
+                    )
+                    return
 
             if self.is_authenticated:
                 fail_payload = {
@@ -241,38 +276,47 @@ class ClientHandler(threading.Thread):
                 self.send_packet(MessageType.AUTH_RESP_FAIL, fail_payload)
                 return
 
-            success, reason, session = self.server.session_mgr.register_user(
-                username=req_username,
-                handler=self,
-                address=self.client_addr,
-                p2p_port=req_p2p_port,
-                p2p_host=req_p2p_host,
-            )
+            with self.server._broadcast_lock:
+                with self._close_lock:
+                    if self._closed:
+                        return
+                    success, reason, session = self.server.session_mgr.register_user(
+                        username=req_username,
+                        handler=self,
+                        address=self.client_addr,
+                        p2p_port=req_p2p_port,
+                        p2p_host=req_p2p_host,
+                        identity_key=identity_key,
+                    )
 
-            if not success or not session:
-                fail_payload = {"status": "FAIL", "reason": reason}
-                self.send_packet(MessageType.AUTH_RESP_FAIL, fail_payload)
-            else:
-                self.is_authenticated = True
-                self.username = session.username
-                self.client_name = session.username
+                    if success and session:
+                        self.is_authenticated = True
+                        self.username = session.username
+                        self.client_name = session.username
 
-                # Phản hồi đăng nhập thành công kèm danh sách user & danh bạ P2P hiện tại
-                success_payload = {
-                    "status": "SUCCESS",
-                    "username": self.username,
-                    "online_users": self.server.session_mgr.get_all_users(),
-                    "peers": self.server.session_mgr.get_all_peer_endpoints(),
-                    "message": "Đăng nhập thành công.",
-                }
-                self.send_packet(MessageType.AUTH_RESP_SUCCESS, success_payload)
+                if not success or not session:
+                    fail_payload = {"status": "FAIL", "reason": reason}
+                    self.send_packet(MessageType.AUTH_RESP_FAIL, fail_payload)
+                else:
+                    # Phản hồi đăng nhập thành công kèm danh sách user & danh bạ P2P hiện tại
+                    success_payload = {
+                        "status": "SUCCESS",
+                        "username": self.username,
+                        "session_id": session.session_id,
+                        "online_users": self.server.session_mgr.get_all_users(),
+                        "peers": self.server.session_mgr.get_all_peer_endpoints(),
+                        "message": "Đăng nhập thành công.",
+                    }
+                    self.send_packet(MessageType.AUTH_RESP_SUCCESS, success_payload)
 
-                # Phát thông báo cho tất cả client khác biết có người vừa tham gia kèm danh sách online
-                self._broadcast_user_status(
-                    event="JOINED",
-                    username=self.username,
-                    peer=session.to_peer_dict() if session.p2p_port is not None else None,
-                )
+                    # Phát thông báo cho tất cả client khác biết có người vừa tham gia kèm danh sách online
+                    self._broadcast_user_status(
+                        event="JOINED",
+                        username=self.username,
+                        peer=session.to_peer_dict()
+                        if session.p2p_port is not None
+                        else None,
+                    )
 
         elif msg_type == MessageType.USER_LIST_REQ:
             # Trả về danh sách tất cả các user đang online kèm danh bạ IP:P2P_Port
@@ -286,6 +330,7 @@ class ClientHandler(threading.Thread):
 
         elif msg_type == MessageType.PEER_LOOKUP_REQ:
             # Control Plane Tracker: Tra cứu địa chỉ IP:P2P_Port cho Client
+            lookup_data = {}
             try:
                 lookup_data = packet.to_json()
                 target = str(
@@ -294,8 +339,16 @@ class ClientHandler(threading.Thread):
             except Exception:
                 target = ""
 
+            request_id = (
+                lookup_data.get("request_id") if isinstance(lookup_data, dict) else None
+            )
+
+            def send_lookup(msg_type, payload):
+                payload["request_id"] = request_id
+                return self.send_packet(msg_type, payload)
+
             if not target:
-                self.send_packet(
+                send_lookup(
                     MessageType.PEER_LOOKUP_RESP,
                     {
                         "found": False,
@@ -308,7 +361,7 @@ class ClientHandler(threading.Thread):
 
             session = self.server.session_mgr.get_session(target)
             if not session or not session.handler:
-                self.send_packet(
+                send_lookup(
                     MessageType.PEER_LOOKUP_RESP,
                     {
                         "found": False,
@@ -320,7 +373,7 @@ class ClientHandler(threading.Thread):
                 return
 
             if session.p2p_port is None:
-                self.send_packet(
+                send_lookup(
                     MessageType.PEER_LOOKUP_RESP,
                     {
                         "found": False,
@@ -338,7 +391,7 @@ class ClientHandler(threading.Thread):
                 session.effective_ip,
                 session.p2p_port,
             )
-            self.send_packet(
+            send_lookup(
                 MessageType.PEER_LOOKUP_RESP,
                 {
                     "found": True,
@@ -346,6 +399,10 @@ class ClientHandler(threading.Thread):
                     "username": session.username,
                     "ip": session.effective_ip,
                     "p2p_port": session.p2p_port,
+                    "request_id": lookup_data.get("request_id"),
+                    "ticket": self.server.issue_peer_ticket(
+                        self.server.session_mgr.get_session(self.username), session
+                    ),
                 },
             )
 
@@ -357,7 +414,9 @@ class ClientHandler(threading.Thread):
             if packet.is_encrypted:
                 # Server không có khóa giải mã (chế độ E2EE Client-to-Client):
                 # Chuyển tiếp nguyên vẹn payload đã mã hóa và giữ nguyên cờ FLAG_ENCRYPTED!
-                sender_name = self.username if self.is_authenticated else self.client_name
+                sender_name = (
+                    self.username if self.is_authenticated else self.client_name
+                )
                 logger.info(
                     "🔒📢 [Encrypted Broadcast Relay] từ '%s' (%d bytes ciphertext)",
                     sender_name,
@@ -472,14 +531,15 @@ class ClientHandler(threading.Thread):
         Returns:
             bool: True nếu gửi thành công, False nếu kết nối đã hỏng.
         """
-        if not self.is_running and not self.client_sock:
+        if self._closed or not self.client_sock:
             return False
 
         try:
             encrypt_target = (
                 self.server.crypto_key is not None
                 and not (flags & FLAG_ENCRYPTED)
-                and int(msg_type) in (
+                and int(msg_type)
+                in (
                     MessageType.AUTH_RESP_SUCCESS,
                     MessageType.AUTH_RESP_FAIL,
                     MessageType.USER_LIST_RESP,
@@ -496,10 +556,11 @@ class ClientHandler(threading.Thread):
                 flags=flags,
                 encrypt_key=self.server.crypto_key if encrypt_target else None,
             )
-            with self._send_lock:
-                if self.client_sock:
-                    self.client_sock.sendall(packet_bytes)
+            self._outgoing.put_nowait(packet_bytes)
             return True
+        except queue.Full:
+            threading.Thread(target=self.close, daemon=True).start()
+            return False
         except (OSError, ConnectionError) as exc:
             logger.warning(
                 "Không thể gửi gói tin tới [%s:%d]: %s",
@@ -509,6 +570,27 @@ class ClientHandler(threading.Thread):
             )
             self.is_running = False
             return False
+
+    def _write_packets(self):
+        while self.is_running and not self._closed:
+            try:
+                data = self._outgoing.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            sock = self.client_sock
+            if sock is None:
+                break
+            timer = threading.Timer(3.0, self.close)
+            timer.daemon = True
+            timer.start()
+            try:
+                with self._send_lock:
+                    sock.sendall(data)
+            except OSError:
+                self.close()
+                break
+            finally:
+                timer.cancel()
 
     def _broadcast_user_status(
         self,
@@ -520,23 +602,24 @@ class ClientHandler(threading.Thread):
         Phát thanh sự kiện JOINED/LEFT kèm danh sách online và danh bạ P2P mới nhất
         tới toàn bộ các client khác đang kết nối.
         """
-        online_users = self.server.session_mgr.get_all_users()
-        payload: Dict[str, Any] = {
-            "event": event,
-            "username": username,
-            "online_users": online_users,
-            "peers": self.server.session_mgr.get_all_peer_endpoints(),
-            "online_count": len(online_users),
-            "timestamp": time.time(),
-        }
-        if peer is not None:
-            payload["peer"] = peer
-        self.server.broadcast_packet(
-            MessageType.USER_STATUS_BROADCAST,
-            payload,
-            exclude_addr=self.client_addr,
-            only_authenticated=True,
-        )
+        with self.server._broadcast_lock:
+            online_users = self.server.session_mgr.get_all_users()
+            payload: Dict[str, Any] = {
+                "event": event,
+                "username": username,
+                "online_users": online_users,
+                "peers": self.server.session_mgr.get_all_peer_endpoints(),
+                "online_count": len(online_users),
+                "timestamp": time.time(),
+            }
+            if peer is not None:
+                payload["peer"] = peer
+            self.server.broadcast_packet(
+                MessageType.USER_STATUS_BROADCAST,
+                payload,
+                exclude_addr=self.client_addr,
+                only_authenticated=True,
+            )
 
     def close(self) -> None:
         """
@@ -548,13 +631,14 @@ class ClientHandler(threading.Thread):
             self._closed = True
 
         self.is_running = False
-        if self.client_sock:
+        sock = self.client_sock
+        self.client_sock = None
+        if sock:
             try:
-                self.client_sock.close()
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            finally:
-                self.client_sock = None
+            sock.close()
 
         # 1. Hủy đăng ký phiên người dùng nếu đã đăng nhập và phát thanh thông báo LEFT (tránh trùng lặp)
         if self.is_authenticated and self.username:
@@ -568,7 +652,9 @@ class ClientHandler(threading.Thread):
             # Dự phòng: Hủy theo handler nếu có
             removed_session = self.server.session_mgr.unregister_by_handler(self)
             if removed_session:
-                self._broadcast_user_status(event="LEFT", username=removed_session.username)
+                self._broadcast_user_status(
+                    event="LEFT", username=removed_session.username
+                )
 
         # 2. Báo cho Server dọn dẹp handler này khỏi danh sách quản lý
         self.server.unregister_handler(self.client_addr)
@@ -577,4 +663,3 @@ class ClientHandler(threading.Thread):
             self.client_addr[0],
             self.client_addr[1],
         )
-

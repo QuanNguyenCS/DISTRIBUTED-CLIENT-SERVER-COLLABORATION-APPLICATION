@@ -10,6 +10,10 @@ import socket
 import sys
 import threading
 import time
+import uuid
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from common.peer_auth import public_key_text, sign
+from common.discovery import DiscoveryResponder
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from common.crypto_utils import derive_key, get_shared_app_key
@@ -33,7 +37,7 @@ logger = get_logger("server.core")
 class ServerCore:
     """
     Lớp quản lý Server TCP ở tầng mạng áp dụng mô hình Thread-per-Client.
-    
+
     Vòng đời của Server Socket:
       1. Khởi tạo socket TCP: socket(AF_INET, SOCK_STREAM)
       2. Cấu hình cờ SO_REUSEADDR (tránh lỗi 'Address already in use' khi khởi động lại)
@@ -49,6 +53,7 @@ class ServerCore:
     HANDSHAKE_TIMEOUT: float = 10.0
     HANDSHAKE_MAX_PAYLOAD: int = 64 * 1024
     MAX_PENDING_HANDSHAKES: int = 64
+    MAX_ACTIVE_CONNECTIONS: int = 128
 
     def __init__(
         self,
@@ -67,6 +72,9 @@ class ServerCore:
         # Quản lý danh sách các ClientHandler đang hoạt động theo (IP, Port)
         self.handlers: Dict[Tuple[str, int], ClientHandler] = {}
         self._handlers_lock = threading.Lock()
+        self._broadcast_lock = threading.RLock()
+        self._ticket_key = Ed25519PrivateKey.generate()
+        self._discovery = None
         self._pending_sockets: Set[socket.socket] = set()
         self._handshake_sem = threading.BoundedSemaphore(self.MAX_PENDING_HANDSHAKES)
 
@@ -77,22 +85,33 @@ class ServerCore:
         self.router = MessageRouter(self)
 
         # Giám sát kết nối Zombie & Quản lý nhịp tim
-        self.zombie_timeout: float = 15.0  # Quá 15 giây không có tín hiệu coi như mất mạng ngầm
+        self.zombie_timeout: float = (
+            15.0  # Quá 15 giây không có tín hiệu coi như mất mạng ngầm
+        )
         self.zombie_check_interval: float = 3.0
         self._zombie_cleaner_thread: Optional[threading.Thread] = None
         self._stop_zombie_event = threading.Event()
 
         # Lớp Bảo mật & Mã hóa dữ liệu (Tự động bật AES-Fernet từ COLLAB_AES_KEY / mặc định)
-        self.crypto_key: Optional[bytes] = get_shared_app_key() if auto_encrypt else None
+        self.crypto_key: Optional[bytes] = (
+            get_shared_app_key() if auto_encrypt else None
+        )
 
     def enable_encryption(self, passphrase: Optional[str] = None) -> None:
         """Kích hoạt hoặc ghi đè khóa AES (Fernet) cho Server."""
-        self.crypto_key = get_shared_app_key(passphrase) if passphrase else get_shared_app_key()
+        self.crypto_key = (
+            get_shared_app_key(passphrase) if passphrase else get_shared_app_key()
+        )
+        if self._discovery is not None:
+            self._discovery.key = self.crypto_key
         logger.info("🔒 Đã kích hoạt lớp mã hóa AES cho Server.")
 
     def disable_encryption(self) -> None:
         """Tắt mã hóa đối xứng trên Server."""
         self.crypto_key = None
+        if self._discovery is not None:
+            self._discovery.close()
+            self._discovery = None
         logger.info("🔓 Đã tắt lớp mã hóa AES trên Server.")
 
     def start(self) -> None:
@@ -116,7 +135,12 @@ class ServerCore:
 
                 # 4. Bắt đầu lắng nghe các kết nối từ client
                 self.server_sock.listen(self.DEFAULT_BACKLOG)
+                self.port = self.server_sock.getsockname()[1]
                 self.is_running = True
+                if self.crypto_key is not None:
+                    self._discovery = DiscoveryResponder(
+                        self.host, self.port, self.server_id, self.crypto_key
+                    )
 
                 # 5. Khởi chạy luồng dọn dẹp Zombie kết nối ngầm
                 self._stop_zombie_event.clear()
@@ -135,7 +159,12 @@ class ServerCore:
                     self.DEFAULT_BACKLOG,
                 )
             except OSError as exc:
-                logger.critical("Không thể khởi động Server tại %s:%d: %s", self.host, self.port, exc)
+                logger.critical(
+                    "Không thể khởi động Server tại %s:%d: %s",
+                    self.host,
+                    self.port,
+                    exc,
+                )
                 self.stop()
                 raise
 
@@ -185,11 +214,19 @@ class ServerCore:
             try:
                 client_info = packet.to_json()
             except Exception as e:
-                logger.warning("[%s:%d] Payload HELLO_HANDSHAKE không phải JSON hợp lệ: %s", client_addr[0], client_addr[1], e)
+                logger.warning(
+                    "[%s:%d] Payload HELLO_HANDSHAKE không phải JSON hợp lệ: %s",
+                    client_addr[0],
+                    client_addr[1],
+                    e,
+                )
                 client_sock.sendall(
                     create_packet(
                         MessageType.HANDSHAKE_REJECT,
-                        {"status": "REJECT", "reason": "HELLO_HANDSHAKE payload must be valid JSON."},
+                        {
+                            "status": "REJECT",
+                            "reason": "HELLO_HANDSHAKE payload must be valid JSON.",
+                        },
                     )
                 )
                 return False, None
@@ -204,14 +241,21 @@ class ServerCore:
                 client_sock.sendall(
                     create_packet(
                         MessageType.HANDSHAKE_REJECT,
-                        {"status": "REJECT", "reason": "HELLO_HANDSHAKE payload must be a JSON object."},
+                        {
+                            "status": "REJECT",
+                            "reason": "HELLO_HANDSHAKE payload must be a JSON object.",
+                        },
                     )
                 )
                 return False, None
 
             client_version = client_info.get("client_version")
             raw_name = client_info.get("client_name", "Unknown-Client")
-            client_name = raw_name if isinstance(raw_name, str) and raw_name.strip() else "Unknown-Client"
+            client_name = (
+                raw_name
+                if isinstance(raw_name, str) and raw_name.strip()
+                else "Unknown-Client"
+            )
 
             logger.info(
                 "[%s:%d] Nhận yêu cầu bắt tay từ client '%s' (Protocol v%s)",
@@ -249,11 +293,10 @@ class ServerCore:
                 "server_id": self.server_id,
                 "version": PROTOCOL_VERSION,
                 "encryption_enabled": self.crypto_key is not None,
+                "tracker_key": public_key_text(self._ticket_key),
                 "message": f"Welcome to {self.server_id}! Handshake successful.",
             }
-            client_sock.sendall(
-                create_packet(MessageType.HANDSHAKE_ACK, ack_payload)
-            )
+            client_sock.sendall(create_packet(MessageType.HANDSHAKE_ACK, ack_payload))
 
             # Khôi phục blocking mode mặc định sau khi handshake xong
             client_sock.settimeout(None)
@@ -267,18 +310,34 @@ class ServerCore:
             return True, client_info
 
         except (socket.timeout, TimeoutError):
-            logger.warning("[%s:%d] Quá thời gian chờ bắt tay (Handshake Timeout).", client_addr[0], client_addr[1])
+            logger.warning(
+                "[%s:%d] Quá thời gian chờ bắt tay (Handshake Timeout).",
+                client_addr[0],
+                client_addr[1],
+            )
             return False, None
         except (ConnectionClosedError, ProtocolError, OSError) as exc:
-            logger.error("[%s:%d] Lỗi trong quá trình bắt tay: %s", client_addr[0], client_addr[1], exc)
+            logger.error(
+                "[%s:%d] Lỗi trong quá trình bắt tay: %s",
+                client_addr[0],
+                client_addr[1],
+                exc,
+            )
             return False, None
         except Exception as exc:
-            logger.error("[%s:%d] Lỗi không mong đợi khi bắt tay: %s", client_addr[0], client_addr[1], exc)
+            logger.error(
+                "[%s:%d] Lỗi không mong đợi khi bắt tay: %s",
+                client_addr[0],
+                client_addr[1],
+                exc,
+            )
             return False, None
 
     def register_handler(self, handler: ClientHandler) -> None:
         """Đăng ký một ClientHandler mới vào bộ quản lý (Thread-Safe)."""
         with self._handlers_lock:
+            if not self.is_running:
+                raise OSError("Server stopped during handshake.")
             self.handlers[handler.client_addr] = handler
             active_count = len(self.handlers)
         logger.info(
@@ -331,16 +390,32 @@ class ServerCore:
         Returns:
             int: Số lượng client gửi thành công.
         """
-        handlers = self.get_all_handlers()
-        success_count = 0
-        for handler in handlers:
-            if exclude_addr and handler.client_addr == exclude_addr:
-                continue
-            if only_authenticated and not handler.is_authenticated:
-                continue
-            if handler.send_packet(msg_type, payload, flags=flags):
-                success_count += 1
-        return success_count
+        with self._broadcast_lock:
+            handlers = self.get_all_handlers()
+            success_count = 0
+            for handler in handlers:
+                if exclude_addr and handler.client_addr == exclude_addr:
+                    continue
+                if only_authenticated and not handler.is_authenticated:
+                    continue
+                if handler.send_packet(msg_type, payload, flags=flags):
+                    success_count += 1
+            return success_count
+
+    def issue_peer_ticket(self, sender, recipient):
+        if sender is None or not sender.identity_key or not recipient.identity_key:
+            raise ValueError("Both peers must register an identity key.")
+        claims = {
+            "id": uuid.uuid4().hex,
+            "sender": sender.username,
+            "recipient": recipient.username,
+            "sender_session": sender.session_id,
+            "recipient_session": recipient.session_id,
+            "sender_key": sender.identity_key,
+            "recipient_key": recipient.identity_key,
+            "expires": time.time() + 30,
+        }
+        return {"claims": claims, "signature": sign(self._ticket_key, claims)}
 
     def accept_one(self) -> Tuple[Optional[socket.socket], Optional[Tuple[str, int]]]:
         """
@@ -375,6 +450,7 @@ class ServerCore:
         """Thực hiện handshake trên luồng worker (không chặn vòng accept) rồi phục vụ Client."""
         handler_holder: Dict[str, ClientHandler] = {}
         try:
+
             def _register_before_ack(client_info: dict) -> None:
                 h = ClientHandler(
                     client_sock=client_sock,
@@ -431,9 +507,16 @@ class ServerCore:
                     # Socket server đã bị đóng trong stop()
                     break
 
-                logger.info("⚡ Chấp nhận kết nối TCP từ %s:%d", client_addr[0], client_addr[1])
+                logger.info(
+                    "⚡ Chấp nhận kết nối TCP từ %s:%d", client_addr[0], client_addr[1]
+                )
 
-                if not self._handshake_sem.acquire(blocking=False):
+                with self._handlers_lock:
+                    at_capacity = (
+                        len(self.handlers) + len(self._pending_sockets)
+                        >= self.MAX_ACTIVE_CONNECTIONS
+                    )
+                if at_capacity or not self._handshake_sem.acquire(blocking=False):
                     logger.warning(
                         "⚠️ Quá nhiều kết nối đang handshake đồng thời (%d). Từ chối %s:%d.",
                         self.MAX_PENDING_HANDSHAKES,
@@ -468,9 +551,13 @@ class ServerCore:
         Nếu Client bị rớt mạng đột ngột không gửi FIN, sau zombie_timeout giây không có
         Heartbeat Ping thì Server sẽ chủ động đóng socket và dọn dẹp bộ nhớ.
         """
-        logger.info("🧟 Luồng ZombieCleaner đã khởi động (Quét mỗi %.1fs, Timeout: %.1fs)...", self.zombie_check_interval, self.zombie_timeout)
+        logger.info(
+            "🧟 Luồng ZombieCleaner đã khởi động (Quét mỗi %.1fs, Timeout: %.1fs)...",
+            self.zombie_check_interval,
+            self.zombie_timeout,
+        )
         while not self._stop_zombie_event.is_set() and self.is_running:
-            now = time.time()
+            now = time.monotonic()
             handlers = self.get_all_handlers()
             for h in handlers:
                 if now - h.last_seen > self.zombie_timeout:
@@ -494,6 +581,9 @@ class ServerCore:
             if not self.is_running and self.server_sock is None:
                 return
             self.is_running = False
+            if self._discovery is not None:
+                self._discovery.close()
+                self._discovery = None
 
             # Dừng luồng ZombieCleaner
             self._stop_zombie_event.set()
@@ -507,6 +597,10 @@ class ServerCore:
 
             for psock in pending_socks:
                 try:
+                    try:
+                        psock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                     psock.close()
                 except OSError:
                     pass
@@ -521,6 +615,10 @@ class ServerCore:
             # 2. Đóng Server socket chính
             if self.server_sock:
                 try:
+                    try:
+                        self.server_sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                     self.server_sock.close()
                     logger.info("🛑 Đã đóng Server socket thành công.")
                 except OSError as exc:

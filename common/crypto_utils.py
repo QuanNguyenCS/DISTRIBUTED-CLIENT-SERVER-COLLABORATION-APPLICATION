@@ -20,7 +20,6 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # Biến môi trường cấu hình khóa AES dùng chung toàn hệ thống (Server <-> Clients)
 ENV_AES_KEY_VAR: str = "COLLAB_AES_KEY"
-DEFAULT_SHARED_SECRET: str = "CollabSecretKey2026@SecureNetworkApplication"
 DEFAULT_SALT: bytes = b"collab_distributed_app_salt_2026"
 _P2P_HKDF_INFO: bytes = b"collab-p2p-file-session-v1"
 
@@ -36,7 +35,7 @@ def _derive_key_cached(passphrase: str, salt: bytes) -> bytes:
     return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
 
 
-def derive_key(passphrase: str = DEFAULT_SHARED_SECRET, salt: bytes = DEFAULT_SALT) -> bytes:
+def derive_key(passphrase: str, salt: bytes = DEFAULT_SALT) -> bytes:
     """
     Sinh khóa bảo mật 32-bytes chuẩn URL-safe Base64 từ chuỗi mật khẩu
     bằng thuật toán KDF (PBKDF2HMAC với 100,000 vòng lặp băm SHA-256).
@@ -45,16 +44,15 @@ def derive_key(passphrase: str = DEFAULT_SHARED_SECRET, salt: bytes = DEFAULT_SA
 
 
 def get_shared_app_key(secret_or_key: Optional[str] = None) -> bytes:
-    """
-    Lấy khóa AES-Fernet dùng chung toàn hệ thống theo thứ tự ưu tiên:
-      1. Tham số truyền trực tiếp (nếu có)
-      2. Biến môi trường COLLAB_AES_KEY
-      3. Khóa mặc định sẵn có của ứng dụng (zero-config trên LAN)
-    Hỗ trợ cả chuỗi Fernet key 44 ký tự sẵn lẫn chuỗi bí mật bất kỳ (tự dẫn xuất qua PBKDF2).
-    """
-    raw_value = (secret_or_key if secret_or_key is not None else os.environ.get(ENV_AES_KEY_VAR, "")).strip()
+    raw_value = (
+        secret_or_key
+        if secret_or_key is not None
+        else os.environ.get(ENV_AES_KEY_VAR, "")
+    ).strip()
     if not raw_value:
-        return derive_key(DEFAULT_SHARED_SECRET)
+        raise ValueError(
+            "Set COLLAB_AES_KEY to a private shared room secret before starting the application."
+        )
 
     try:
         candidate = raw_value.encode("ascii")

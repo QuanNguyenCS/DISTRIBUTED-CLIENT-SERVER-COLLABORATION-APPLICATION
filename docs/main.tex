@@ -1,906 +1,107 @@
 \documentclass[11pt,a4paper]{article}
-
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
-\usepackage[margin=0.9in, headheight=14pt]{geometry}
-\usepackage{microtype}
-\usepackage{xcolor}
-\usepackage{booktabs}
-\usepackage{tabularx}
-\usepackage{longtable}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{fancyhdr}
-\usepackage{titlesec}
-\usepackage{listings}
+\usepackage[margin=25mm]{geometry}
+\usepackage{parskip}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, backgrounds, calc}
+\usetikzlibrary{positioning,arrows.meta}
 \usepackage[hidelinks]{hyperref}
-
-% ---- Color Palette ----
-\definecolor{NavyPrimary}{RGB}{24, 58, 110}
-\definecolor{TealAccent}{RGB}{0, 121, 132}
-\definecolor{SlateDark}{RGB}{45, 55, 72}
-\definecolor{BgSoft}{RGB}{246, 248, 251}
-\definecolor{BorderLight}{RGB}{203, 213, 225}
-\definecolor{CodeKeyword}{RGB}{0, 82, 165}
-\definecolor{CodeString}{RGB}{163, 21, 21}
-\definecolor{CodeComment}{RGB}{34, 120, 62}
-\definecolor{AlertRed}{RGB}{180, 45, 45}
-
-% ---- Typography & Headings ----
-\titleformat{\section}{\Large\bfseries\color{NavyPrimary}}{\thesection}{0.7em}{}[\vspace{2pt}{\color{BorderLight}\titlerule[0.8pt]}]
-\titleformat{\subsection}{\large\bfseries\color{SlateDark}}{\thesubsection}{0.6em}{}
-\titleformat{\subsubsection}{\normalsize\bfseries\color{TealAccent}}{\thesubsubsection}{0.5em}{}
-
-\pagestyle{fancy}
-\fancyhf{}
-\fancyhead[L]{\small\color{SlateDark} Assignment 1: Distributed Client--Server Collaboration Application}
-\fancyhead[R]{\small\color{SlateDark} Network Application Development}
-\fancyfoot[C]{\small\thepage}
-\renewcommand{\headrulewidth}{0.4pt}
-
-% ---- Code Listings Setup ----
-\lstdefinelanguage{Pseudocode}{
-  morekeywords={FUNCTION, WHILE, IF, ELSE, RETURN, RAISE, FOR, IN, TO, AND, OR, NOT},
-  sensitive=true,
-  morecomment=[l]{//},
-  morestring=[b]"
-}
-
-\lstset{
-  backgroundcolor=\color{BgSoft},
-  frame=single,
-  rulecolor=\color{BorderLight},
-  frameround=tttt,
-  basicstyle=\ttfamily\footnotesize,
-  keywordstyle=\color{CodeKeyword}\bfseries,
-  commentstyle=\color{CodeComment}\itshape,
-  stringstyle=\color{CodeString},
-  breaklines=true,
-  breakatwhitespace=true,
-  showstringspaces=false,
-  numbers=left,
-  numberstyle=\tiny\color{gray},
-  numbersep=6pt,
-  xleftmargin=12pt,
-  xrightmargin=4pt,
-  aboveskip=8pt,
-  belowskip=8pt
-}
-
-\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
-\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
-
+\title{Distributed Client--Server Collaboration Application\\Protocol v2: Security and Resilience Revision}
+\author{Assignment 1 Project Team}
+\date{17 November 2026}
 \begin{document}
-
-% ==============================================================================
-% TITLE PAGE
-% ==============================================================================
-\begin{titlepage}
-  \centering
-  \vspace*{0.8cm}
-  {\small\bfseries\color{TealAccent} NETWORK APPLICATION DEVELOPMENT --- ASSIGNMENT 1 REPORT\par}
-  \vspace{0.5cm}
-  {\Huge\bfseries\color{NavyPrimary} Distributed Client--Server\\Collaboration Application\par}
-  \vspace{0.35cm}
-  {\large\color{SlateDark} Hybrid Client--Server Control Plane \& Direct Peer-to-Peer File Transfer\\Over Raw TCP Sockets\par}
-  \vspace{1.0cm}
-
-  {\color{NavyPrimary}\rule{0.75\textwidth}{1.5pt}}
-  \vspace{0.9cm}
-
-  \begin{tabular}{@{} L{4.2cm} L{9.5cm} @{}}
-    \textbf{Course:} & Network Application Development \\[6pt]
-    \textbf{Student Name(s) / Team:} & \texttt{[Student Name(s) / Team]} \\[6pt]
-    \textbf{Student ID(s):} & \texttt{[Student ID(s)]} \\[6pt]
-    \textbf{Instructor:} & \texttt{[Instructor Name]} \\[6pt]
-    \textbf{Submission Date:} & \texttt{[Submission Date]} \textit{(Ref. Deadline: Nov 17, 2026)} \\[6pt]
-    \textbf{Source Repository:} & \url{https://github.com/QuanNguyenCS/DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION} \\
-  \end{tabular}
-
-  \vspace{1.2cm}
-
-  \begin{tikzpicture}[node distance=1.4cm, >=Stealth]
-    \node[draw=NavyPrimary, fill=BgSoft, rounded corners=6pt, inner sep=10pt, align=center, font=\small] (summary) {
-      \textbf{Key Architectural Highlights}\\[4pt]
-      Custom 16-Byte Binary Framing (\texttt{!2sBHBHQ}) $\cdot$ 24 Message Types (\texttt{101..602})\\
-      Multi-Threaded Tracker \& Chat Router ($\ge 16$ Clients) $\cdot$ Direct P2P 32 KB Chunking + SHA-256\\
-      Automatic Shared AES (\texttt{COLLAB\_AES\_KEY}) + Ephemeral P2P X25519 $\cdot$ Zero-Freeze Tkinter GUI \& CLI
-    };
-  \end{tikzpicture}
-
-  \vfill
-  {\small\color{SlateDark} Technical Explanation Report prepared for code review and oral defense.}
-\end{titlepage}
-
+\maketitle
 \tableofcontents
-\newpage
-
-% ==============================================================================
-% SECTION 1: INTRODUCTION
-% ==============================================================================
-\section{Introduction}
-
-\subsection{Motivation}
-Small teams, university laboratories, and classroom groups often need to communicate and share files over a local area network (LAN) without relying on large-scale cloud infrastructure. A lightweight collaboration tool can meet this need while remaining practical to deploy. Building it directly on TCP sockets also provides hands-on experience with message framing, concurrent connections, shared state, failure detection, and applied cryptography.
-
-\subsection{Problem Statement}
-Reliable, in-order delivery is essential for messaging applications, so TCP is a suitable transport for carrying chat data. However, TCP provides a continuous stream of bytes rather than separate, ready-made messages; it does not preserve the boundaries between messages sent by an application. If two messages arrive together in a single read, this is commonly called packet concatenation. If a read contains only part of a message, this is known as packet fragmentation. The application must therefore define message boundaries and assemble complete messages before processing them.
-
-Beyond text messaging, users also need to share files. In a conventional client-server approach, the sender uploads a file to the server, which then forwards it to the recipient. The server must carry the same file data twice, placing extra demands on its bandwidth and resources and potentially creating a bottleneck as file sizes or user numbers grow. A more efficient approach is to use the server for user authentication and recipient discovery, then transfer the file directly between the sender and recipient over a peer-to-peer connection.
+\clearpage
 
 
-\subsection{Project Objectives}
-This project develops a cross-platform \textbf{Distributed Collaboration Application} using Python's low-level \texttt{socket} module. It is designed for \textbf{10--20+ concurrent users} communicating over localhost or a LAN on Windows, macOS, and Linux. The application brings together:
-\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
-  \item A multithreaded \textbf{Tracker and Chat Server} that handles authentication, peer discovery, heartbeat monitoring, and ordered real-time message routing.
-  \item A \textbf{Direct Peer-to-Peer (P2P) File Transfer Engine} that sends files in 32 KB chunks and verifies integrity with SHA-256.
-\end{itemize}
+\section{Architecture and scope}
 
-% ==============================================================================
-% SECTION 2: FEATURES & COMPLIANCE
-% ==============================================================================
-\section{Features and Technical Requirements}
+Python socket APIs implement the application without HTTP frameworks or WebSockets. TCP carries central control/chat and direct P2P files. UDP provides authenticated LAN server discovery; heartbeat remains TCP.
 
-\subsection{Core System Capabilities}
-\begin{enumerate}[leftmargin=1.5em, itemsep=3pt]
-  \item \textbf{Connection Compatibility:} Checks that a client and the server use compatible application protocol versions before proceeding to authentication.
-  \item \textbf{User Authentication and Peer Discovery:} Requires each user to choose a unique username containing 3--20 letters, digits, underscores, or hyphens. For online users, the server keeps the network address and connection port needed by other clients to establish direct file transfers.
-  \item \textbf{Real-Time Messaging:} Delivers messages to everyone in the shared room (\texttt{CHAT\_BROADCAST}) or privately to a selected user (\texttt{CHAT\_DIRECT}), with all control and chat traffic automatically encrypted using the shared application key (\texttt{COLLAB\_AES\_KEY}).
-  \item \textbf{Direct Peer-to-Peer File Transfer:} Queries the server tracker to find the recipient's LAN address and P2P port, then streams the file directly between devices in 32 KB chunks straight to a \texttt{.part} staging file on disk ($O(1)$ RAM) with incremental SHA-256 verification.
-  \item \textbf{Network Resilience:} Clients send a brief liveness signal every 4 seconds, while the server checks for missed responses every 3 seconds. A client that fails to respond for 15 seconds is treated as disconnected, allowing the server to remove its stale connection and broadcast updated presence snapshots.
-  \item \textbf{Two-Tier Automatic Encryption:} Protects Client$\leftrightarrow$Server packets using a shared 256-bit Fernet key (\texttt{AES-128-CBC + HMAC-SHA256}) derived via \texttt{PBKDF2HMAC-SHA256} (\texttt{100,000} iterations) from \texttt{COLLAB\_AES\_KEY}, and secures each Direct P2P file transfer with a one-time ephemeral \texttt{X25519} ECDH + \texttt{HKDF-SHA256} session key that is destroyed immediately after transfer completion.
-\end{enumerate}
 
-\subsection{Compliance Matrix}
-\begin{table}[h!]
-  \centering
-  \small
-  \begin{tabularx}{\textwidth}{@{} L{3.2cm} L{4.6cm} Y @{}}
-    \toprule
-    \textbf{Constraint} & \textbf{Assignment Requirement} & \textbf{Implemented Solution} \\
-    \midrule
-    Low-level Transport & Raw sockets only; no Flask, Django, WebSockets, or RPC & Built strictly on Python \texttt{socket} (\texttt{AF\_INET}, \texttt{SOCK\_STREAM}) and \texttt{struct}. \\
-    Custom Protocol & Self-designed framing, headers, types, and state machine & Fixed 16-byte header (\texttt{!2sBHBHQ}), 24 \texttt{MessageType} enums (\texttt{101..602}). \\
-    Concurrency & Support 10--20 concurrent clients cleanly & Asynchronous handshake workers (\texttt{BoundedSemaphore(64)}) + daemon \texttt{ClientHandler} pool with \texttt{threading.RLock} / \texttt{Lock}. \\
-    Cross-Platform & Compatible with Windows, macOS, and Linux & Standard library sockets/threads and UTF-8 safe I/O compatible across Windows, Linux, and macOS. \\
-    \bottomrule
-  \end{tabularx}
-  \caption{Verification of mandatory technical constraints.}
-\end{table}
-
-% ==============================================================================
-% SECTION 3: HYBRID SYSTEM ARCHITECTURE
-% ==============================================================================
-\section{Hybrid System Architecture}
-
-\subsection{Control and Data Plane Separation}
-Routing chat broadcasts through a central server guarantees deterministic message ordering for all participants and provides an always-available registry for peer discovery. Offloading bulk file streams directly onto Peer-to-Peer TCP connections eliminates central server bandwidth and disk bottlenecks. If a direct P2P file connection fails due to offline status or firewall blocking, the sender reports a clear error directly rather than silently overloading the central server.
-
-\subsection{Architecture Diagram}
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[
-    node distance=0.8cm and 1.1cm,
-    box/.style={draw=NavyPrimary, fill=white, rounded corners=4pt, minimum height=0.85cm, align=center, font=\scriptsize, inner sep=5pt},
-    srvbox/.style={draw=TealAccent, fill=BgSoft, rounded corners=5pt, inner sep=10pt},
-    clibox/.style={draw=SlateDark, fill=BgSoft, rounded corners=5pt, inner sep=8pt},
-    arrow/.style={-{Stealth[length=5pt]}, thick, color=NavyPrimary},
-    p2parrow/.style={<->, very thick, color=AlertRed}
-  ]
-
-  % Server Components
-  \node[box, minimum width=3.0cm] (sc) {\textbf{ServerCore}\\Accept Loop (\texttt{0.0.0.0:9000})};
-  \node[box, minimum width=2.8cm, right=0.8cm of sc] (sm) {\textbf{SessionManager}\\Active Users \& \texttt{IP:P2P\_Port}};
-  \node[box, minimum width=2.8cm, below=0.55cm of sm] (mr) {\textbf{MessageRouter}\\Broadcast \& Unicast Only};
-  \node[box, minimum width=3.0cm, below=0.55cm of sc] (ch) {\textbf{ClientHandler Threads}\\Handshake, Lookup, Dispatch};
-  \node[box, minimum width=2.5cm, right=0.8cm of sm] (zc) {\textbf{ZombieCleaner}\\Sweep $>15\text{s}$ Idle};
-
-  \begin{scope}[on background layer]
-    \node[srvbox, fit=(sc)(sm)(mr)(ch)(zc), label={[font=\small\bfseries\color{TealAccent}]above:Central Server (Control Plane Tracker \& Chat Router)}] (srvframe) {};
-  \end{scope}
-
-  \draw[arrow] (sc) -- (ch);
-  \draw[arrow] (ch) -- (sm);
-  \draw[arrow] (ch) -- (mr);
-  \draw[arrow] (mr) -- (sm);
-  \draw[arrow] (zc) -- (sm);
-
-  % Client A
-  \node[box, below=1.6cm of ch, xshift=-2.6cm, minimum width=3.3cm] (ca_rx) {\textbf{Client A (Sender)}\\Client Core\\ReceiverThread + Heartbeat (4s)};
-  \node[box, below=0.4cm of ca_rx, minimum width=3.3cm] (ca_p2p) {\textbf{P2PListener A}\\(\texttt{0.0.0.0:p2p\_A})};
-
-  \begin{scope}[on background layer]
-    \node[clibox, fit=(ca_rx)(ca_p2p)] (caframe) {};
-  \end{scope}
-
-  % Client B
-  \node[box, below=1.6cm of mr, xshift=2.2cm, minimum width=3.3cm] (cb_rx) {\textbf{Client B (Receiver)}\\Client Core\\ReceiverThread + Heartbeat (4s)};
-  \node[box, below=0.4cm of cb_rx, minimum width=3.3cm] (cb_p2p) {\textbf{P2PListener B}\\(\texttt{0.0.0.0:p2p\_B})};
-
-  \begin{scope}[on background layer]
-    \node[clibox, fit=(cb_rx)(cb_p2p)] (cbframe) {};
-  \end{scope}
-
-  % Network Links
-  \draw[arrow, <->] (ca_rx.north) -- node[left, font=\tiny, align=right]{TCP 9000\\Auth, Chat, Lookup} (ch.south west);
-  \draw[arrow, <->] (cb_rx.north) -- node[right, font=\tiny, align=left]{TCP 9000\\Auth, Chat, Presence} (ch.south east);
-  \draw[p2parrow] (ca_p2p.east) -- node[above, yshift=2mm, font=\scriptsize\bfseries\color{AlertRed}, align=center, fill=white, inner sep=2pt]{Direct TCP P2P File Transfer\\(32 KB chunks)} (cb_p2p.west);
-
-  \end{tikzpicture}
-  \caption{Hybrid Client--Server Control Plane with Direct Peer-to-Peer File Transfer Architecture.}
-  \label{fig:arch}
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[node distance=26mm,box/.style={draw,rounded corners,align=center,minimum width=30mm,minimum height=12mm},>=Stealth]
+\node[box] (s) {Tracker and\\chat server};
+\node[box,below left=of s] (a) {Client Alice};
+\node[box,below right=of s] (b) {Client Bob};
+\draw[<->] (a) -- node[left,font=\small] {TCP control} (s);
+\draw[<->] (b) -- node[right,font=\small] {TCP control} (s);
+\draw[<->] (a) -- node[below,font=\small] {Direct encrypted TCP file} (b);
+\draw[->,dashed] (a.west) to[bend left=45] node[left,font=\small] {UDP discovery} (s.west);
+\end{tikzpicture}
+\caption{Central session/chat services and direct peer file transport.}
 \end{figure}
 
-\subsection{Threading and Synchronization}
-\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
-  \item \textbf{Server:} \texttt{ServerCore} listens with \texttt{backlog=20} and delegates each newly accepted socket to a bounded handshake worker thread (\texttt{\_handshake\_sem = BoundedSemaphore(64)}) so slow handshakes never stall the main accept loop. Once handshake succeeds, a daemon \texttt{ClientHandler} runs for that client. Handler lists in \texttt{ServerCore} use \texttt{threading.RLock}, active user sessions in \texttt{SessionManager} use \texttt{threading.Lock}, and each handler serializes outbound writes via \texttt{\_send\_lock}. \texttt{ZombieCleaner} checks sessions every \texttt{3.0s} and disconnects peers idle for over \texttt{15.0s}.
-  \item \textbf{Client:} Each client uses three coordinated network roles: (1) \texttt{ReceiverThread} decoding server packets; (2) \texttt{HeartbeatSender} emitting \texttt{HEARTBEAT\_PING} every \texttt{4.0s}; and (3) \texttt{P2PListener} spawning worker threads for direct incoming peer file connections (\texttt{30.0s} socket timeout).
-\end{itemize}
 
-% ==============================================================================
-% SECTION 4: APPLICATION-LAYER PROTOCOL
-% ==============================================================================
-\section{Application Protocol}
+The listener hands central handshakes to bounded workers. Each established handler reads independently and writes through a bounded outbound queue. A shared lock orders broadcast enqueue operations across recipients; slow socket writes occur on separate writer threads. Queue overflow or send timeout closes the affected connection. This provides a consistent accepted broadcast order, not guaranteed delivery to disconnected recipients.
 
-\subsection{Binary Frame Format}
-Every frame on both server and P2P sockets uses Network Byte Order (\texttt{!} Big-Endian) packed via Python's \texttt{struct.pack("!2sBHBHQ", ...)}, giving an invariant \textbf{16-byte header} followed by up to \texttt{50 MB} (\texttt{MAX\_PAYLOAD\_SIZE}) of payload bytes:
+SessionManager locks unique-name registration and endpoint lookup. The tracker stores observed TCP source IP, connection port, advertised P2P port, identity public key and session ID. P2P workers/listeners and GUI workers are separated from the Tk main thread. The server never relays file contents.
 
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[font=\ttfamily\scriptsize]
-    \def\unit{0.34cm}
-    % Bit ruler
-    \foreach \b in {0,8,16,24} {
-      \node[anchor=south] at (\b*\unit, 3.25) {\b};
-    }
-    \node[anchor=south] at (31.5*\unit, 3.25) {31};
-    % Row 1: Magic (16 bits) + Version (8 bits) + MsgType upper (8 bits)? Wait clean byte boxes:
-    % Wait: offset layout: Magic=2B(16b), Version=1B(8b), MsgType=2B(16b) -> better 16-bit/32-bit aligned row diagram matching exact offsets!
-    \draw[fill=BgSoft, draw=NavyPrimary] (0, 2.4) rectangle (16*\unit, 3.1) node[pos=0.5]{Magic Bytes ("CA") [2B]};
-    \draw[fill=BgSoft, draw=NavyPrimary] (16*\unit, 2.4) rectangle (24*\unit, 3.1) node[pos=0.5]{Version [1B]};
-    \draw[fill=BgSoft, draw=NavyPrimary] (24*\unit, 2.4) rectangle (32*\unit, 3.1) node[pos=0.5]{MsgType [H:hi]};
+\section{Protocol and state}
 
-    \draw[fill=BgSoft, draw=NavyPrimary] (0, 1.7) rectangle (8*\unit, 2.4) node[pos=0.5]{MsgType [lo]};
-    \draw[fill=BgSoft, draw=NavyPrimary] (8*\unit, 1.7) rectangle (16*\unit, 2.4) node[pos=0.5]{Flags [1B]};
-    \draw[fill=BgSoft, draw=NavyPrimary] (16*\unit, 1.7) rectangle (32*\unit, 2.4) node[pos=0.5]{Reserved (0x0000) [2B]};
+The 16-byte header is \texttt{!2sBHBHQ}: CA magic, version 2, message type, flags, reserved zero, wire payload length. Encrypted plaintext starts with an authenticated copy of version/type/flags. The receiver compares this context before parsing the application payload, preventing private ciphertext being reclassified as broadcast. Compression is not implemented; unknown flags/reserved fields are rejected. Full specification (protocol\_specs.md) defines registry and payload schemas.
 
-    \draw[fill=BgSoft, draw=NavyPrimary] (0, 0.7) rectangle (32*\unit, 1.7) node[pos=0.5]{Payload Length (uint64 Big-Endian) [8B --- Max 50 MB]};
-    \draw[fill=white, draw=TealAccent, dashed] (0, -0.2) rectangle (32*\unit, 0.7) node[pos=0.5]{Dynamic Payload Data (JSON UTF-8, Binary Chunk, or Fernet Ciphertext)};
-  \end{tikzpicture}
-  \caption{Fixed 16-byte binary header (\texttt{!2sBHBHQ}) and dynamic payload layout.}
-  \label{fig:header-layout}
+\begin{quote}Disconnected $\to$ Connecting $\to$ Handshaking $\to$ Authenticating $\to$ Online. Online and Transferring return on completion or failure; either transitions to Disconnected on logout or liveness failure.\end{quote}
+
+Central HELLO has a 64 KiB cap and 10-second monotonic total deadline. Control/P2P receive paths use 64 KiB caps and bounded packet deadlines. The generic parser retains a 50 MiB cap; this is not the normal allowance for accepted control frames.
+
+\section{Keys, authentication and trust}
+
+Normal entrypoints require a private COLLAB\_AES\_KEY distributed outside the source repository. Missing configuration fails clearly; the old source-code secret is removed. Keys may be Fernet keys or passphrases derived with PBKDF2HMAC-SHA256, 100,000 iterations. Fernet uses AES-128-CBC and HMAC-SHA256; its combined key is not an AES-256 cipher key.
+
+The auth gate rejects data before login. Protected auth/list/lookup/chat requests must be encrypted. Names are temporary online identities, not persistent password-protected accounts. Successful auth returns a fresh session ID and presence snapshots.
+
+Each peer registers an Ed25519 identity key during auth. The tracker signs a 30-second ticket containing both names, session IDs and public identity keys. The sender signs its ticket and ephemeral X25519 public key. The receiver checks authorization/replay and signs the full response transcript using its own identity key. The sender verifies that proof before using the X25519/HKDF-SHA256 session key. A room member cannot claim another active session merely by repeating its username.
+
+The room key remains a group trust boundary. This is not a PKI and does not defend against a room-key holder actively impersonating the central server. It cannot prevent a legitimate recipient lying about future file retention. Dropping Python key references is not guaranteed secure RAM zeroization.
+
+\section{Message and file sequences}
+
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[>=Stealth,font=\small]
+\node (a) at (0,0) {Alice}; \node (s) at (4,0) {Tracker}; \node (b) at (8,0) {Bob};
+\draw[dashed] (0,-.3) -- (0,-5.6); \draw[dashed] (4,-.3) -- (4,-5.6); \draw[dashed] (8,-.3) -- (8,-5.6);
+\draw[->] (0,-.6) -- node[above] {Lookup + request ID} (4,-.6);
+\draw[->] (4,-1.2) -- node[above] {Signed session ticket} (0,-1.2);
+\draw[->] (0,-1.9) -- node[above] {Ticket, X25519 key, sender proof} (8,-1.9);
+\draw[->] (8,-2.6) -- node[above] {Receiver key + transcript proof} (0,-2.6);
+\draw[->] (0,-3.3) -- node[above] {Encrypted offer} (8,-3.3);
+\draw[->] (8,-3.9) -- node[above] {Encrypted accept + file ID} (0,-3.9);
+\draw[->] (0,-4.5) -- node[above] {Encrypted chunks; stage + hash} (8,-4.5);
+\draw[->] (8,-5.2) -- node[above] {Verified commit + final ACK} (0,-5.2);
+\end{tikzpicture}
+\caption{One direct file session; chat remains on the server connection.}
 \end{figure}
 
-\begin{table}[h!]
-  \centering
-  \small
-  \begin{tabularx}{\textwidth}{@{} c L{2.8cm} c c Y @{}}
-    \toprule
-    \textbf{Byte Offset} & \textbf{Field} & \textbf{Struct} & \textbf{Size} & \textbf{Specification} \\
-    \midrule
-    0 -- 1 & \texttt{Magic Bytes} & \texttt{2s} & 2 B & Constant \texttt{b"CA"}; rejects non-protocol traffic immediately. \\
-    2 & \texttt{Version} & \texttt{B} & 1 B & Protocol version \texttt{1}. \\
-    3 -- 4 & \texttt{Message Type} & \texttt{H} & 2 B & Unsigned 16-bit integer mapped to \texttt{MessageType} (\texttt{101..602}). \\
-    5 & \texttt{Flags} & \texttt{B} & 1 B & \texttt{0x00} (\texttt{FLAG\_NONE}), \texttt{0x01} (\texttt{FLAG\_ENCRYPTED}), \texttt{0x02} (\texttt{FLAG\_COMPRESSED}). \\
-    6 -- 7 & \texttt{Reserved} & \texttt{H} & 2 B & Reserved alignment bytes, set to \texttt{0}. \\
-    8 -- 15 & \texttt{Payload Length} & \texttt{Q} & 8 B & Exact byte size of following payload; bounded at \texttt{50 * 1024 * 1024}. \\
-    \bottomrule
-  \end{tabularx}
-  \caption{Field breakdown of the 16-byte application header.}
-\end{table}
 
-\subsection{Message Type Registry}
-\small
-\setlength{\tabcolsep}{3pt}
-\begin{longtable}{@{} L{2.4cm} c L{4.4cm} c L{3.8cm} @{}}
-  \toprule
-  \textbf{Group} & \textbf{Code} & \textbf{Enum Name} & \textbf{Channel} & \textbf{Purpose / Key Fields} \\
-  \midrule
-  \endhead
-  Handshake & 101 & \texttt{HELLO\_HANDSHAKE} & Client $\to$ Server & Sends \texttt{client\_version}, \texttt{client\_name}. \\
-  & 102 & \texttt{HANDSHAKE\_ACK} & Server $\to$ Client & Returns \texttt{server\_id}, \texttt{encryption\_enabled}. \\
-  & 103 & \texttt{HANDSHAKE\_REJECT} & Server $\to$ Client & Rejects mismatched protocol version. \\
-  Auth & 104 & \texttt{AUTH\_REQ} & Client $\to$ Server & Registers \texttt{username} and \texttt{p2p\_port} (AES). \\
-  & 105 & \texttt{AUTH\_RESP\_SUCCESS} & Server $\to$ Client & Returns \texttt{online\_users} and \texttt{peers} (AES). \\
-  & 106 & \texttt{AUTH\_RESP\_FAIL} & Server $\to$ Client & Rejects invalid or taken username (AES). \\
-  \midrule
-  Presence \& & 201 & \texttt{USER\_LIST\_REQ} & Client $\to$ Server & Requests current active user list (AES). \\
-  Tracker & 202 & \texttt{USER\_LIST\_RESP} & Server $\to$ Client & Lists users and \texttt{peers} (\texttt{ip}, \texttt{p2p\_port}) (AES). \\
-  & 203 & \texttt{USER\_STATUS\_BROADCAST} & Server $\to$ Client & Broadcasts \texttt{JOINED}/\texttt{LEFT} + full \texttt{online\_users} snapshot. \\
-  & 204 & \texttt{PEER\_LOOKUP\_REQ} & Client $\to$ Server & Queries Tracker for \texttt{username} (AES). \\
-  & 205 & \texttt{PEER\_LOOKUP\_RESP} & Server $\to$ Client & Returns \texttt{found}, \texttt{ip}, \texttt{p2p\_port} (AES). \\
-  \midrule
-  Chat Routing & 301 & \texttt{CHAT\_BROADCAST} & Client $\leftrightarrow$ Server & Room-wide message ordered by server (AES). \\
-  & 302 & \texttt{CHAT\_DIRECT} & Client $\leftrightarrow$ Server & 1-on-1 private message routed by server (AES). \\
-  & 303 & \texttt{CHAT\_ACK} & Server $\to$ Client & Delivery confirmation (status + recipient, AES). \\
-  \midrule
-  P2P File & 401 & \texttt{FILE\_OFFER\_REQ} & Peer $\to$ Peer & Proposes file (\texttt{file\_id}, \texttt{sha256}, P2P X25519 key). \\
-  Transfer & 402 & \texttt{FILE\_OFFER\_RESP} & Peer $\to$ Peer & Peer replies \texttt{ACCEPTED} or \texttt{REJECTED} (P2P key). \\
-  & 403 & \texttt{FILE\_CHUNK} & Peer $\to$ Peer & Streams 4B meta len + JSON + $\le 32$ KB bytes (P2P key). \\
-  & 404 & \texttt{FILE\_ACK} & Peer $\to$ Peer & Final SHA-256 verification status (P2P key). \\
-  & 405 & \texttt{PEER\_HELLO} & Peer $\to$ Peer & Direct P2P handshake + sender \texttt{x25519\_pub} (shared AES). \\
-  & 406 & \texttt{PEER\_HELLO\_ACK} & Peer $\to$ Peer & Confirms P2P handshake + receiver \texttt{x25519\_pub} (shared AES). \\
-  \midrule
-  Heartbeat & 501 & \texttt{HEARTBEAT\_PING} & Client $\to$ Server & Periodic 4.0s client keepalive probe. \\
-  & 502 & \texttt{HEARTBEAT\_PONG} & Server $\to$ Client & Keepalive response (\texttt{ALIVE}). \\
-  \midrule
-  Connection & 601 & \texttt{DISCONNECT\_NOTICE} & Client $\to$ Server & Clean shutdown notification. \\
-  & 602 & \texttt{ERROR\_NOTICE} & Server $\to$ Client & Error code (e.g., \texttt{FILE\_P2P\_ONLY}). \\
-  \bottomrule
-  \caption{Application-layer message registry defined in \texttt{common/message\_types.py}.}
-  \label{tab:message-types}
-\end{longtable}
-\normalsize
-\setlength{\tabcolsep}{6pt}
+File IDs are full UUID hex values. Tracker request IDs are separate, so simultaneous lookups of one recipient cannot overwrite each other's waiter. Metadata types, recipient/sender, indices/counts/lengths, total bytes and SHA-256 are checked. An empty file uses one empty chunk. There is one final application ACK, not per-chunk ACKs. TCP handles byte retransmission; no resume or relay fallback is provided.
 
-\subsection{Client State Machine}
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[
-    node distance=1.4cm and 2.0cm,
-    state/.style={draw=NavyPrimary, fill=BgSoft, rounded corners=6pt, minimum width=2.8cm, minimum height=0.75cm, align=center, font=\scriptsize\bfseries},
-    substate/.style={draw=TealAccent, fill=white, rounded corners=4pt, minimum width=2.5cm, minimum height=0.65cm, align=center, font=\scriptsize},
-    trans/.style={-{Stealth[length=5pt]}, thick, color=SlateDark}
-  ]
-    \node[state] (disc) {DISCONNECTED};
-    \node[state, right=2.0cm of disc] (conn) {CONNECTING};
-    \node[state, right=2.0cm of conn] (hand) {HANDSHAKING};
-    \node[state, below=1.4cm of hand] (auth) {AUTHENTICATING};
+The receiver exclusively creates an unpredictable staging file. Failure/interruption removes only its owned staging data. A hard-link commit reserves a final name without replacing existing data, even when another process commits concurrently. Filesystems lacking hard-link support fail safely. Memory does not grow with the whole file; framing/crypto buffers and worker count still consume resources.
 
-    \node[substate, below=1.6cm of auth, xshift=-2.8cm] (idle) {IDLE};
-    \node[substate, right=1.8cm of idle] (chat) {CHATTING};
-    \node[substate, below=0.9cm of chat] (p2p) {TRANSFERRING\_FILE\_P2P};
+Each file and aggregate announced incoming data are limited to 2 GiB per client. There are at most eight receiving P2P workers and sixteen tracked P2P sockets. Central active connections and pending handshakes are bounded. These limits are not a guarantee of arbitrary-scale resource isolation.
 
-    \begin{scope}[on background layer]
-      \node[draw=TealAccent, dashed, fill=BgSoft!50, rounded corners=6pt, fit=(idle)(chat)(p2p), inner sep=10pt, label={[font=\scriptsize\bfseries\color{TealAccent}, fill=white]above right:ONLINE}] (online) {};
-    \end{scope}
+\section{Resilience and UI}
 
-    \node[state, left=2.0cm of online] (dconn) {DISCONNECTING};
+The client probes every four seconds; server cleanup normally removes sessions silent for over 15 seconds plus the three-second sweep interval. Liveness duration uses monotonic time. The client detects missing server heartbeat responses as well. Shutdown detaches sockets, wakes blocked I/O with shutdown/close, and waits for P2P workers within a total budget. Captured socket references avoid the previous None.shutdown race.
 
-    \draw[trans] (disc) -- node[above, font=\tiny]{\texttt{connect()}} (conn);
-    \draw[trans] (conn) -- node[above, font=\tiny]{TCP OK} (hand);
-    \draw[trans] (hand) -- node[right, font=\tiny, align=left]{ACK + Start\\P2PListener} (auth);
-    \draw[trans] (hand) to[bend right=25] node[above, font=\tiny]{Reject/Timeout} (disc);
-    \draw[trans] (auth) -- node[right, font=\tiny]{\texttt{AUTH\_RESP\_SUCCESS}} (online);
-    \draw[trans] (auth) to[loop right] node[right, font=\tiny]{Retry Name} (auth);
+Tkinter consumes a bounded event queue with bounded work each tick. Generation tags reject stale events from previous login sessions. Upload workers capture their client/session; downloads and completion use file IDs. Both directions have cancellation that reaches the transfer socket. Visible history is bounded to 5,000 lines per tab. This does not imply unlimited tabs or a general UI performance guarantee.
 
-    \draw[trans, <->] (idle) -- node[above, font=\tiny]{Chat Server} (chat);
-    \draw[trans, <->] (idle) |- node[above, font=\tiny, pos=0.6]{P2P + SHA-256} (p2p);
+\section{Engineering challenges and solutions}
 
-    \draw[trans] (online) -- node[above, font=\tiny]{\texttt{DISCONNECT}} (dconn);
-    \draw[trans] (dconn) -- node[left, font=\tiny]{Close Sockets} (disc);
-  \end{tikzpicture}
-  \caption{Client lifecycle finite state machine.}
-  \label{fig:fsm}
-\end{figure}
+1. **TCP streaming:** exact reads plus fixed headers reconstruct message boundaries; total deadlines limit incomplete frames.
+2. **Authenticated meaning:** payload encryption alone left routing type mutable. Version 2 authenticates and checks header context.
+3. **Peer identity:** tracker tickets and signed transcripts bind live session identities and ephemeral keys instead of trusting self-asserted names.
+4. **Filesystem races:** exclusive staging and no-overwrite final commit preserve existing files across threads/processes.
+5. **Concurrency/lifecycle:** correlation IDs isolate waiters; socket registries and cancellation align cleanup with the correct transfer; generation tags isolate GUI sessions.
 
-\subsection{Protocol Sequences}
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[font=\scriptsize, >=Stealth]
-    % Lifelines
-    \node[draw=NavyPrimary, fill=BgSoft, rounded corners=3pt, minimum width=2.2cm, minimum height=0.6cm] (A) at (0,0) {\textbf{Alice (Client A)}};
-    \node[draw=TealAccent, fill=BgSoft, rounded corners=3pt, minimum width=2.6cm, minimum height=0.6cm] (S) at (5.2,0) {\textbf{Tracker \& Chat Server}};
-    \node[draw=NavyPrimary, fill=BgSoft, rounded corners=3pt, minimum width=2.2cm, minimum height=0.6cm] (B) at (10.4,0) {\textbf{Bob (Client B)}};
+\section{Validation and limitations}
 
-    \draw[dashed, color=gray] (0,-0.4) -- (0,-6.6);
-    \draw[dashed, color=gray] (5.2,-0.4) -- (5.2,-6.6);
-    \draw[dashed, color=gray] (10.4,-0.4) -- (10.4,-6.6);
+Install requirements-dev.txt and run \texttt{python -m pytest -q}. Existing protocol/auth/router/resilience/file/GUI tests remain; changed expectations reflect intentional v2 security behavior. New regression tests cover mutable headers, forged peers/ACKs, ticket replay/expiry/session binding, concurrent transfers, cross-process commits, cancellation, bounded workers/queues, missing PONG and UDP loopback discovery. Fix mapping (review\_fixes.md) records observed validation results.
 
-    % Phase 1
-    \draw[->, thick, NavyPrimary] (0,-1.0) -- node[above, font=\tiny]{\texttt{HELLO\_HANDSHAKE} (ver=1)} (5.2,-1.0);
-    \draw[<-, thick, TealAccent] (0,-1.6) -- node[above, font=\tiny]{\texttt{HANDSHAKE\_ACK} (\texttt{server\_id})} (5.2,-1.6);
-    \node[fill=white, draw=BorderLight, font=\tiny] at (0,-2.2) {Start P2P Listener (\texttt{p2p\_A})};
-    \draw[->, thick, NavyPrimary] (0,-2.8) -- node[above, font=\tiny]{\texttt{AUTH\_REQ} ("Alice", \texttt{p2p\_A})} (5.2,-2.8);
-    \draw[<-, thick, TealAccent] (0,-3.4) -- node[above, font=\tiny]{\texttt{AUTH\_RESP\_SUCCESS} (peers)} (5.2,-3.4);
-    \draw[->, thick, TealAccent] (5.2,-3.9) -- node[above, font=\tiny]{\texttt{USER\_STATUS\_BROADCAST} (JOINED)} (10.4,-3.9);
-
-    % Phase 2
-    \draw[->, thick, NavyPrimary] (0,-4.6) -- node[above, font=\tiny]{\texttt{CHAT\_BROADCAST} ("Hello team")} (5.2,-4.6);
-    \draw[<-, thick, TealAccent] (0,-5.1) -- node[above, font=\tiny]{\texttt{CHAT\_BROADCAST}} (5.2,-5.1);
-    \draw[->, thick, TealAccent] (5.2,-5.1) -- node[above, font=\tiny]{\texttt{CHAT\_BROADCAST}} (10.4,-5.1);
-
-    \draw[->, thick, NavyPrimary] (0,-5.8) -- node[above, font=\tiny]{\texttt{CHAT\_DIRECT} (recipient="Bob", Shared AES)} (5.2,-5.8);
-    \draw[->, thick, TealAccent] (5.2,-6.3) -- node[above, font=\tiny]{\texttt{CHAT\_DIRECT} (Shared AES)} (10.4,-6.3);
-  \end{tikzpicture}
-  \caption{Sequence A: Handshake, P2P Port Registration, Presence, and Chat Routing.}
-  \label{fig:seq-a}
-\end{figure}
-
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[font=\scriptsize, >=Stealth]
-    \node[draw=NavyPrimary, fill=BgSoft, rounded corners=3pt, minimum width=2.2cm, minimum height=0.6cm] (A) at (0,0) {\textbf{Alice (Sender)}};
-    \node[draw=TealAccent, fill=BgSoft, rounded corners=3pt, minimum width=2.4cm, minimum height=0.6cm] (T) at (5.2,0) {\textbf{Tracker Server}};
-    \node[draw=AlertRed, fill=BgSoft, rounded corners=3pt, minimum width=2.4cm, minimum height=0.6cm] (B) at (10.4,0) {\textbf{Bob P2P Listener}};
-
-    \draw[dashed, color=gray] (0,-0.4) -- (0,-6.6);
-    \draw[dashed, color=gray] (5.2,-0.4) -- (5.2,-6.6);
-    \draw[dashed, color=gray] (10.4,-0.4) -- (10.4,-6.6);
-
-    \draw[->, thick, NavyPrimary] (0,-1.0) -- node[above, font=\tiny]{\texttt{PEER\_LOOKUP\_REQ} ("Bob")} (5.2,-1.0);
-    \draw[<-, thick, TealAccent] (0,-1.6) -- node[above, font=\tiny]{\texttt{PEER\_LOOKUP\_RESP} (\texttt{ip:p2p\_B})} (5.2,-1.6);
-
-    \draw[->, very thick, AlertRed] (0,-2.3) -- node[above, font=\tiny]{Direct TCP + \texttt{PEER\_HELLO} (\texttt{x25519\_pub\_A})} (10.4,-2.3);
-    \draw[<-, very thick, AlertRed] (0,-2.9) -- node[above, font=\tiny]{\texttt{PEER\_HELLO\_ACK} ("OK", \texttt{x25519\_pub\_B})} (10.4,-2.9);
-
-    \draw[->, very thick, AlertRed] (0,-3.6) -- node[above, font=\tiny]{\texttt{FILE\_OFFER\_REQ} (size, sha256, P2P Key)} (10.4,-3.6);
-    \draw[<-, very thick, AlertRed] (0,-4.2) -- node[above, font=\tiny]{\texttt{FILE\_OFFER\_RESP} (ACCEPTED, P2P Key)} (10.4,-4.2);
-
-    \draw[->, very thick, AlertRed] (0,-4.9) -- node[above, font=\tiny]{Loop: \texttt{FILE\_CHUNK} (32 KB, P2P Session Key)} (10.4,-4.9);
-    \node[fill=white, draw=BorderLight, font=\tiny] at (10.4,-5.5) {Stream to \texttt{.part} \& Verify SHA-256};
-    \draw[<-, very thick, AlertRed] (0,-6.2) -- node[above, font=\tiny]{\texttt{FILE\_ACK} (status="SUCCESS" / Erase Key)} (10.4,-6.2);
-  \end{tikzpicture}
-  \caption{Sequence B: Direct Peer-to-Peer File Transfer (Ephemeral X25519 Session Key).}
-  \label{fig:seq-b}
-\end{figure}
-
-\newpage
-
-% ==============================================================================
-% SECTION 5: IMPLEMENTATION BREAKDOWN
-% ==============================================================================
-\section{Implementation Breakdown}
-
-\subsection{Project Folder Tree}
-The repository layout below documents every package and file in the system alongside its exact role:
-
-\begin{lstlisting}[language={}, numbers=none, basicstyle=\ttfamily\tiny, caption={Complete repository directory layout and file responsibilities.}]
-DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION/
-|-- run_server.py                 # Server CLI entrypoint (binds 0.0.0.0:9000, auto-loads COLLAB_AES_KEY)
-|-- run_client.py                 # Interactive Terminal CLI client (/msg, @user, /file, /ping, /quit)
-|-- run_gui.py                    # Desktop GUI launcher initializing CollabChatApp
-|-- requirements.txt              # External cryptographic dependency: cryptography
-|-- README.md                     # Project overview, feature guide, architecture, and run commands
-|-- DEVELOPMENT_PLAN.md           # 10-step implementation roadmap and architectural checklist
-|
-|-- common/                       # Shared transport, protocol, security, and logging modules
-|   |-- __init__.py               # Package marker
-|   |-- protocol.py               # 16B header (!2sBHBHQ), Packet dataclass, recv_exact/recv_packet
-|   |-- message_types.py          # MessageType(IntEnum) registry defining 24 opcodes (101..602)
-|   |-- crypto_utils.py           # Shared COLLAB_AES_KEY (PBKDF2/Fernet) & P2P X25519 + HKDF-SHA256
-|   `-- logger.py                 # Cross-platform UTF-8 safe structured logging
-|
-|-- server/                       # Central Control Plane Tracker & Ordered Chat Router
-|   |-- __init__.py               # Package marker
-|   |-- server_core.py            # TCP accept loop, bounded handshake workers, broadcast, ZombieCleaner
-|   |-- client_handler.py         # Per-client daemon thread, Auth/AES gate, _send_lock, FILE_P2P_ONLY
-|   |-- session_manager.py        # Thread-safe active user directory, regex check, IP:P2P_Port store
-|   `-- router.py                 # MessageRouter for ordered CHAT_BROADCAST & 1-on-1 CHAT_DIRECT
-|
-|-- client/                       # Client Engine, P2P File Transfer, Keepalive & Supporting UI
-|   |-- __init__.py               # Package marker
-|   |-- client_core.py            # State machine, server receiver, tracker lookup, P2P X25519 workers
-|   |-- file_transfer.py          # 32 KB chunk slicing, O(1) RAM .part streaming + SHA-256 verify
-|   |-- heartbeat.py              # HeartbeatSender daemon thread sending HEARTBEAT_PING every 4.0s
-|   `-- gui/                      # Thin Tkinter presentation layer decoupled via queue.Queue
-|       |-- __init__.py           # Package marker
-|       |-- app.py                # Tk root controller polling gui_queue every 50ms on main thread
-|       |-- login_view.py         # Server IP/Port and Username login screen
-|       |-- chat_view.py          # Shared room tab, 1-on-1 tabs, auto-synced online users & file picker
-|       `-- file_progress.py      # Non-blocking upload/download progress bar and cancel control
-|
-|-- storage/                      # Local runtime folders used during execution
-|   |-- client_downloads/         # Default folder saving SHA-256-verified P2P downloads
-|   `-- server_cache/             # Reserved directory (unused for files in pure P2P mode)
-|
-`-- docs/                         # Technical & protocol documentation
-    |-- protocol_specs.md         # Wire-level packet format and state transition specification
-    |-- technical_report.md       # English technical report (Markdown)
-    `-- main.tex                  # Standalone LaTeX report with native TikZ diagrams
-\end{lstlisting}
-
-\begin{table}[h!]
-  \centering
-  \small
-  \begin{tabularx}{\textwidth}{@{} c L{5.0cm} Y @{}}
-    \toprule
-    \textbf{Step} & \textbf{Rubric Criterion} & \textbf{Primary Modules} \\
-    \midrule
-    1 & Setup \& Protocol Design & \texttt{common/protocol.py}, \texttt{common/message\_types.py} \\
-    2 & Basic Client--Server Handshake & \texttt{server/server\_core.py}, \texttt{client/client\_core.py} \\
-    3 & Concurrency Implementation & \texttt{server/server\_core.py}, \texttt{server/client\_handler.py} \\
-    4 & Authentication \& State Management & \texttt{server/session\_manager.py} \\
-    5 & Real-Time Text Routing & \texttt{server/router.py}, \texttt{client/client\_core.py} \\
-    6 & Reliable Direct P2P File Transfer & \texttt{client/file\_transfer.py}, \texttt{client/client\_core.py} \\
-    7 & Network Resilience \& Error Handling & \texttt{client/heartbeat.py}, \texttt{ZombieCleaner} \\
-    8 & Security Layer (Encryption) & \texttt{common/crypto\_utils.py}, \texttt{server/client\_handler.py} \\
-    9 & UI / CLI Integration & \texttt{client/gui/app.py}, \texttt{run\_client.py} \\
-    10 & Testing \& Code Quality & \texttt{common/logger.py}, Multi-Terminal Live Verification \\
-    \bottomrule
-  \end{tabularx}
-  \caption{Mapping of implementation modules to the 10-step assignment rubric.}
-  \label{tab:implementation-rubric}
-\end{table}
-
-\subsection{Setup and Protocol Design}
-Because TCP transmits an unstructured byte stream, rapid writes can merge two frames (\emph{packet concatenation}) or split one frame across reads (\emph{packet fragmentation}). Referring to the 16-byte header layout (\textbf{Figure~\ref{fig:header-layout}}) and message registry (\textbf{Table~\ref{tab:message-types}}), \texttt{common/protocol.py} and \texttt{common/message\_types.py} enforce framing boundaries and reject malformed sizes before allocating payload memory:
-
-\begin{lstlisting}[language=Python, caption={Header constants and framing validation (common/protocol.py).}]
-MAGIC_BYTES: bytes = b"CA"
-PROTOCOL_VERSION: int = 1
-HEADER_FORMAT: str = "!2sBHBHQ"
-MAX_PAYLOAD_SIZE: int = 50 * 1024 * 1024
-
-# Inside recv_packet(): check 16B header before reading payload bytes
-header_bytes = recv_exact(sock, HEADER_SIZE)
-magic, version, raw_msg_type, flags, _reserved, payload_len = struct.unpack(
-    HEADER_FORMAT,
-    header_bytes,
-)
-if magic != MAGIC_BYTES:
-    raise InvalidMagicBytesError(...)
-if version != PROTOCOL_VERSION:
-    raise UnsupportedVersionError(...)
-if payload_len > MAX_PAYLOAD_SIZE:
-    raise PayloadTooLargeError(...)
-payload_bytes = recv_exact(sock, payload_len) if payload_len > 0 else b""
-\end{lstlisting}
-
-\begin{lstlisting}[language=Python, caption={Sample MessageType opcodes across all 6 functional categories (common/message\_types.py).}]
-class MessageType(IntEnum):
-    HELLO_HANDSHAKE = 101; HANDSHAKE_ACK = 102; AUTH_REQ = 104
-    USER_LIST_REQ = 201;   USER_STATUS_BROADCAST = 203; PEER_LOOKUP_REQ = 204
-    CHAT_BROADCAST = 301;  CHAT_DIRECT = 302;   CHAT_ACK = 303
-    FILE_OFFER_REQ = 401;  FILE_CHUNK = 403;    FILE_ACK = 404; PEER_HELLO = 405
-    HEARTBEAT_PING = 501;  HEARTBEAT_PONG = 502; ERROR_NOTICE = 602
-\end{lstlisting}
-
-\subsection{Client-Server Handshake}
-Immediately after TCP connect (\textbf{Figure~\ref{fig:seq-a}}, Phase 1; \textbf{Figure~\ref{fig:fsm}}), the client sends \texttt{HELLO\_HANDSHAKE} and expects \texttt{HANDSHAKE\_ACK}. The server enforces a strict \texttt{10.0s} monotonic deadline, bounds the handshake payload to \texttt{64 KB} (\texttt{MAX\_HANDSHAKE\_PAYLOAD\_SIZE}), validates that the decoded JSON is a \texttt{dict}, and returns \texttt{HANDSHAKE\_REJECT} if the client protocol version mismatches:
-
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[node distance=1.3cm, >=Stealth, box/.style={draw=NavyPrimary, fill=BgSoft, rounded corners=4pt, inner sep=5pt, font=\scriptsize}]
-    \node[box] (c) {\texttt{Client.connect()}};
-    \node[box, right=1.8cm of c] (s) {\texttt{Server.handle\_handshake() (10s)}};
-    \node[box, right=1.8cm of s, yshift=0.45cm, draw=TealAccent] (ok) {\texttt{HANDSHAKE\_ACK} (ver == 1)};
-    \node[box, right=1.8cm of s, yshift=-0.45cm, draw=AlertRed] (no) {\texttt{HANDSHAKE\_REJECT} (close)};
-    \draw[->, thick] (c) -- node[above, font=\tiny]{\texttt{HELLO\_HANDSHAKE}} (s);
-    \draw[->, thick, TealAccent] (s) -- (ok);
-    \draw[->, thick, AlertRed] (s) -- (no);
-  \end{tikzpicture}
-  \caption{Application handshake negotiation right after TCP 3-way connect.}
-\end{figure}
-
-\begin{lstlisting}[language=Python, caption={Handshake send (client/client\_core.py) and deadline/version check (server/server\_core.py).}]
-# Client (_perform_handshake):
-hello_payload = {
-    "client_name": self.client_name,
-    "client_version": protocol_version,
-}
-self.sock.sendall(
-    create_packet(
-        MessageType.HELLO_HANDSHAKE,
-        hello_payload,
-        version=protocol_version,
-    )
-)
-response = recv_packet(self.sock)
-
-# Server (handle_handshake):
-packet = recv_packet(
-    client_sock,
-    max_payload_size=MAX_HANDSHAKE_PAYLOAD_SIZE,
-    deadline=deadline,
-)
-client_info = packet.decode_json()
-if not isinstance(client_info, dict) or client_info.get("client_version") != PROTOCOL_VERSION:
-    client_sock.sendall(create_packet(MessageType.HANDSHAKE_REJECT, {"status": "REJECT"}))
-    return False, None
-client_sock.sendall(create_packet(MessageType.HANDSHAKE_ACK, {
-    "status": "OK",
-    "server_id": self.server_id,
-    "encryption_enabled": self.crypto_key is not None,
-}))
-\end{lstlisting}
-
-
-\subsection{Concurrency}
-As shown in \textbf{Figure~\ref{fig:arch}}, \texttt{ServerCore} accepts clients continuously and offloads handshake + handler initialization to bounded worker threads (\texttt{\_handshake\_sem = BoundedSemaphore(64)}) so a slow handshake never stalls \texttt{accept()}. Each active \texttt{ClientHandler} serializes socket writes with \texttt{\_send\_lock}, preventing concurrent broadcasts, direct messages, and heartbeat responses from interleaving:
-
-\begin{lstlisting}[language=Python, basicstyle=\ttfamily\scriptsize, caption={Non-blocking accept loop with handshake worker pool (server/server\_core.py) and write mutex (server/client\_handler.py).}]
-# ServerCore.serve_forever() & _accept_and_handle_connection():
-client_sock, client_addr = self.server_sock.accept()
-if not self._handshake_sem.acquire(blocking=False):
-    client_sock.close()
-    continue
-threading.Thread(
-    target=self._accept_and_handle_connection,
-    args=(client_sock, client_addr),
-    daemon=True,
-).start()
-
-# ClientHandler.send_packet(): prevent concurrent byte interleaving
-with self._send_lock:
-    if self.client_sock:
-        self.client_sock.sendall(packet_bytes)
-\end{lstlisting}
-
-\subsection{Authentication and Session Management}
-Before authentication, each client starts its P2P listener and registers its port in \texttt{AUTH\_REQ} (\textbf{Figure~\ref{fig:seq-a}}). \texttt{SessionManager} validates usernames and protects the check-and-insert operation with a lock, preventing duplicate names during simultaneous logins. The server also records the observed LAN address as \texttt{effective\_ip} for peer lookup:
-
-\begin{lstlisting}[language=Python, caption={Thread-safe username uniqueness check and P2P port registration (server/session\_manager.py).}]
-USERNAME_REGEX = re.compile(r"^[a-zA-Z0-9_\-]{3,20}$")
-key = clean_username.lower()
-with self._lock:
-    if key in self._sessions:
-        return False, reason_taken, None
-    session = UserSession(
-        username=clean_username,
-        handler=handler,
-        address=address,
-        p2p_port=valid_p2p_port,
-    )
-    self._sessions[key] = session
-\end{lstlisting}
-
-\subsection{Real-Time Message Routing}
-\texttt{MessageRouter} routes \texttt{CHAT\_BROADCAST} across authenticated handlers in a single consistent order, and delivers \texttt{CHAT\_DIRECT} solely between sender and target recipient (\textbf{Figure~\ref{fig:seq-a}}, Phase 2) with case-insensitive lookup. Both broadcast and direct packets are automatically encrypted at the transport framing layer using the shared application key (\texttt{COLLAB\_AES\_KEY}), and \texttt{CHAT\_ACK} confirms delivery without echoing plaintext message contents:
-
-\begin{lstlisting}[language=Python, caption={Direct unicast delivery (server/router.py) and automatic encrypted send (client/client\_core.py).}]
-# MessageRouter.route_direct_message():
-session = self.server.session_mgr.get_session(recipient_username)
-if session and session.handler:
-    sent = session.handler.send_packet(MessageType.CHAT_DIRECT, direct_payload)
-    if sent and sender_handler:
-        sender_handler.send_packet(
-            MessageType.CHAT_ACK,
-            {"status": "DELIVERED", "recipient": session.username, "timestamp": ts},
-        )
-
-# ClientCore.send_direct_message(): automatically encrypted via self.crypto_key
-return self.send_packet(
-    MessageType.CHAT_DIRECT,
-    {
-        "sender": sender_name,
-        "recipient": recipient.strip(),
-        "content": content,
-        "timestamp": time.time(),
-    },
-)
-\end{lstlisting}
-
-\subsection{Direct Peer-to-Peer File Transfer}
-As illustrated in \textbf{Figure~\ref{fig:arch}} and \textbf{Figure~\ref{fig:seq-b}}, bulk file bytes bypass the central server completely. After Tracker lookup (\texttt{PEER\_LOOKUP\_REQ/RESP}) and direct TCP connect, peers exchange ephemeral \texttt{X25519} public keys inside \texttt{PEER\_HELLO} / \texttt{PEER\_HELLO\_ACK} to derive a one-time \texttt{p2p\_session\_key}. Chunks stream at \texttt{32 KB} (\texttt{DEFAULT\_CHUNK\_SIZE = 32 * 1024}) directly into a \texttt{.part} staging file on disk while updating an incremental \texttt{hashlib.sha256()} digest ($O(1)$ RAM). Upon completion, the receiver verifies the final SHA-256 digest before committing via \texttt{os.replace()} (using \texttt{resolve\_unique\_save\_path()} to prevent overwriting existing files) and erases the ephemeral session key. Server-side \texttt{ClientHandler} rejects any \texttt{FILE\_*} packet with \texttt{FILE\_P2P\_ONLY}:
-
-\begin{figure}[h!]
-  \centering
-  \begin{tikzpicture}[node distance=0.8cm, >=Stealth, st/.style={draw=AlertRed, fill=BgSoft, rounded corners=4pt, inner sep=5pt, align=center, font=\scriptsize}]
-    \node[st, draw=TealAccent] (s1) {1. Tracker Lookup\\\texttt{PEER\_LOOKUP}};
-    \node[st, right=0.55cm of s1] (s2) {2. Ephemeral X25519\\\texttt{PEER\_HELLO / ACK}};
-    \node[st, right=0.55cm of s2] (s3) {3. Stream to \texttt{.part}\\\texttt{OFFER} + 32KB \texttt{CHUNK}};
-    \node[st, right=0.55cm of s3] (s4) {4. Safe Commit\\SHA-256 $\to$ \texttt{FILE\_ACK}};
-    \draw[->, thick] (s1) -- (s2);
-    \draw[->, thick] (s2) -- (s3);
-    \draw[->, thick] (s3) -- (s4);
-  \end{tikzpicture}
-  \caption{Four-stage Direct P2P file pipeline with ephemeral X25519 session key and $O(1)$ RAM streaming.}
-\end{figure}
-
-\begin{lstlisting}[language=Python, caption={O(1) RAM .part streaming + incremental SHA-256 verification (client/file\_transfer.py) and server relay block (server/client\_handler.py).}]
-# IncomingFileTransfer.write_chunk() & assemble_and_verify(): O(1) RAM streaming
-self._part_fp.write(chunk_bytes)
-self._hasher.update(chunk_bytes)
-self.received_bytes += len(chunk_bytes)
-
-# After receiving all chunks: verify incremental SHA-256 and commit atomically
-actual_sha256 = self._hasher.hexdigest()
-if actual_sha256.lower() != self.expected_sha256.lower():
-    self.cleanup()
-    return False, "SHA-256 mismatch"
-os.replace(self.temp_part_path, self.save_path)
-
-# ClientHandler._dispatch_packet(): enforce direct P2P file policy
-elif msg_type in (
-    MessageType.FILE_OFFER_REQ,
-    MessageType.FILE_OFFER_RESP,
-    MessageType.FILE_CHUNK,
-    MessageType.FILE_ACK,
-):
-    self.send_packet(
-        MessageType.ERROR_NOTICE,
-        {"code": "FILE_P2P_ONLY", "message": "Use direct P2P."},
-    )
-\end{lstlisting}
-
-\subsection{Network Resilience and Error Handling}
-To remove crashed or half-open clients (\textbf{Figure~\ref{fig:fsm}}, \texttt{ONLINE $\to$ DISCONNECTED}), \texttt{HeartbeatSender} sends \texttt{HEARTBEAT\_PING} every 4 seconds. A server cleanup task checks sessions every 3 seconds, closes sockets idle for 15 seconds, and broadcasts \texttt{LEFT} to remaining peers:
-
-\begin{lstlisting}[language=Python, caption={Periodic heartbeat ping (client/heartbeat.py) and server zombie sweep (server/server\_core.py).}]
-# HeartbeatSender.run(): 4.0s client keepalive probe
-if self._stop_event.wait(timeout=self.interval):
-    break
-self.client.send_packet(MessageType.HEARTBEAT_PING, {
-    "client": self.client.username or self.client.client_name,
-    "timestamp": time.time(),
-})
-
-# ServerCore._run_zombie_cleaner(): close connections silent > 15.0s
-for h in self.get_all_handlers():
-    if now - h.last_seen > self.zombie_timeout:
-        h.close()
-\end{lstlisting}
-
-\subsection{Security}
-\texttt{common/crypto\_utils.py} implements a zero-configuration, two-tier encryption architecture setting \texttt{FLAG\_ENCRYPTED = 0x01} in the 16-byte header (\textbf{Figure~\ref{fig:header-layout}}):
-\begin{enumerate}[leftmargin=1.5em, itemsep=2pt]
-  \item \textbf{Shared Application Key (Client $\leftrightarrow$ Server):} \texttt{get\_shared\_app\_key()} reads \texttt{COLLAB\_AES\_KEY} from the environment (or uses the built-in default secret) and derives a 32-byte URL-safe Base64 key via \texttt{PBKDF2HMAC} (\texttt{SHA-256}, \texttt{100,000} iterations) for \textbf{Fernet} (\texttt{AES-128-CBC + HMAC-SHA256}). \texttt{ClientHandler} enforces mandatory encryption on all business packets (\texttt{ENCRYPTION\_REQUIRED}) and rejects mismatched tokens with \texttt{DECRYPTION\_FAILED}.
-  \item \textbf{Ephemeral P2P Session Key (Peer $\leftrightarrow$ Peer):} For every file transfer, both peers generate one-time \texttt{X25519} keypairs (\texttt{generate\_ephemeral\_x25519\_keypair()}), exchange public keys inside \texttt{PEER\_HELLO} / \texttt{PEER\_HELLO\_ACK}, and derive a 32-byte Fernet session key via \texttt{HKDF-SHA256} (\texttt{derive\_p2p\_session\_key()}). All \texttt{FILE\_OFFER\_*}, \texttt{FILE\_CHUNK}, and \texttt{FILE\_ACK} frames use this ephemeral key, which is erased in \texttt{finally:} immediately after transfer completion (Forward Secrecy).
-\end{enumerate}
-
-\begin{lstlisting}[language=Python, caption={Shared AES key loading, ephemeral X25519 + HKDF derivation (common/crypto\_utils.py), and server enforcement (server/client\_handler.py).}]
-# common/crypto_utils.py: ephemeral X25519 ECDH + HKDF-SHA256 P2P session key
-shared_secret = private_key.exchange(peer_pub)
-hkdf = HKDF(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=None,
-    info=P2P_HKDF_INFO,
-)
-p2p_session_key = base64.urlsafe_b64encode(hkdf.derive(shared_secret))
-
-# server/client_handler.py: enforce mandatory encryption and valid AES token
-if self.server.crypto_key is not None and msg_type in SERVER_ENCRYPTED_TYPES:
-    if not packet.is_encrypted:
-        self.send_packet(MessageType.ERROR_NOTICE, {"code": "ENCRYPTION_REQUIRED"})
-        continue
-    try:
-        packet = packet.get_decrypted_packet(self.server.crypto_key)
-    except InvalidToken:
-        self.send_packet(MessageType.ERROR_NOTICE, {"code": "DECRYPTION_FAILED"})
-        continue
-\end{lstlisting}
-
-
-\subsection{User Interface and Command-Line Integration}
-From a distributed systems perspective, the Tkinter GUI (\texttt{client/gui/}) and CLI (\texttt{run\_client.py}) are thin presentation layers decoupled from \texttt{ClientCore}. Their key engineering requirement is \textbf{UI thread safety}: network threads never mutate widgets directly, instead enqueueing events into \texttt{self.gui\_queue} while the Tk main thread polls every \texttt{50 ms}. Whenever a user joins or leaves, \texttt{USER\_STATUS\_BROADCAST} delivers an updated \texttt{online\_users} snapshot that automatically refreshes the sidebar without manual polling, while \texttt{FileProgressDialog} displays live upload/download progress with cooperative cancellation (\texttt{cancel\_event}):
-
-\begin{lstlisting}[language=Python, caption={Producer--Consumer queue bridge preventing Tkinter thread crashes (client/gui/app.py).}]
-def on_broadcast(pkt: Packet):
-    self.gui_queue.put(("chat_broadcast", _safe_json(pkt)))
-
-def _process_gui_queue(self) -> None:
-    try:
-        while True:
-            event_type, data = self.gui_queue.get_nowait()
-            self._dispatch_gui_event(event_type, data)
-    except queue.Empty:
-        pass
-    finally:
-        self.after(50, self._process_gui_queue)
-\end{lstlisting}
-
-\begin{figure}[h!]
-  \centering
-  % Uncomment the \includegraphics lines below once screenshot files are placed in docs/figures/
-  % \includegraphics[width=0.45\textwidth]{figures/gui_login.png}\hfill
-  % \includegraphics[width=0.52\textwidth]{figures/gui_chat_file.png}
-  \begin{tikzpicture}
-    \node[draw=NavyPrimary, dashed, fill=BgSoft, rounded corners=5pt, minimum width=6.5cm, minimum height=3.6cm, align=center, font=\scriptsize\color{SlateDark}] (img1) at (0,0) {
-      \textbf{[GUI Screenshot Placeholder 1]}\\[4pt]
-      Login View (\texttt{client/gui/login\_view.py})\\
-      Server IP, Port \& Username Input\\[4pt]
-      \texttt{figures/gui\_login.png}
-    };
-    \node[draw=TealAccent, dashed, fill=BgSoft, rounded corners=5pt, minimum width=7.5cm, minimum height=3.6cm, align=center, font=\scriptsize\color{SlateDark}] (img2) at (7.4,0) {
-      \textbf{[GUI Screenshot Placeholder 2]}\\[4pt]
-      Main Collaboration View (\texttt{client/gui/chat\_view.py})\\
-      Shared Room, Private Tabs, Auto-Synced Online List \& P2P Progress\\[4pt]
-      \texttt{figures/gui\_chat\_file.png}
-    };
-  \end{tikzpicture}
-  \caption{Desktop Tkinter GUI: Login screen (left) and real-time chat with Direct P2P file transfer progress (right).}
-  \label{fig:gui-screenshots}
-\end{figure}
-
-\subsection{Testing and Code Quality}
-The codebase is organized into modular PEP 8 packages (\texttt{common/}, \texttt{server/}, \texttt{client/}) with explicit type annotations and cross-platform UTF-8 structured logging (\texttt{common/logger.py}) so Vietnamese text and protocol events display cleanly on Windows PowerShell, Linux, and macOS terminals.
-
-System functionality and concurrency were verified through \textbf{live multi-terminal experiments} running one central Server terminal alongside multiple concurrent CLI and GUI Client terminals:
-\begin{itemize}[leftmargin=1.5em, itemsep=2pt]
-  \item \textbf{Concurrent Connection \& Presence Auto-Sync:} Launching multiple client terminals simultaneously to verify \texttt{HELLO\_HANDSHAKE}, unique username enforcement (\texttt{AUTH\_REQ}), and instant \texttt{JOINED}/\texttt{LEFT} presence synchronization across all connected clients.
-  \item \textbf{Real-Time Broadcast \& Private Messaging:} Exchanging room-wide broadcasts and 1-on-1 private messages (\texttt{@username}) encrypted automatically via \texttt{COLLAB\_AES\_KEY}, confirming ordered delivery and \texttt{CHAT\_ACK} receipts.
-  \item \textbf{Direct P2P File Transfer \& Integrity Check:} Streaming files directly between peers over ephemeral \texttt{X25519}-encrypted P2P sockets while observing zero file-chunk traffic on the central server, \texttt{.part} staging, and SHA-256 verification inside \texttt{storage/client\_downloads/}.
-  \item \textbf{Abrupt Disconnect \& Zombie Cleanup:} Force-closing a client terminal to confirm \texttt{ZombieCleaner} detects missed heartbeats after \texttt{15.0s}, reclaims the session, and broadcasts \texttt{LEFT} to remaining terminals.
-\end{itemize}
-
-\begin{figure}[h!]
-  \centering
-  % Uncomment the \includegraphics line below once the multi-terminal screenshot is placed in docs/figures/
-  % \includegraphics[width=0.95\textwidth]{figures/multi_terminal_test.png}
-  \begin{tikzpicture}
-    \node[draw=NavyPrimary, dashed, fill=BgSoft, rounded corners=5pt, minimum width=14.4cm, minimum height=4.2cm, align=center, font=\scriptsize\color{SlateDark}] {
-      \textbf{[Multi-Terminal Experiment Screenshot Placeholder]}\\[4pt]
-      Simultaneous Execution of Central Server Terminal (\texttt{run\_server.py}) and Multiple Client Terminals (\texttt{run\_client.py} / \texttt{run\_gui.py})\\
-      Demonstrating Handshake, Auth, Encrypted Broadcast/Direct Chat, Direct P2P File Transfer, and Heartbeat/Zombie Recovery\\[4pt]
-      \texttt{figures/multi\_terminal\_test.png}
-    };
-  \end{tikzpicture}
-  \caption{Multi-terminal experimental verification showing concurrent server and client terminals interacting in real time.}
-  \label{fig:multi-terminal-test}
-\end{figure}
-
-% ==============================================================================
-% SECTION 6: CHALLENGES & SOLUTIONS (~1 PAGE)
-% ==============================================================================
-\section{Engineering Challenges and Solutions}
-
-\begin{enumerate}[leftmargin=1.4em, itemsep=6pt]
-  \item \textbf{TCP Stream Concatenation and Fragmentation}\\
-  \textit{Challenge:} Reading raw sockets with fixed buffers caused adjacent packets to merge (\textit{sticky packets}) or split across consecutive \texttt{recv()} calls, crashing JSON parsers.\\
-  \textit{Solution:} Implemented the 16-byte fixed binary header (\texttt{!2sBHBHQ}) paired with a deterministic \texttt{recv\_exact()} loop in \texttt{common/protocol.py} that reassembles exact payload boundaries regardless of OS socket chunking.
-
-
-  \item \textbf{Half-Open (``Zombie'') Sockets on Abrupt Client Drops}\\
-  \textit{Challenge:} Terminating a client process abruptly or unplugging LAN cables leaves TCP sockets open on the server, blocking usernames indefinitely.\\
-  \textit{Solution:} Added periodic \texttt{HEARTBEAT\_PING} probes (\texttt{4.0s}) combined with the server's \texttt{ZombieCleaner} thread scanning every \texttt{3.0s} (\texttt{zombie\_timeout = 15.0s}) to close dead peers and broadcast departure updates.
-
-  \item \textbf{Server Bandwidth Bottlenecks vs. LAN Peer Discovery}\\
-  \textit{Challenge:} Relaying file chunks through the server congested central memory/bandwidth. Switching to direct P2P required reliable discovery without clients registering unreachable \texttt{127.0.0.1} addresses over LAN.\\
-  \textit{Solution:} Maintained the server as an authoritative Tracker storing each session's socket-observed \texttt{effective\_ip} alongside its client-declared \texttt{p2p\_port}, queried on demand via \texttt{PEER\_LOOKUP\_REQ} / \texttt{PEER\_LOOKUP\_RESP}. Removed server fallback relay (\texttt{FILE\_P2P\_ONLY}) so broken firewall setups report clear errors immediately.
-
-\end{enumerate}
-
-
-
-% ==============================================================================
-% SECTION 7: INSTALLATION & RUNNING GUIDE
-% ==============================================================================
-\section{Installation and Usage}
-
-\subsection{Environment Setup}
-Requires \textbf{Python 3.10+} (verified on Python 3.12). On Linux, ensure Tkinter is installed (\texttt{sudo apt-get install -y python3-tk libtk8.6}).
-
-\begin{lstlisting}[language=bash, basicstyle=\ttfamily\scriptsize, caption={Cloning and installing dependencies inside a virtual environment.}]
-git clone https://github.com/QuanNguyenCS/DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION.git
-cd DISTRIBUTED-CLIENT-SERVER-COLLABORATION-APPLICATION
-
-python -m venv venv
-# Windows PowerShell: .\venv\Scripts\activate
-# macOS / Linux:      source venv/bin/activate
-pip install -r requirements.txt
-\end{lstlisting}
-
-\subsection{Starting the Server and Clients}
-\begin{lstlisting}[language=bash, caption={Commands to start the Server, Desktop GUI Client, and Terminal CLI Client.}]
-# 1. Start Server (default 0.0.0.0:9000; automatic encryption via COLLAB_AES_KEY)
-python run_server.py --host 0.0.0.0 --port 9000
-
-# 2. Start Tkinter Desktop GUI Client
-python run_gui.py
-
-# 3. Start Terminal CLI Client (optional fixed P2P port for LAN firewalls)
-python run_client.py --host 127.0.0.1 --port 9000 --username Bob --p2p-port 0
-\end{lstlisting}
-
-\begin{table}[h!]
-  \centering
-  \small
-  \begin{tabularx}{\textwidth}{@{} L{4.4cm} Y @{}}
-    \toprule
-    \textbf{CLI Command} & \textbf{Function} \\
-    \midrule
-    \texttt{<message>} & Broadcast message to shared room \\
-    \texttt{@<user> <text>} or \texttt{/msg <user> <text>} & Send private 1-on-1 message \\
-    \texttt{/file <user> <path>} or \texttt{/sendfile ...} & Transmit file directly P2P with SHA-256 verification \\
-    \texttt{/users} or \texttt{/who} & Display online users \\
-    \texttt{/ping} & Send manual \texttt{HEARTBEAT\_PING} probe \\
-    \texttt{/quit} or \texttt{/exit} & Send \texttt{DISCONNECT\_NOTICE} and shut down cleanly \\
-    \bottomrule
-  \end{tabularx}
-  \caption{Interactive CLI client command reference.}
-\end{table}
-
-\paragraph{Multi-Host LAN Checklist:} When running across separate PCs on a LAN, clients must specify the Server's LAN IP address (not \texttt{127.0.0.1}), and host firewalls must allow inbound TCP traffic on Server port \texttt{9000} and each client's listening P2P port (set explicitly via \texttt{--p2p-port} if required).
-
-% ==============================================================================
-% SECTION 9: CONCLUSION
-% ==============================================================================
-\section{Conclusion}
-We designed and implemented a complete raw-socket distributed collaboration system fulfilling all ten rubric stages. Separating lightweight control, presence, and ordered chat onto a multi-threaded central server while streaming encrypted files directly peer-to-peer achieves clean modularity, strong data integrity, and verified reliability across Windows, Linux, and macOS.
-
+Local Windows tests do not prove that Linux/macOS CI has passed. Inspect actual CI jobs, then separately verify LAN topology/firewalls, prolonged load and target filesystem behavior. The source report can be typeset from main.tex; an earlier external submission PDF is not silently rewritten.
 \end{document}

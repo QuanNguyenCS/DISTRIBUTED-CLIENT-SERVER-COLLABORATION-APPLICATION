@@ -49,6 +49,8 @@ class MessageRouter:
         Returns:
             Tuple[bool, int]: (Thành công hay không, Số lượng client đã nhận tin).
         """
+        if not isinstance(content, str) or len(content) > 8192:
+            raise ValueError("Invalid chat content.")
         if not content:
             return False, 0
 
@@ -95,13 +97,21 @@ class MessageRouter:
         Returns:
             Tuple[bool, str]: (Thành công hay không, Thông điệp kết quả).
         """
+        if (
+            not isinstance(recipient_username, str)
+            or not isinstance(content, str)
+            or len(content) > 8192
+        ):
+            raise ValueError("Invalid direct message payload.")
         if not content and not e2ee_ciphertext:
             return False, "Nội dung tin nhắn không được để trống."
 
         # 1. Chặn việc tự gửi tin nhắn riêng cho chính mình
         if sender_username.strip().lower() == recipient_username.strip().lower():
             reason = "Không thể gửi tin nhắn riêng cho chính mình."
-            logger.warning("[%s] Cố tình gửi tin nhắn riêng cho chính mình.", sender_username)
+            logger.warning(
+                "[%s] Cố tình gửi tin nhắn riêng cho chính mình.", sender_username
+            )
             if sender_handler:
                 sender_handler.send_packet(
                     MessageType.ERROR_NOTICE,
@@ -167,7 +177,9 @@ class MessageRouter:
                 )
             return False, reason
 
-        logger.info("🔒 [Direct] %s ➔ %s: %s", sender_username, session.username, content)
+        logger.info(
+            "🔒 [Direct] %s ➔ %s: %s", sender_username, session.username, content
+        )
 
         # 4. Gửi xác nhận CHAT_ACK (chỉ metadata tối thiểu, không lặp lại bản rõ content)
         if sender_handler:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -24,12 +25,15 @@ logger = get_logger("server.session")
 @dataclass
 class UserSession:
     """Đại diện cho một phiên làm việc của người dùng đã xác thực thành công."""
+
     username: str
     handler: Any  # ClientHandler
     address: Tuple[str, int]
     p2p_port: Optional[int] = None
     p2p_host: Optional[str] = None
     login_time: float = field(default_factory=time.time)
+    identity_key: Optional[str] = None
+    session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def effective_ip(self) -> str:
@@ -60,7 +64,7 @@ class UserSession:
 class SessionManager:
     """
     Bộ quản lý phiên người dùng tập trung trên Server.
-    
+
     Quy tắc an toàn:
       - Mọi thao tác đọc/ghi vào dictionary active_users đều phải được bao bọc bởi self._lock.
       - Tên người dùng không phân biệt hoa thường khi kiểm tra trùng lặp (vd: 'Alice' và 'alice' coi là một).
@@ -79,10 +83,10 @@ class SessionManager:
     def validate_username(cls, username: str) -> Tuple[bool, str]:
         """
         Kiểm tra tính hợp lệ của Username theo quy chuẩn.
-        
+
         Args:
             username: Tên người dùng cần kiểm tra.
-            
+
         Returns:
             Tuple[bool, str]: (Hợp lệ hay không, Thông báo lý do nếu không hợp lệ).
         """
@@ -96,7 +100,10 @@ class SessionManager:
             return False, "Username quá dài (tối đa 20 ký tự)."
 
         if not cls.USERNAME_REGEX.match(username):
-            return False, "Username chỉ được chứa chữ cái, chữ số, gạch dưới (_) hoặc gạch ngang (-)."
+            return (
+                False,
+                "Username chỉ được chứa chữ cái, chữ số, gạch dưới (_) hoặc gạch ngang (-).",
+            )
 
         return True, "Hợp lệ"
 
@@ -107,6 +114,7 @@ class SessionManager:
         address: Tuple[str, int],
         p2p_port: Optional[int] = None,
         p2p_host: Optional[str] = None,
+        identity_key: Optional[str] = None,
     ) -> Tuple[bool, str, Optional[UserSession]]:
         """
         Đăng ký một người dùng mới vào danh bạ trực tuyến (Thread-Safe).
@@ -131,22 +139,27 @@ class SessionManager:
         key = clean_username.lower()
 
         valid_p2p_port: Optional[int] = None
-        if isinstance(p2p_port, int) and not isinstance(p2p_port, bool) and 1 <= p2p_port <= 65535:
+        if (
+            isinstance(p2p_port, int)
+            and not isinstance(p2p_port, bool)
+            and 1 <= p2p_port <= 65535
+        ):
             valid_p2p_port = p2p_port
 
         clean_p2p_host: Optional[str] = None
-        if isinstance(p2p_host, str):
-            candidate = p2p_host.strip()
-            if candidate and candidate != "0.0.0.0":
-                clean_p2p_host = candidate
 
         # 2. Kiểm tra trùng lặp và đăng ký trong khối khóa an toàn
         with self._lock:
             if key in self._sessions:
                 logger.warning(
-                    "Đăng ký thất bại: Username '%s' đã có người sử dụng.", clean_username
+                    "Đăng ký thất bại: Username '%s' đã có người sử dụng.",
+                    clean_username,
                 )
-                return False, f"Username '{clean_username}' đã có người sử dụng. Vui lòng chọn tên khác.", None
+                return (
+                    False,
+                    f"Username '{clean_username}' đã có người sử dụng. Vui lòng chọn tên khác.",
+                    None,
+                )
 
             session = UserSession(
                 username=clean_username,
@@ -154,6 +167,7 @@ class SessionManager:
                 address=address,
                 p2p_port=valid_p2p_port,
                 p2p_host=clean_p2p_host,
+                identity_key=identity_key,
             )
             self._sessions[key] = session
             online_count = len(self._sessions)

@@ -1,135 +1,65 @@
-# TÀI LIỆU ĐẶC TẢ GIAO THỨC TẦNG ỨNG DỤNG (APPLICATION LAYER PROTOCOL SPECIFICATION)
-> **Dự án:** Distributed Client-Server Collaboration Application  
-> **Phiên bản Giao thức:** 1.0  
-> **Giao vận tầng dưới:** TCP (Raw Socket)
+# Application protocol v2
 
----
+TCP carries server chat/control and direct P2P files. UDP discovery uses one encrypted frame per datagram. Upgrade both sides together; v1 frames are rejected.
 
-## 1. TỔNG QUAN THIẾT KẾ GIAO THỨC
+## Header
 
-Trong mô hình mạng OSI/TCP-IP, tầng Transport (TCP) cung cấp dịch vụ truyền dữ liệu dạng **luồng byte liên tục (Stream-oriented)**, nghĩa là TCP không bảo toàn ranh giới giữa các thông điệp gửi đi. Nếu ứng dụng gửi hai thông điệp riêng biệt, bên nhận có thể:
-1. Nhận cả hai thông điệp trong cùng một lần đọc socket (`Packet Concatenation / Dính gói`).
-2. Chỉ nhận được một phần thông điệp trong một lần đọc (`Packet Fragmentation / Phân mảnh`).
+Network byte order, `!2sBHBHQ`, exactly 16 bytes:
 
-Để giải quyết triệt để vấn đề này, hệ thống sử dụng phương pháp **Packet Framing có Header Độ Dài Cố Định (Fixed-Length Header with Length Prefix)** kết hợp với kiểm tra hợp lệ nhị phân qua **Magic Bytes**.
+| Offset | Field | Bytes | Value |
+|---|---|---:|---|
+| 0–1 | Magic | 2 | CA |
+| 2 | Version | 1 | 2 |
+| 3–4 | Type | 2 | Registry below |
+| 5 | Flags | 1 | 0x00 plain or 0x01 encrypted |
+| 6–7 | Reserved | 2 | Zero |
+| 8–15 | Wire payload length | 8 | Bytes following header |
 
----
+Unknown flags/nonzero reserved fields are rejected; compression is not implemented. Generic frame cap is 50 MiB. Control/P2P paths use 64 KiB; central HELLO has a 64 KiB cap and 10-second total monotonic deadline. UDP datagrams are capped at 4096 bytes.
 
-## 2. CẤU TRÚC GÓI TIN NHỊ PHÂN (PACKET BINARY FORMAT)
+## Authenticated meaning
 
-Mỗi gói tin truyền trên đường truyền bao gồm 2 phần liên tiếp:
-1. **Binary Header (16 bytes cố định):** Chứa metadata và độ dài chính xác của Payload.
-2. **Dynamic Payload (0 đến N bytes):** Dữ liệu thực tế của thông điệp (JSON, văn bản UTF-8 hoặc dữ liệu file nhị phân).
+Encrypted plaintext is `struct.pack('!BHB', version, type, flags_including_encrypted) + application_payload`. After Fernet verification/decryption, the receiver compares this prefix with its external header and removes it before parsing JSON/binary. Reclassifying an encrypted DM as broadcast cannot reuse the original ciphertext.
 
-```text
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       Magic Bytes ("CA")      |    Version    |               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+               +
-|         Message Type          |     Flags     |               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           Reserved            |                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
-|                                                               |
-+                     Payload Length (64-bit)                   +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Payload Data...                        |
-|                     (Độ dài = Payload Length)                 |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-```
+`recv_secure_packet` requires encrypted framing when a key is configured. Supplying decrypt_key to generic recv_packet alone is not that enforcement; generic parsing is retained for wire-inspection tests.
 
-### Chi tiết các trường trong Header (Network Byte Order - Big Endian `!`):
+## Registry
 
-| Offset (Byte) | Tên trường | Kiểu dữ liệu | Kích thước | Mô tả chi tiết |
-| :---: | :--- | :---: | :---: | :--- |
-| **0 - 1** | `Magic Bytes` | `char[2]` (`2s`) | 2 bytes | Luôn là `b"CA"` (Collaboration App). Giúp bên nhận nhận diện ngay lập tức gói tin hợp lệ hay dữ liệu rác. |
-| **2** | `Version` | `uint8` (`B`) | 1 byte | Phiên bản giao thức (hiện tại là `1`). Cho phép nâng cấp giao thức tương lai. |
-| **3 - 4** | `Message Type` | `uint16` (`H`) | 2 bytes | Mã số xác định hành vi gói tin (xem bảng Message Types bên dưới). |
-| **5** | `Flags` | `uint8` (`B`) | 1 byte | Các cờ bitmask: `0x01` (đã mã hóa AES), `0x02` (đã nén). |
-| **6 - 7** | `Reserved` | `uint16` (`H`) | 2 bytes | Dự phòng mở rộng, hiện tại luôn đặt là `0x0000`. |
-| **8 - 15** | `Payload Length` | `uint64` (`Q`) | 8 bytes | Độ dài chính xác của phần Payload theo sau tính bằng bytes (hỗ trợ truyền file tới hàng chục Gigabytes). |
+| Codes | Messages |
+|---|---|
+| 101/102/103 | HELLO_HANDSHAKE / HANDSHAKE_ACK / HANDSHAKE_REJECT |
+| 104/105/106 | AUTH_REQ / AUTH_RESP_SUCCESS / AUTH_RESP_FAIL |
+| 201/202/203 | USER_LIST_REQ / USER_LIST_RESP / USER_STATUS_BROADCAST |
+| 204/205 | PEER_LOOKUP_REQ / PEER_LOOKUP_RESP |
+| 301/302/303 | CHAT_BROADCAST / CHAT_DIRECT / CHAT_ACK |
+| 401/402/403/404 | FILE_OFFER_REQ / FILE_OFFER_RESP / FILE_CHUNK / FILE_ACK |
+| 405/406 | PEER_HELLO / PEER_HELLO_ACK |
+| 501/502 | TCP HEARTBEAT_PING / HEARTBEAT_PONG |
+| 503/504 | UDP DISCOVERY_REQ / DISCOVERY_RESP |
+| 601/602 | DISCONNECT_NOTICE / ERROR_NOTICE |
 
-**Định dạng chuỗi `struct` trong Python:** `"!2sBHBHQ"` (tổng cộng đúng 16 bytes).
+The initial plain HELLO negotiates version/server identity/encryption mode/tracker verification key. Auth, user lists/presence, tracker lookups and chat/ACK use the configured room key. Minimal errors, heartbeat and disconnect remain control signals without file/chat contents. Normal entrypoints require a private room key; keyless mode is an explicit library setting.
 
----
+## Sessions and request correlation
 
-## 3. DANH SÁCH MÃ THÔNG ĐIỆP (MESSAGE TYPES REGISTRY)
+AUTH_REQ registers username, p2p_port and an Ed25519 identity_key. The tracker uses the observed TCP source IP; a claimed p2p_host does not override it. AUTH_RESP_SUCCESS returns username, session_id, online_users and peers. Names are unique case-insensitively while online.
 
-Các mã thông điệp được phân chia theo từng dải số chức năng (khớp chính xác với `common/message_types.py`):
+PEER_LOOKUP_REQ includes a unique request_id; every response echoes it. Success returns endpoint and ticket. Separate request IDs prevent two lookups of the same username overwriting each other's waiter.
 
-| Nhóm | Mã (Code) | Tên Enum | Chiều truyền | Ý nghĩa & Dữ liệu Payload |
-| :--- | :---: | :--- | :---: | :--- |
-| **Handshake & Auth** | `101` | `HELLO_HANDSHAKE` | Client -> Server | Khởi tạo bắt tay ứng dụng: `{"client_name": "...", "client_version": 1}`. |
-| | `102` | `HANDSHAKE_ACK` | Server -> Client | Đồng ý bắt tay, trả về `status="OK"`, `server_id`, `version`, `encryption_enabled`. |
-| | `103` | `HANDSHAKE_REJECT` | Server -> Client | Từ chối kết nối do không tương thích phiên bản hoặc payload sai chuẩn. |
-| | `104` | `AUTH_REQ` | Client -> Server | Yêu cầu đăng nhập: `{"username": "alice", "p2p_port": 51234}`. |
-| | `105` | `AUTH_RESP_SUCCESS` | Server -> Client | Đăng nhập thành công: `{"status": "SUCCESS", "username": "alice", "online_users": [...], "peers": {...}}`. |
-| | `106` | `AUTH_RESP_FAIL` | Server -> Client | Đăng nhập thất bại: `{"status": "FAIL", "reason": "..."}`. |
-| **User Presence & Tracker** | `201` | `USER_LIST_REQ` | Client -> Server | Yêu cầu lấy danh sách người dùng đang online kèm danh bạ P2P. |
-| | `202` | `USER_LIST_RESP` | Server -> Client | Trả về danh sách `users` và `peers` (`username`, `ip`, `p2p_port`). |
-| | `203` | `USER_STATUS_BROADCAST` | Server -> Client | Thông báo có user `JOINED` hoặc `LEFT` kèm `online_users`, `peers` và `online_count`. |
-| | `204` | `PEER_LOOKUP_REQ` | Client -> Server | Hỏi Tracker địa chỉ P2P: `{"username": "bob"}`. |
-| | `205` | `PEER_LOOKUP_RESP` | Server -> Client | Tracker trả về `{"found": true, "username": "bob", "ip": "...", "p2p_port": ...}`. |
-| **Chat Messaging** | `301` | `CHAT_BROADCAST` | Client <-> Server | Tin nhắn phòng chung (Server giữ thứ tự phát thanh): `{"sender", "content", "timestamp"}`. |
-| | `302` | `CHAT_DIRECT` | Client <-> Server | Tin nhắn riêng 1-1 (`{"sender", "recipient", "content" | "e2ee"+"ciphertext", "timestamp"}`). |
-| | `303` | `CHAT_ACK` | Server -> Client | Xác nhận đã chuyển tin nhắn (`{"status": "DELIVERED", "recipient", "timestamp"}`, không lặp bản rõ `content`). |
-| **File Transfer (P2P Direct)** | `401` | `FILE_OFFER_REQ` | Peer -> Peer | Đề xuất gửi file trực tiếp (mã hóa bằng khóa phiên tạm X25519): `{"file_id", "sender", "recipient", "file_name", "file_size", "total_chunks", "sha256", "encrypted"}`. |
-| | `402` | `FILE_OFFER_RESP` | Peer -> Peer | Chấp thuận (`ACCEPTED`) hoặc từ chối (`REJECTED`) nhận file (mã hóa khóa phiên X25519). |
-| | `403` | `FILE_CHUNK` | Peer -> Peer | Mảnh dữ liệu file nhị phân (32 KB): Header JSON (`!I` + JSON) + Raw bytes (mã hóa toàn packet bằng khóa phiên X25519 tạm thời). |
-| | `404` | `FILE_ACK` | Peer -> Peer | Xác nhận hoàn tất nhận file & kiểm tra SHA-256 (`SUCCESS` hoặc `FAILED`), xóa khóa phiên ngay sau khi đóng kênh. |
-| | `405` | `PEER_HELLO` | Peer -> Peer | Bắt tay trực tiếp P2P (bọc bằng khóa chung AES): `{"sender", "protocol_version", "x25519_pub"}`. |
-| | `406` | `PEER_HELLO_ACK` | Peer -> Peer | Peer phản hồi `OK`/`REJECTED` kèm `x25519_pub` để hai bên tự dẫn xuất khóa AES phiên tạm (HKDF-SHA256). |
-| **Heartbeat** | `501` | `HEARTBEAT_PING` | Client -> Server | Gói tin nhịp tim kiểm tra liveness (chu kỳ 4.0s). |
-| | `502` | `HEARTBEAT_PONG` | Server -> Client | Gói tin phản hồi nhịp tim (`{"status": "ALIVE"}`). |
-| **Connection** | `601` | `DISCONNECT_NOTICE` | Client -> Server | Thông báo chủ động ngắt kết nối an toàn (Graceful Disconnect). |
-| | `602` | `ERROR_NOTICE` | Server -> Client | Thông báo lỗi hệ thống hoặc vi phạm giao thức (ví dụ `FILE_P2P_ONLY`). |
+Ticket claims: id, sender, recipient, sender_session, recipient_session, sender_key, recipient_key, expires. The tracker signs canonical UTF-8 JSON (sorted keys, compact separators) with Ed25519. The signing private key is generated per server instance. Tickets expire after 30 seconds and are consumed once by the recipient.
 
----
+## Direct P2P
 
-## 4. SƠ ĐỒ MÁY TRẠNG THÁI CLIENT (CLIENT STATE MACHINE)
+1. Sender obtains a ticket for the current sessions.
+2. Room-key encrypted PEER_HELLO contains sender, protocol_version, x25519_pub, ticket and proof. The sender signs the hello without proof using its registered identity private key.
+3. Receiver verifies tracker signature, expiry, recipient/session/key, sender proof and replay cache. It derives a Fernet session key using X25519 and HKDF-SHA256.
+4. Encrypted PEER_HELLO_ACK carries OK, receiver username, version, ephemeral key, ticket_id and proof. The receiver signs `{hello, reply_without_proof}`. Sender verifies expected identity and transcript.
+5. Session-key encrypted FILE_OFFER_REQ contains file_id, sender, recipient, file_name, file_size, total_chunks and SHA-256. Offer responses and final ACK must be encrypted and match the file_id.
+6. Each FILE_CHUNK plaintext contains four-byte metadata JSON length, metadata JSON and binary chunk. Metadata: file_id, chunk_index, total_chunks, chunk_size. Indices, chunk count/length and total bytes are validated. Empty files use one empty chunk.
+7. Receiver streams to exclusively created staging, verifies size/chunks/hash, then commits a unique no-overwrite final filename. One encrypted FILE_ACK reports SUCCESS/FAILED. There is no ACK per chunk or resume protocol above TCP.
 
-```mermaid
-stateDiagram-v2
-    [*] --> DISCONNECTED
-    DISCONNECTED --> CONNECTING : Gọi connect(IP, Port)
-    CONNECTING --> HANDSHAKING : TCP 3-Way Handshake OK
-    HANDSHAKING --> AUTHENTICATING : HELLO_HANDSHAKE / HANDSHAKE_ACK + Start P2P Listener
-    HANDSHAKING --> DISCONNECTED : HANDSHAKE_REJECT hoặc Timeout (10s Server / 5s Client)
-    AUTHENTICATING --> ONLINE : AUTH_REQ(username, p2p_port) / AUTH_RESP_SUCCESS
-    AUTHENTICATING --> AUTHENTICATING : Nhận AUTH_RESP_FAIL (Nhập lại tên)
-    AUTHENTICATING --> DISCONNECTED : Đóng kết nối
+Shutdown/cancel closes the corresponding socket so blocked I/O wakes and staging is removed. Workers, sockets, incoming sizes and packet-read durations are bounded. Dropping key references is not a promise of secure RAM zeroization.
 
-    state ONLINE {
-        [*] --> IDLE
-        IDLE --> CHATTING : Gửi/Nhận CHAT_BROADCAST / CHAT_DIRECT (qua Server)
-        CHATTING --> IDLE
-        IDLE --> TRANSFERRING_FILE_P2P : PEER_LOOKUP_REQ -> TCP P2P (PEER_HELLO -> FILE_CHUNK -> FILE_ACK)
-        TRANSFERRING_FILE_P2P --> IDLE : Hoàn tất kiểm tra SHA-256 (hoặc báo lỗi nếu P2P thất bại)
-    }
+## UDP discovery
 
-    ONLINE --> DISCONNECTING : Gửi DISCONNECT_NOTICE
-    DISCONNECTING --> DISCONNECTED : Đóng Socket Server & Stop P2P Listener
-    ONLINE --> DISCONNECTED : Mất kết nối đột ngột (Broken Pipe / Zombie Timeout 15s)
-```
-
----
-
-## 5. THUẬT TOÁN ĐỌC ĐỦ GÓI TIN (PACKET UNPACKING ALGORITHM)
-
-```text
-Function recv_packet(socket):
-    1. header_bytes = recv_exact(socket, 16)
-    2. (magic, version, msg_type, flags, reserved, payload_len) = unpack("!2sBHBHQ", header_bytes)
-    3. If magic != "CA":
-           Raise InvalidMagicBytesError
-    4. If version != CURRENT_VERSION:
-           Raise UnsupportedVersionError
-    5. If payload_len > MAX_LIMIT (50MB):
-           Raise PayloadTooLargeError
-    6. payload_bytes = ""
-    7. If payload_len > 0:
-           payload_bytes = recv_exact(socket, payload_len)
-    8. Return Packet(msg_type, payload_bytes, flags, version)
-```
+The request contains a fresh 32-character nonce. The encrypted response echoes nonce, server_id and TCP port. Client uses observed UDP source IP. Wrong key, type, size, version or nonce is rejected. Discovery selects an address under group room-key trust; it is not an external certificate authority.

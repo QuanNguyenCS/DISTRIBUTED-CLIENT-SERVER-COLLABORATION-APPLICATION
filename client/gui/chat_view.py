@@ -80,7 +80,9 @@ class ChatView(ttk.Frame):
         )
         user_badge.pack(anchor=tk.W)
 
-        enc_text = "🔒 AES + P2P X25519 tự động" if self.is_encrypted else "🔓 Không mã hóa"
+        enc_text = (
+            "🔒 AES + P2P X25519 tự động" if self.is_encrypted else "🔓 Không mã hóa"
+        )
         enc_color = "#2E7D32" if self.is_encrypted else "#757575"
         self.enc_lbl = ttk.Label(
             my_card,
@@ -193,6 +195,13 @@ class ChatView(ttk.Frame):
 
     def _create_chat_tab(self, tab_id: str, title: str) -> scrolledtext.ScrolledText:
         """Tạo một tab trò chuyện mới trong Notebook."""
+        if len(self.chat_tabs) >= 64:
+            oldest = next(key for key in self.chat_tabs if key != "global")
+            frame = self.tab_frames.pop(oldest)
+            self.notebook.forget(frame)
+            frame.destroy()
+            self.chat_tabs.pop(oldest)
+            self.tab_recipients.pop(oldest, None)
         tab_frame = ttk.Frame(self.notebook)
         self.notebook.add(tab_frame, text=title)
 
@@ -208,12 +217,22 @@ class ChatView(ttk.Frame):
 
         # Cấu hình các style tag
         text_widget.tag_config("timestamp", foreground="#888888", font=("Segoe UI", 8))
-        text_widget.tag_config("self_sender", foreground="#1976D2", font=("Segoe UI", 9, "bold"))
-        text_widget.tag_config("other_sender", foreground="#7B1FA2", font=("Segoe UI", 9, "bold"))
-        text_widget.tag_config("system_sender", foreground="#E65100", font=("Segoe UI", 9, "bold"))
+        text_widget.tag_config(
+            "self_sender", foreground="#1976D2", font=("Segoe UI", 9, "bold")
+        )
+        text_widget.tag_config(
+            "other_sender", foreground="#7B1FA2", font=("Segoe UI", 9, "bold")
+        )
+        text_widget.tag_config(
+            "system_sender", foreground="#E65100", font=("Segoe UI", 9, "bold")
+        )
         text_widget.tag_config("content", foreground="#212121", font=("Segoe UI", 9))
-        text_widget.tag_config("file_badge", foreground="#2E7D32", font=("Segoe UI", 9, "bold"))
-        text_widget.tag_config("error_badge", foreground="#D32F2F", font=("Segoe UI", 9, "italic"))
+        text_widget.tag_config(
+            "file_badge", foreground="#2E7D32", font=("Segoe UI", 9, "bold")
+        )
+        text_widget.tag_config(
+            "error_badge", foreground="#D32F2F", font=("Segoe UI", 9, "italic")
+        )
 
         self.chat_tabs[tab_id] = text_widget
         self.tab_frames[tab_id] = tab_frame
@@ -298,6 +317,9 @@ class ChatView(ttk.Frame):
             text_widget.insert(tk.END, prefix, sender_tag)
             text_widget.insert(tk.END, f"{content}\n", "content")
 
+        line_count = int(text_widget.index("end-1c").split(".")[0])
+        if line_count > 5000:
+            text_widget.delete("1.0", f"{line_count - 5000}.0")
         text_widget.see(tk.END)
         text_widget.config(state=tk.DISABLED)
 
@@ -316,7 +338,9 @@ class ChatView(ttk.Frame):
     def _open_selected_user_chat(self) -> None:
         selected_indices = self.users_listbox.curselection()
         if not selected_indices:
-            messagebox.showinfo("Thông báo", "Vui lòng chọn một người dùng từ danh sách.")
+            messagebox.showinfo(
+                "Thông báo", "Vui lòng chọn một người dùng từ danh sách."
+            )
             return
 
         selected_text = self.users_listbox.get(selected_indices[0])
@@ -324,7 +348,9 @@ class ChatView(ttk.Frame):
         target_username = selected_text.replace("🟢", "").replace("(Bạn)", "").strip()
 
         if target_username.lower() == self.current_username.lower():
-            messagebox.showwarning("Cảnh báo", "Bạn không thể tự gửi tin nhắn riêng cho chính mình.")
+            messagebox.showwarning(
+                "Cảnh báo", "Bạn không thể tự gửi tin nhắn riêng cho chính mình."
+            )
             return
 
         # Mở hoặc focus vào tab chat riêng

@@ -24,7 +24,12 @@ from common.crypto_utils import (
     get_shared_app_key,
 )
 from common.message_types import MessageType
-from common.protocol import PROTOCOL_VERSION, create_packet, recv_packet
+from common.protocol import (
+    ConnectionClosedError,
+    PROTOCOL_VERSION,
+    create_packet,
+    recv_packet,
+)
 from server.server_core import ServerCore
 from client.client_core import ClientCore
 
@@ -52,12 +57,11 @@ class TestCryptoUnit:
     def test_shared_app_key_from_env_and_fallback(self, monkeypatch):
         """Biến môi trường COLLAB_AES_KEY hỗ trợ cả chuỗi bất kỳ lẫn Fernet key sẵn; rỗng sẽ dùng khóa mặc định."""
         monkeypatch.delenv(ENV_AES_KEY_VAR, raising=False)
-        default_k = get_shared_app_key()
-        assert len(default_k) == 44
+        with pytest.raises(ValueError, match="COLLAB_AES_KEY"):
+            get_shared_app_key()
 
         monkeypatch.setenv(ENV_AES_KEY_VAR, "CustomTeamEnvSecret")
         env_derived = get_shared_app_key()
-        assert env_derived != default_k
         assert env_derived == derive_key("CustomTeamEnvSecret")
 
         raw_fernet = Fernet.generate_key().decode("ascii")
@@ -102,7 +106,9 @@ class TestCryptoUnit:
         """Gói tin tạo ra mang FLAG_ENCRYPTED và che giấu hoàn toàn bản rõ trên socket."""
         key = get_shared_app_key()
         secret_message = "Hello Confidential World"
-        packet_bytes = create_packet(MessageType.CHAT_BROADCAST, secret_message, encrypt_key=key)
+        packet_bytes = create_packet(
+            MessageType.CHAT_BROADCAST, secret_message, encrypt_key=key
+        )
         assert secret_message.encode("utf-8") not in packet_bytes
 
         s1, s2 = socket.socketpair()
@@ -138,16 +144,31 @@ class TestCryptoIntegration:
             assert bob.server_encryption_enabled is True
 
             bc_msgs, dm_msgs, acks = [], [], []
-            bc_ev, dm_ev, ack_ev = threading.Event(), threading.Event(), threading.Event()
-            bob.register_callback(MessageType.CHAT_BROADCAST, lambda p: (bc_msgs.append(p.to_json()), bc_ev.set()))
-            bob.register_callback(MessageType.CHAT_DIRECT, lambda p: (dm_msgs.append(p.to_json()), dm_ev.set()))
-            alice.register_callback(MessageType.CHAT_ACK, lambda p: (acks.append(p.to_json()), ack_ev.set()))
+            bc_ev, dm_ev, ack_ev = (
+                threading.Event(),
+                threading.Event(),
+                threading.Event(),
+            )
+            bob.register_callback(
+                MessageType.CHAT_BROADCAST,
+                lambda p: (bc_msgs.append(p.to_json()), bc_ev.set()),
+            )
+            bob.register_callback(
+                MessageType.CHAT_DIRECT,
+                lambda p: (dm_msgs.append(p.to_json()), dm_ev.set()),
+            )
+            alice.register_callback(
+                MessageType.CHAT_ACK, lambda p: (acks.append(p.to_json()), ack_ev.set())
+            )
 
             assert alice.send_broadcast("Xin chao ma hoa tu dong") is True
             assert bc_ev.wait(timeout=2.0)
             assert bc_msgs[0]["content"] == "Xin chao ma hoa tu dong"
 
-            assert alice.send_direct_message("BobAuto", "Tin rieng khong can nhap pass") is True
+            assert (
+                alice.send_direct_message("BobAuto", "Tin rieng khong can nhap pass")
+                is True
+            )
             assert dm_ev.wait(timeout=2.0) and ack_ev.wait(timeout=2.0)
             assert dm_msgs[0]["content"] == "Tin rieng khong can nhap pass"
             assert "content" not in acks[0]
@@ -225,7 +246,9 @@ class TestCryptoIntegration:
         time.sleep(0.3)
 
         enc_alice = ClientCore(server_host="127.0.0.1", server_port=port)
-        plain_attacker = ClientCore(server_host="127.0.0.1", server_port=port, auto_encrypt=False)
+        plain_attacker = ClientCore(
+            server_host="127.0.0.1", server_port=port, auto_encrypt=False
+        )
 
         try:
             assert enc_alice.connect() and enc_alice.authenticate("AliceStrict")[0]
@@ -291,13 +314,22 @@ class TestCryptoIntegration:
                             bucket.append(pkt)
                             # Forward nguyên trạng header + payload
                             dst.sendall(
-                                create_packet(pkt.msg_type, pkt.payload, flags=pkt.flags, version=pkt.version)
+                                create_packet(
+                                    pkt.msg_type,
+                                    pkt.payload,
+                                    flags=pkt.flags,
+                                    version=pkt.version,
+                                )
                             )
                     except Exception:
                         pass
 
-                t_a = threading.Thread(target=pipe, args=(in_conn, out_conn, captured_c2s), daemon=True)
-                t_b = threading.Thread(target=pipe, args=(out_conn, in_conn, captured_s2c), daemon=True)
+                t_a = threading.Thread(
+                    target=pipe, args=(in_conn, out_conn, captured_c2s), daemon=True
+                )
+                t_b = threading.Thread(
+                    target=pipe, args=(out_conn, in_conn, captured_s2c), daemon=True
+                )
                 t_a.start()
                 t_b.start()
                 t_a.join(timeout=4.0)
@@ -309,34 +341,47 @@ class TestCryptoIntegration:
             proxy_thread.start()
 
             # Trỏ Tracker của ProxyBob sang cổng proxy sniffer
-            server.session_mgr.register_user("ProxyBob", bob, ("127.0.0.1", 59999), p2p_port=proxy_port)
+            server.session_mgr.get_session("BobFS").p2p_port = proxy_port
 
             secret_file = tmp_path / "forward_secret.txt"
             secret_bytes = b"TOP_SECRET_FORWARD_SECRECY_DATA_2026"
             secret_file.write_bytes(secret_bytes)
 
-            ok, msg = alice.send_file("ProxyBob", str(secret_file), timeout=5.0)
+            ok, msg = alice.send_file("BobFS", str(secret_file), timeout=5.0)
             proxy_thread.join(timeout=3.0)
             proxy_sock.close()
-            server.session_mgr.unregister_user("ProxyBob")
+            server.session_mgr.get_session("BobFS").p2p_port = bob.p2p_port
 
             assert ok is True, msg
-            assert (tmp_path / "downloads" / "forward_secret.txt").read_bytes() == secret_bytes
+            assert (
+                tmp_path / "downloads" / "forward_secret.txt"
+            ).read_bytes() == secret_bytes
 
             # 1. PEER_HELLO & PEER_HELLO_ACK mã hóa bằng khóa chung và chứa x25519_pub
             app_key = get_shared_app_key()
             hello_pkt = captured_c2s[0]
             hello_ack_pkt = captured_s2c[0]
-            assert hello_pkt.msg_type == MessageType.PEER_HELLO and hello_pkt.is_encrypted
-            assert hello_ack_pkt.msg_type == MessageType.PEER_HELLO_ACK and hello_ack_pkt.is_encrypted
+            assert (
+                hello_pkt.msg_type == MessageType.PEER_HELLO and hello_pkt.is_encrypted
+            )
+            assert (
+                hello_ack_pkt.msg_type == MessageType.PEER_HELLO_ACK
+                and hello_ack_pkt.is_encrypted
+            )
             assert "x25519_pub" in hello_pkt.get_decrypted_packet(app_key).to_json()
             assert "x25519_pub" in hello_ack_pkt.get_decrypted_packet(app_key).to_json()
 
             # 2. FILE_OFFER_REQ, FILE_CHUNK, FILE_ACK phải dùng khóa tạm X25519:
             # Ngay cả khóa AES chung của hệ thống cũng KHÔNG giải mã được!
-            offer_pkt = next(p for p in captured_c2s if p.msg_type == MessageType.FILE_OFFER_REQ)
-            chunk_pkt = next(p for p in captured_c2s if p.msg_type == MessageType.FILE_CHUNK)
-            ack_pkt = next(p for p in captured_s2c if p.msg_type == MessageType.FILE_ACK)
+            offer_pkt = next(
+                p for p in captured_c2s if p.msg_type == MessageType.FILE_OFFER_REQ
+            )
+            chunk_pkt = next(
+                p for p in captured_c2s if p.msg_type == MessageType.FILE_CHUNK
+            )
+            ack_pkt = next(
+                p for p in captured_s2c if p.msg_type == MessageType.FILE_ACK
+            )
 
             for ephemeral_pkt in (offer_pkt, chunk_pkt, ack_pkt):
                 assert ephemeral_pkt.is_encrypted is True
@@ -350,7 +395,6 @@ class TestCryptoIntegration:
             sthread.join(timeout=2.0)
 
     def test_p2p_plaintext_downgrade_rejected(self):
-        """Gửi PEER_HELLO bản rõ tới P2P Listener khi AES đang bật phải bị từ chối REJECTED."""
         port = get_free_port()
         server = ServerCore(host="127.0.0.1", port=port)
         sthread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -369,9 +413,8 @@ class TestCryptoIntegration:
                         {"sender": "Rogue", "protocol_version": PROTOCOL_VERSION},
                     )
                 )
-                resp = recv_packet(raw_sock)
-                assert resp.msg_type == MessageType.PEER_HELLO_ACK
-                assert resp.to_json()["status"] == "REJECTED"
+                with pytest.raises(ConnectionClosedError):
+                    recv_packet(raw_sock)
         finally:
             bob.disconnect()
             server.stop()

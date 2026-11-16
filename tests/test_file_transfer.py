@@ -42,24 +42,31 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
-def open_encrypted_p2p_session(port: int, sender_name: str):
-    """Mở socket P2P, thực hiện PEER_HELLO/ACK mã hóa khóa chung + trao đổi X25519 lấy khóa phiên tạm."""
-    app_key = get_shared_app_key()
-    priv_key, pub_b64 = generate_ephemeral_x25519_keypair()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5.0)
-    sock.connect(("127.0.0.1", port))
-    sock.sendall(
-        create_packet(
-            MessageType.PEER_HELLO,
-            {"sender": sender_name, "protocol_version": PROTOCOL_VERSION, "x25519_pub": pub_b64},
-            encrypt_key=app_key,
-        )
+def open_encrypted_p2p_session(port: int, sender_name: str, server):
+    sender = ClientCore(
+        server_host="127.0.0.1", server_port=server.server_sock.getsockname()[1]
     )
-    ack = recv_packet(sock, decrypt_key=app_key).to_json()
-    assert ack["status"] == "OK"
-    session_key = derive_p2p_session_key(priv_key, ack["x25519_pub"])
-    return sock, session_key
+    assert sender.connect() and sender.authenticate(sender_name)[0]
+    recipient = next(
+        name
+        for name, peer in server.session_mgr.get_all_peer_endpoints().items()
+        if peer["p2p_port"] == port
+    )
+    sock, key, error = sender._connect_p2p_peer(recipient, "127.0.0.1", port, 5.0)
+    assert sock is not None, error
+
+    class Session:
+        def __getattr__(self, name):
+            return getattr(sock, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            sock.close()
+            sender.disconnect()
+
+    return Session(), key
 
 
 class TestFileTransferUnit:
@@ -319,14 +326,19 @@ class TestFileTransferIntegration:
         bob.download_dir = str(tmp_path / "bob_downloads")
         bob_errors = []
         bob_err_event = threading.Event()
-        bob.on_file_error = lambda s, f, r: (bob_errors.append((s, f, r)), bob_err_event.set())
+        bob.on_file_error = lambda s, f, r: (
+            bob_errors.append((s, f, r)),
+            bob_err_event.set(),
+        )
 
         try:
             assert bob.connect() and bob.authenticate("BobReceiver")[0]
             assert bob.p2p_port is not None
 
             # Mở kết nối P2P có bắt tay X25519 rồi cố tình gửi dữ liệu lật bit khác SHA-256 đã khai báo
-            p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "EvilAlice")
+            p2p_sock, session_key = open_encrypted_p2p_session(
+                bob.p2p_port, "EvilAlice", server
+            )
             with p2p_sock:
                 # Khai báo SHA-256 giả (64 ký tự '0') không khớp với dữ liệu thực
                 p2p_sock.sendall(
@@ -337,7 +349,7 @@ class TestFileTransferIntegration:
                             "sender": "EvilAlice",
                             "recipient": "BobReceiver",
                             "file_name": "corrupted.bin",
-                            "file_size": 16,
+                            "file_size": len(b"CORRUPTED_DATA!!!"),
                             "total_chunks": 1,
                             "sha256": "0" * 64,
                         },
@@ -347,8 +359,14 @@ class TestFileTransferIntegration:
                 offer_resp = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
                 assert offer_resp["status"] == "ACCEPTED"
 
-                bad_chunk = pack_chunk_payload("badsha01", 0, 1, b"CORRUPTED_DATA!!", encrypted=True)
-                p2p_sock.sendall(create_packet(MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key))
+                bad_chunk = pack_chunk_payload(
+                    "badsha01", 0, 1, b"CORRUPTED_DATA!!!", encrypted=True
+                )
+                p2p_sock.sendall(
+                    create_packet(
+                        MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key
+                    )
+                )
 
                 ack_pkt = recv_packet(p2p_sock, decrypt_key=session_key)
                 assert ack_pkt.msg_type == MessageType.FILE_ACK
@@ -360,7 +378,11 @@ class TestFileTransferIntegration:
             assert len(bob_errors) == 1
             # Đảm bảo KHÔNG có file hỏng hoặc file .part nào bị bỏ sót trên ổ đĩa của Bob
             assert not (tmp_path / "bob_downloads" / "corrupted.bin").exists()
-            leftover_files = list((tmp_path / "bob_downloads").glob("*")) if (tmp_path / "bob_downloads").exists() else []
+            leftover_files = (
+                list((tmp_path / "bob_downloads").glob("*"))
+                if (tmp_path / "bob_downloads").exists()
+                else []
+            )
             assert leftover_files == []
         finally:
             bob.disconnect()
@@ -383,10 +405,15 @@ class TestFileTransferIntegration:
             assert bob.connect() and bob.authenticate("BobSafe")[0]
             payload_bytes = b"SafeContentInsideDownloadDirOnly"
             import hashlib
+
             valid_sha = hashlib.sha256(payload_bytes).hexdigest()
 
-            for idx, malicious_name in enumerate(["../../escaped_unix.txt", "..\\..\\escaped_win.txt"]):
-                p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "Sender")
+            for idx, malicious_name in enumerate(
+                ["../../escaped_unix.txt", "..\\..\\escaped_win.txt"]
+            ):
+                p2p_sock, session_key = open_encrypted_p2p_session(
+                    bob.p2p_port, "Sender", server
+                )
                 with p2p_sock:
                     fid = f"trav0{idx}"
                     p2p_sock.sendall(
@@ -404,9 +431,20 @@ class TestFileTransferIntegration:
                             encrypt_key=session_key,
                         )
                     )
-                    assert recv_packet(p2p_sock, decrypt_key=session_key).to_json()["status"] == "ACCEPTED"
+                    assert (
+                        recv_packet(p2p_sock, decrypt_key=session_key).to_json()[
+                            "status"
+                        ]
+                        == "ACCEPTED"
+                    )
                     p2p_sock.sendall(
-                        create_packet(MessageType.FILE_CHUNK, pack_chunk_payload(fid, 0, 1, payload_bytes, encrypted=True), encrypt_key=session_key)
+                        create_packet(
+                            MessageType.FILE_CHUNK,
+                            pack_chunk_payload(
+                                fid, 0, 1, payload_bytes, encrypted=True
+                            ),
+                            encrypt_key=session_key,
+                        )
                     )
                     ack = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
                     assert ack["status"] == "SUCCESS"
@@ -449,7 +487,9 @@ class TestFileTransferIntegration:
             results = {}
 
             def send_worker(client_obj, key, path):
-                results[key] = client_obj.send_file("BobTarget", str(path), timeout=10.0)
+                results[key] = client_obj.send_file(
+                    "BobTarget", str(path), timeout=10.0
+                )
 
             t1 = threading.Thread(target=send_worker, args=(alice, "A", file_a))
             t2 = threading.Thread(target=send_worker, args=(charlie, "C", file_c))
@@ -460,8 +500,12 @@ class TestFileTransferIntegration:
 
             assert results["A"][0] is True, results["A"][1]
             assert results["C"][0] is True, results["C"][1]
-            assert (tmp_path / "bob_concurrent" / "alice_data.bin").read_bytes() == bytes_a
-            assert (tmp_path / "bob_concurrent" / "charlie_data.bin").read_bytes() == bytes_c
+            assert (
+                tmp_path / "bob_concurrent" / "alice_data.bin"
+            ).read_bytes() == bytes_a
+            assert (
+                tmp_path / "bob_concurrent" / "charlie_data.bin"
+            ).read_bytes() == bytes_c
         finally:
             alice.disconnect()
             charlie.disconnect()
@@ -518,7 +562,9 @@ class TestFileTransferIntegration:
 
         try:
             assert bob.connect() and bob.authenticate("BobStrict")[0]
-            p2p_sock, session_key = open_encrypted_p2p_session(bob.p2p_port, "Sender")
+            p2p_sock, session_key = open_encrypted_p2p_session(
+                bob.p2p_port, "Sender", server
+            )
             with p2p_sock:
                 p2p_sock.sendall(
                     create_packet(
@@ -535,11 +581,20 @@ class TestFileTransferIntegration:
                         encrypt_key=session_key,
                     )
                 )
-                assert recv_packet(p2p_sock, decrypt_key=session_key).to_json()["status"] == "ACCEPTED"
+                assert (
+                    recv_packet(p2p_sock, decrypt_key=session_key).to_json()["status"]
+                    == "ACCEPTED"
+                )
 
                 # Cố tình gửi chunk_index = 5 khi total_chunks = 1
-                bad_chunk = pack_chunk_payload("badidx01", 5, 1, b"1234567890", encrypted=True)
-                p2p_sock.sendall(create_packet(MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key))
+                bad_chunk = pack_chunk_payload(
+                    "badidx01", 5, 1, b"1234567890", encrypted=True
+                )
+                p2p_sock.sendall(
+                    create_packet(
+                        MessageType.FILE_CHUNK, bad_chunk, encrypt_key=session_key
+                    )
+                )
 
                 ack = recv_packet(p2p_sock, decrypt_key=session_key).to_json()
                 assert ack["status"] == "FAILED"
@@ -550,4 +605,3 @@ class TestFileTransferIntegration:
             bob.disconnect()
             server.stop()
             sthread.join(timeout=2.0)
-

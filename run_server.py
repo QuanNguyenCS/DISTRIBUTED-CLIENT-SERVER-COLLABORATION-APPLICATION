@@ -22,9 +22,7 @@ logger = get_logger("run_server")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Khởi chạy Collaboration TCP Server"
-    )
+    parser = argparse.ArgumentParser(description="Khởi chạy Collaboration TCP Server")
     parser.add_argument(
         "--host",
         type=str,
@@ -50,8 +48,13 @@ def main() -> None:
     print(" DISTRIBUTED CLIENT-SERVER COLLABORATION APPLICATION - SERVER")
     print("=" * 65)
 
-    server = ServerCore(host=args.host, port=args.port, server_id=args.server_id)
-    logger.info("🔒 Mã hóa AES tự động đang bật (biến môi trường COLLAB_AES_KEY / mặc định).")
+    try:
+        server = ServerCore(host=args.host, port=args.port, server_id=args.server_id)
+    except ValueError as exc:
+        parser.error(str(exc))
+    logger.info(
+        "🔒 Mã hóa AES tự động đang bật (biến môi trường COLLAB_AES_KEY / mặc định)."
+    )
 
     try:
         server.serve_forever()

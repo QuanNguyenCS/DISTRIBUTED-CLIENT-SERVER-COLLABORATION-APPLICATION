@@ -24,7 +24,7 @@ from common.crypto_utils import decrypt_payload, encrypt_payload
 MAGIC_BYTES: bytes = b"CA"  # Collaboration App
 
 # Phiên bản giao thức hiện tại
-PROTOCOL_VERSION: int = 1
+PROTOCOL_VERSION: int = 2
 
 # Định dạng nhị phân Header (Network Byte Order - Big Endian "!":
 #   2s : 2 bytes magic (b"CA")
@@ -39,11 +39,14 @@ HEADER_SIZE: int = struct.calcsize(HEADER_FORMAT)  # 16 bytes
 
 # Các cờ điều khiển (Flags - 1 byte bitmask)
 FLAG_NONE: int = 0x00
-FLAG_ENCRYPTED: int = 0x01   # Bit 0: Payload đã được mã hóa bằng AES
+FLAG_ENCRYPTED: int = 0x01  # Bit 0: Payload đã được mã hóa bằng AES
 FLAG_COMPRESSED: int = 0x02  # Bit 1: Payload đã được nén (dự phòng tương lai)
 
 # Giới hạn an toàn payload tối đa (đề phòng tấn công làm tràn bộ nhớ - DoS)
 MAX_PAYLOAD_SIZE: int = 50 * 1024 * 1024  # 50 MB mỗi gói tin
+MAX_CONTROL_PAYLOAD_SIZE: int = 64 * 1024
+MAX_FILE_FRAME_SIZE: int = 64 * 1024
+_ENCRYPTED_CONTEXT = struct.Struct("!BHB")
 
 
 # ==============================================================================
@@ -51,26 +54,31 @@ MAX_PAYLOAD_SIZE: int = 50 * 1024 * 1024  # 50 MB mỗi gói tin
 # ==============================================================================
 class ProtocolError(Exception):
     """Ngoại lệ cơ sở cho các lỗi vi phạm giao thức."""
+
     pass
 
 
 class InvalidMagicBytesError(ProtocolError):
     """Lỗi khi nhận gói tin không bắt đầu bằng Magic Bytes hợp lệ."""
+
     pass
 
 
 class UnsupportedVersionError(ProtocolError):
     """Lỗi khi phiên bản gói tin không tương thích."""
+
     pass
 
 
 class PayloadTooLargeError(ProtocolError):
     """Lỗi khi độ dài payload vượt quá giới hạn an toàn tối đa."""
+
     pass
 
 
 class ConnectionClosedError(Exception):
     """Ngoại lệ ném ra khi kết nối socket bị phía bên kia đóng đột ngột."""
+
     pass
 
 
@@ -82,6 +90,7 @@ class Packet:
     """
     Đại diện cho một gói tin đã được mở gói (unpacked) hoàn chỉnh.
     """
+
     msg_type: MessageType
     payload: bytes
     flags: int = FLAG_NONE
@@ -113,9 +122,12 @@ class Packet:
             return self
 
         decrypted_bytes = decrypt_payload(self.payload, key)
+        context = _ENCRYPTED_CONTEXT.pack(self.version, int(self.msg_type), self.flags)
+        if not decrypted_bytes.startswith(context):
+            raise ProtocolError("Encrypted frame context does not match its header.")
         return Packet(
             msg_type=self.msg_type,
-            payload=decrypted_bytes,
+            payload=decrypted_bytes[_ENCRYPTED_CONTEXT.size :],
             flags=self.flags & ~FLAG_ENCRYPTED,
             version=self.version,
         )
@@ -153,12 +165,15 @@ def create_packet(
     elif isinstance(payload, (dict, list)):
         payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     else:
-        raise TypeError(f"Payload không hợp lệ: {type(payload)}. Phải là bytes, str hoặc dict/list.")
+        raise TypeError(
+            f"Payload không hợp lệ: {type(payload)}. Phải là bytes, str hoặc dict/list."
+        )
 
     # Mã hóa payload nếu có encrypt_key
     if encrypt_key is not None:
-        payload_bytes = encrypt_payload(payload_bytes, encrypt_key)
         flags |= FLAG_ENCRYPTED
+        context = _ENCRYPTED_CONTEXT.pack(version, int(msg_type), flags)
+        payload_bytes = encrypt_payload(context + payload_bytes, encrypt_key)
 
     payload_len = len(payload_bytes)
     if payload_len > MAX_PAYLOAD_SIZE:
@@ -189,7 +204,7 @@ def recv_exact(
 ) -> bytes:
     """
     Đọc chính xác và đủ num_bytes từ TCP socket.
-    
+
     Do đặc tính TCP là Stream of Bytes (luồng byte không phân cách),
     một lệnh sock.recv(N) không đảm bảo trả về đủ N bytes ngay lập tức.
     Hàm này sẽ lặp liên tục cho đến khi gom đủ num_bytes hoặc socket bị ngắt.
@@ -273,6 +288,9 @@ def recv_packet(
             f"Phiên bản giao thức không tương thích: {version} (hiện tại hỗ trợ: {PROTOCOL_VERSION})."
         )
 
+    if flags & ~FLAG_ENCRYPTED or _reserved != 0:
+        raise ProtocolError("Unsupported flags or nonzero reserved field.")
+
     # Kiểm tra Payload Length
     if payload_len > max_payload_size:
         raise PayloadTooLargeError(
@@ -303,4 +321,15 @@ def recv_packet(
     if decrypt_key is not None and packet.is_encrypted:
         packet = packet.get_decrypted_packet(decrypt_key)
 
+    return packet
+
+
+def recv_secure_packet(sock, key, **kwargs):
+    packet = recv_packet(sock, **kwargs)
+    if key is not None:
+        if not packet.is_encrypted:
+            raise ProtocolError("Encrypted packet required.")
+        packet = packet.get_decrypted_packet(key)
+    elif packet.is_encrypted:
+        raise ProtocolError("No key configured for encrypted packet.")
     return packet

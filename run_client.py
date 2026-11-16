@@ -9,6 +9,7 @@ Tích hợp quy trình xác thực người dùng và định tuyến tin nhắn
 """
 
 import argparse
+from common.discovery import discover_servers
 import sys
 import time
 from typing import Optional
@@ -46,7 +47,9 @@ def handle_incoming_packet(packet: Packet) -> None:
             sender = data.get("sender", "Hệ thống")
             content = data.get("content") or data.get("text", "")
             ts_str = format_ts(data.get("timestamp"))
-            print(f"\n💬 [{ts_str}] [GLOBAL] {sender}: {content}\n> ", end="", flush=True)
+            print(
+                f"\n💬 [{ts_str}] [GLOBAL] {sender}: {content}\n> ", end="", flush=True
+            )
         except Exception:
             print(f"\n💬 [Server]: {packet.to_text()}\n> ", end="", flush=True)
 
@@ -56,7 +59,11 @@ def handle_incoming_packet(packet: Packet) -> None:
             sender = data.get("sender", "Ẩn danh")
             content = data.get("content") or data.get("text", "")
             ts_str = format_ts(data.get("timestamp"))
-            print(f"\n🔒 [{ts_str}] [PRIVATE from {sender}]: {content}\n> ", end="", flush=True)
+            print(
+                f"\n🔒 [{ts_str}] [PRIVATE from {sender}]: {content}\n> ",
+                end="",
+                flush=True,
+            )
         except Exception:
             print(f"\n🔒 [PRIVATE]: {packet.to_text()}\n> ", end="", flush=True)
 
@@ -67,9 +74,17 @@ def handle_incoming_packet(packet: Packet) -> None:
             content = data.get("content")
             ts_str = format_ts(data.get("timestamp"))
             if content:
-                print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: {content}\n> ", end="", flush=True)
+                print(
+                    f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: {content}\n> ",
+                    end="",
+                    flush=True,
+                )
             else:
-                print(f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: Đã chuyển tới người nhận.\n> ", end="", flush=True)
+                print(
+                    f"\n📤 [{ts_str}] [PRIVATE to {recipient}]: Đã chuyển tới người nhận.\n> ",
+                    end="",
+                    flush=True,
+                )
         except Exception:
             pass
 
@@ -89,9 +104,17 @@ def handle_incoming_packet(packet: Packet) -> None:
             count = data.get("online_count", "?")
             ts_str = format_ts(data.get("timestamp"))
             if event == "JOINED":
-                print(f"\n🔔 [{ts_str}] [Thông báo] '{user}' vừa tham gia! (Đang online: {count})\n> ", end="", flush=True)
+                print(
+                    f"\n🔔 [{ts_str}] [Thông báo] '{user}' vừa tham gia! (Đang online: {count})\n> ",
+                    end="",
+                    flush=True,
+                )
             elif event == "LEFT":
-                print(f"\n🔔 [{ts_str}] [Thông báo] '{user}' đã rời phòng! (Đang online: {count})\n> ", end="", flush=True)
+                print(
+                    f"\n🔔 [{ts_str}] [Thông báo] '{user}' đã rời phòng! (Đang online: {count})\n> ",
+                    end="",
+                    flush=True,
+                )
         except Exception as e:
             logger.debug("Lỗi parse USER_STATUS_BROADCAST: %s", e)
 
@@ -100,9 +123,7 @@ def handle_incoming_packet(packet: Packet) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Khởi chạy Collaboration TCP Client"
-    )
+    parser = argparse.ArgumentParser(description="Khởi chạy Collaboration TCP Client")
     parser.add_argument(
         "--host",
         type=str,
@@ -130,18 +151,32 @@ def main() -> None:
         help="Cổng TCP lắng nghe kết nối nhận file P2P trực tiếp (mặc định 0 để OS tự cấp)",
     )
 
+    parser.add_argument("--discover", action="store_true")
     args = parser.parse_args()
+    if args.discover:
+        try:
+            servers = discover_servers(port=args.port)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if len(servers) != 1:
+            parser.error(
+                "Discovery requires exactly one matching server; use --host to select explicitly."
+            )
+        args.host, args.port = servers[0]["ip"], servers[0]["port"]
 
     print("=" * 65)
     print(" DISTRIBUTED CLIENT-SERVER COLLABORATION APPLICATION - CLIENT")
     print("=" * 65)
 
-    client = ClientCore(
-        server_host=args.host,
-        server_port=args.port,
-        client_name=args.username or "Guest-Client",
-        p2p_port=args.p2p_port,
-    )
+    try:
+        client = ClientCore(
+            server_host=args.host,
+            server_port=args.port,
+            client_name=args.username or "Guest-Client",
+            p2p_port=args.p2p_port,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     logger.info("🔒 Mã hóa tự động AES (Server) + X25519 tạm thời (P2P File) đang bật.")
 
     # Đăng ký callbacks xử lý các sự kiện đến từ Server
@@ -154,7 +189,11 @@ def main() -> None:
 
     # Đăng ký callback khi nhận file thành công
     def on_received_file(sender: str, file_name: str, save_path: str):
-        print(f"\n📁 [File Nhận Được] Bạn vừa nhận được file '{file_name}' từ '{sender}'! Đã lưu tại: {save_path}\n> ", end="", flush=True)
+        print(
+            f"\n📁 [File Nhận Được] Bạn vừa nhận được file '{file_name}' từ '{sender}'! Đã lưu tại: {save_path}\n> ",
+            end="",
+            flush=True,
+        )
 
     client.on_file_received = on_received_file
 
@@ -177,7 +216,9 @@ def main() -> None:
                 initial_username = None  # Chỉ thử 1 lần từ dòng lệnh
             else:
                 try:
-                    chosen_user = input("👉 Nhập Username của bạn (hoặc /quit để thoát): ").strip()
+                    chosen_user = input(
+                        "👉 Nhập Username của bạn (hoặc /quit để thoát): "
+                    ).strip()
                 except (EOFError, KeyboardInterrupt):
                     client.disconnect()
                     sys.exit(0)
@@ -191,8 +232,14 @@ def main() -> None:
 
             ok, msg = client.authenticate(chosen_user)
             if ok:
-                p2p_info = f" | Cổng P2P nhận file: {client.p2p_port}" if client.p2p_port else ""
-                print(f"✅ {msg} Chào mừng '{client.username}' tham gia phòng hợp tác!{p2p_info}")
+                p2p_info = (
+                    f" | Cổng P2P nhận file: {client.p2p_port}"
+                    if client.p2p_port
+                    else ""
+                )
+                print(
+                    f"✅ {msg} Chào mừng '{client.username}' tham gia phòng hợp tác!{p2p_info}"
+                )
                 users = client.online_users or [client.username]
                 print(f"👥 Danh sách đang online ({len(users)}): {', '.join(users)}")
             else:
@@ -204,8 +251,12 @@ def main() -> None:
         print("-" * 65)
         print("  HƯỚNG DẪN TRÒ CHUYỆN:")
         print("  - Gõ tin nhắn và Enter để chat phòng chung (Broadcast).")
-        print("  - Gõ '@<username> <nội dung>' hoặc '/msg <username> <nội dung>' để chat riêng 1-1.")
-        print("  - Gõ '/file <username> <đường_dẫn>' để gửi file tin cậy (kèm SHA-256).")
+        print(
+            "  - Gõ '@<username> <nội dung>' hoặc '/msg <username> <nội dung>' để chat riêng 1-1."
+        )
+        print(
+            "  - Gõ '/file <username> <đường_dẫn>' để gửi file tin cậy (kèm SHA-256)."
+        )
         print("  - Gõ '/users' hoặc '/who' để xem danh sách đang online.")
         print("  - Gõ '/ping' để kiểm tra nhịp tim (Keepalive).")
         print("  - Gõ '/quit' hoặc '/exit' để đăng xuất và thoát an toàn.")
@@ -229,7 +280,9 @@ def main() -> None:
             elif cmd_lower in ("/users", "/who"):
                 users = client.request_user_list()
                 if users is not None:
-                    print(f"👥 Danh sách người dùng online ({len(users)}): {', '.join(users)}")
+                    print(
+                        f"👥 Danh sách người dùng online ({len(users)}): {', '.join(users)}"
+                    )
                 else:
                     print("⚠️ Không thể lấy danh sách người dùng vào lúc này.")
             elif cmd_lower == "/ping":
@@ -257,9 +310,19 @@ def main() -> None:
                 if len(parts) == 3:
                     _, target_user, file_path = parts
                     print(f"🚀 Bắt đầu gửi file '{file_path}' tới '{target_user}'...")
+
                     def cli_progress(sent, total, pct):
-                        print(f"\r🚀 Đang truyền: {sent}/{total} chunks ({pct:.1f}%)...", end="", flush=True)
-                    ok, msg = client.send_file(target_user.strip(), file_path.strip(), progress_callback=cli_progress)
+                        print(
+                            f"\r🚀 Đang truyền: {sent}/{total} chunks ({pct:.1f}%)...",
+                            end="",
+                            flush=True,
+                        )
+
+                    ok, msg = client.send_file(
+                        target_user.strip(),
+                        file_path.strip(),
+                        progress_callback=cli_progress,
+                    )
                     print()
                     if ok:
                         print(f"✅ {msg}")
@@ -272,7 +335,9 @@ def main() -> None:
                 client.send_broadcast(user_input)
 
     except ConnectionRefusedError:
-        logger.error("Không thể kết nối: Server chưa chạy tại %s:%d.", args.host, args.port)
+        logger.error(
+            "Không thể kết nối: Server chưa chạy tại %s:%d.", args.host, args.port
+        )
         sys.exit(1)
     except Exception as exc:
         logger.error("Lỗi ngoại lệ: %s", exc)
